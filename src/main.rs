@@ -11,6 +11,10 @@ fn hash(str: &str) -> u64 {
 const MAX_CHUNK_SIZE: usize = 200_000_000;
 const N_RINGS: usize = 6000;
 
+type WorkerIndex = u16;
+type ChunkIndex = u32;
+type RingIndex = u16;
+
 #[derive(Debug)]
 struct Chunk {
     id: String,
@@ -35,7 +39,10 @@ fn main() {
     let chunks = generate_chunks(10_000_000);
     let vchunks = generate_virtual_chunks(&chunks);
     let workers = generate_workers(2_000);
-    let total_size: usize = vchunks.iter().map(|(chunk, _)| chunk.size).sum();
+    let total_size: usize = vchunks
+        .iter()
+        .map(|(chunk_index, _)| chunks[*chunk_index as usize].size)
+        .sum();
     let worker_capacity = (total_size as f32 / workers.len() as f32 * 1.1) as usize;
     println!(
         "Total chunks: {}, virtual chunks: {}, total size: {}GB, worker capacity: {}GB",
@@ -46,14 +53,17 @@ fn main() {
     );
 
     println!("Hashing workers");
-    let rings: Vec<Vec<(u64, &String)>> = (0..N_RINGS)
+    let rings: Vec<Vec<(u64, WorkerIndex)>> = (0..N_RINGS as RingIndex)
         .into_par_iter()
         .map(|ring_index| {
             let mut vec = workers
                 .iter()
                 .enumerate()
                 .map(|(worker_index, worker_id)| {
-                    (hash(&format!("{}:{}", worker_id, ring_index)), worker_id)
+                    (
+                        hash(&format!("{}:{}", worker_id, ring_index)),
+                        worker_index as WorkerIndex,
+                    )
                 })
                 .collect_vec();
             vec.sort_unstable();
@@ -62,32 +72,35 @@ fn main() {
         .collect();
 
     println!("Hashing chunks");
-    let orderings: Vec<(&Chunk, &Vec<_>, usize)> = vchunks
+    let orderings: Vec<(ChunkIndex, RingIndex, WorkerIndex)> = vchunks
         .par_iter()
-        .map(|&(chunk, tag)| {
-            let chunk_hash = hash(&format!("{}:{}", chunk.id, tag));
+        .map(|&(chunk_index, tag)| {
+            let chunk_hash = hash(&format!("{}:{}", chunks[chunk_index as usize].id, tag));
             let ring_index = chunk_hash as usize % N_RINGS;
             let ring = &rings[ring_index];
             let first = ring.partition_point(|(x, _)| *x < chunk_hash);
-            (chunk, ring, first)
+            (
+                chunk_index as ChunkIndex,
+                ring_index as RingIndex,
+                first as WorkerIndex,
+            )
         })
         .collect();
 
     println!("Distributing chunks");
-    let mut capacities: HashMap<String, usize> = workers
-        .iter()
-        .map(|worker_id| (worker_id.clone(), worker_capacity))
-        .collect();
-    let distribution: Vec<(&Chunk, &String)> = orderings
+    let mut capacities: Vec<usize> = workers.iter().map(|_| worker_capacity).collect();
+    let distribution: Vec<(ChunkIndex, WorkerIndex)> = orderings
         .into_iter()
-        .map(|(chunk, ring, first)| {
+        .map(|(chunk_index, ring_index, first)| {
+            let chunk = &chunks[chunk_index as usize];
+            let ring = &rings[ring_index as usize];
             let first = first as usize;
             let candidates = ring[first..].iter().chain(ring[..first].iter());
-            for &(_, worker_id) in candidates {
-                let capacity = capacities.get_mut(worker_id).unwrap();
+            for &(_, worker_index) in candidates {
+                let capacity = &mut capacities[worker_index as usize];
                 if *capacity >= chunk.size {
                     *capacity -= chunk.size;
-                    return (chunk, worker_id);
+                    return (chunk_index, worker_index);
                 }
             }
             panic!("No worker found for chunk {}", chunk.id);
@@ -99,11 +112,11 @@ fn main() {
 
     println!("Packing assignments");
     let mut results: HashMap<String, Worker> = HashMap::new();
-    for (chunk, worker_id) in distribution {
+    for (chunk_index, worker_index) in distribution {
         results
-            .entry(worker_id.clone())
+            .entry(workers[worker_index as usize].clone())
             .or_default()
-            .add(chunk);
+            .add(&chunks[chunk_index as usize]);
     }
     results
         .into_iter()
@@ -131,14 +144,14 @@ fn generate_chunks(n: usize) -> Vec<Chunk> {
         .collect()
 }
 
-fn generate_virtual_chunks(chunks: &Vec<Chunk>) -> Vec<(&Chunk, u8)> {
+fn generate_virtual_chunks(chunks: &Vec<Chunk>) -> Vec<(ChunkIndex, u8)> {
     chunks
         .iter()
         .enumerate()
-        .flat_map(|(_chunk_index, chunk)| {
+        .flat_map(|(chunk_index, _)| {
             let mut rng = rand::rng();
             let n_virtual_chunks = rng.random_range(1..=60);
-            (0..n_virtual_chunks).map(move |tag| (chunk, tag))
+            (0..n_virtual_chunks).map(move |tag| (chunk_index as ChunkIndex, tag))
         })
         .collect()
 }
