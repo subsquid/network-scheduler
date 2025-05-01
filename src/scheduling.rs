@@ -4,6 +4,7 @@ use rayon::iter::{
     IndexedParallelIterator, IntoParallelIterator, IntoParallelRefIterator, ParallelIterator,
 };
 use seahash::hash;
+use tracing::instrument;
 
 use crate::types::{Assignment, ChunkIndex, WorkerIndex};
 
@@ -18,9 +19,18 @@ pub struct Chunk {
     pub replication: u8,
 }
 
+#[instrument(skip_all)]
 pub fn distribute(chunks: &[Chunk], workers: Vec<PeerId>, worker_capacity: u64) -> Assignment {
-    println!("Hashing workers");
-    let rings: Vec<Vec<(u64, WorkerIndex)>> = (0..N_RINGS as RingIndex)
+    let rings = hash_workers(&workers);
+    let orderings = hash_chunks(chunks, &rings);
+    assign_chunks(orderings, chunks, &workers, rings, worker_capacity)
+}
+
+#[instrument(skip_all)]
+fn hash_workers(workers: &[PeerId]) -> Vec<Vec<(u64, WorkerIndex)>> {
+    tracing::info!("Hashing workers");
+
+    (0..N_RINGS as RingIndex)
         .into_par_iter()
         .map(|ring_index| {
             let mut vec = workers
@@ -39,14 +49,20 @@ pub fn distribute(chunks: &[Chunk], workers: Vec<PeerId>, worker_capacity: u64) 
             vec.sort_unstable();
             vec
         })
-        .collect();
+        .collect()
+}
 
-    println!("Hashing chunks");
-    let orderings: Vec<(ChunkIndex, RingIndex, WorkerIndex)> = chunks
+#[instrument(skip_all)]
+fn hash_chunks(
+    chunks: &[Chunk],
+    rings: &[Vec<(u64, u16)>],
+) -> Vec<(ChunkIndex, RingIndex, WorkerIndex)> {
+    tracing::info!("Hashing chunks");
+
+    chunks
         .par_iter()
         .enumerate()
         .flat_map_iter(|(chunk_index, chunk)| {
-            let rings = &rings;
             (0..chunk.replication).map(move |tag| {
                 let buffer = [chunk.id.as_bytes(), b":", &tag.to_le_bytes()].concat();
                 let chunk_hash = hash(&buffer);
@@ -60,10 +76,25 @@ pub fn distribute(chunks: &[Chunk], workers: Vec<PeerId>, worker_capacity: u64) 
                 )
             })
         })
-        .collect();
+        .collect()
+}
 
-    println!("Distributing chunks");
-    let mut results: Vec<WorkerAssignment> = workers
+#[instrument(skip_all)]
+fn assign_chunks(
+    orderings: Vec<(ChunkIndex, RingIndex, WorkerIndex)>,
+    chunks: &[Chunk],
+    worker_ids: &[PeerId],
+    rings: Vec<Vec<(u64, WorkerIndex)>>,
+    worker_capacity: u64,
+) -> Assignment {
+    tracing::info!("Assigning chunks");
+
+    struct WorkerAssignment {
+        chunks: Vec<ChunkIndex>,
+        allocated: u64,
+    }
+
+    let mut workers: Vec<WorkerAssignment> = worker_ids
         .iter()
         .map(|_| WorkerAssignment {
             chunks: Vec::new(),
@@ -78,10 +109,10 @@ pub fn distribute(chunks: &[Chunk], workers: Vec<PeerId>, worker_capacity: u64) 
             let first = first as usize;
             let candidates = ring[first..].iter().chain(ring[..first].iter());
             for &(_, worker_index) in candidates {
-                let worker = &mut results[worker_index as usize];
+                let worker = &mut workers[worker_index as usize];
 
-                // indexes are added in increasing order, so it's enough to check the last one for duplicates
                 if worker.allocated + chunk.size as u64 <= worker_capacity
+                    // indexes are added in increasing order, so it's enough to check the last one for duplicates
                     && worker.chunks.last() != Some(&chunk_index)
                 {
                     worker.allocated += chunk.size as u64;
@@ -91,18 +122,12 @@ pub fn distribute(chunks: &[Chunk], workers: Vec<PeerId>, worker_capacity: u64) 
             }
             panic!("No worker found for chunk {}", chunk.id);
         });
-    drop(rings);
 
     Assignment {
-        workers: results
+        workers: workers
             .into_iter()
             .enumerate()
-            .map(|(id, worker)| (workers[id], worker.chunks))
+            .map(|(id, worker)| (worker_ids[id], worker.chunks))
             .collect(),
     }
-}
-
-struct WorkerAssignment {
-    chunks: Vec<ChunkIndex>,
-    allocated: u64,
 }

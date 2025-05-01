@@ -10,3 +10,5 @@ multihash = "0.19.3"
 rand = "0.9.1"
 rayon = "1.10.0"
 seahash = "4.1.0"
+tracing = "0.1.41"
+tracing-subscriber = { version = "0.3.19", features = ["env-filter", "parking_lot"] }

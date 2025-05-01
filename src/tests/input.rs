@@ -7,6 +7,7 @@ use crate::{
     types::{ChunkIndex, WorkerIndex},
 };
 
+#[tracing::instrument(skip_all)]
 pub fn generate_input(
     n_workers: WorkerIndex,
     n_chunks: ChunkIndex,
