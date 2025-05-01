@@ -34,7 +34,7 @@ pub fn generate_input(
 }
 
 fn generate_chunks(n: ChunkIndex) -> Vec<Chunk> {
-    const MAX_CHUNK_SIZE: u32 = 200 * 1 << 20; // 200MB
+    const MAX_CHUNK_SIZE: u32 = 200 << 20; // 200MB
 
     (0..n)
         .into_par_iter()
