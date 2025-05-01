@@ -3,6 +3,7 @@ use libp2p_identity::PeerId;
 use rayon::iter::{
     IndexedParallelIterator, IntoParallelIterator, IntoParallelRefIterator, ParallelIterator,
 };
+use seahash::hash;
 
 use crate::types::{Assignment, ChunkIndex, WorkerIndex};
 
@@ -26,10 +27,13 @@ pub fn distribute(chunks: &[Chunk], workers: Vec<PeerId>, worker_capacity: u64) 
                 .iter()
                 .enumerate()
                 .map(|(worker_index, worker_id)| {
-                    (
-                        hash(&format!("{}:{}", worker_id, ring_index)),
-                        worker_index as WorkerIndex,
-                    )
+                    let buffer = [
+                        worker_id.to_bytes().as_slice(),
+                        b":",
+                        &ring_index.to_le_bytes(),
+                    ]
+                    .concat();
+                    (hash(&buffer), worker_index as WorkerIndex)
                 })
                 .collect_vec();
             vec.sort_unstable();
@@ -44,7 +48,8 @@ pub fn distribute(chunks: &[Chunk], workers: Vec<PeerId>, worker_capacity: u64) 
         .flat_map_iter(|(chunk_index, chunk)| {
             let rings = &rings;
             (0..chunk.replication).map(move |tag| {
-                let chunk_hash = hash(&format!("{}:{}", chunk.id, tag));
+                let buffer = [chunk.id.as_bytes(), b":", &tag.to_le_bytes()].concat();
+                let chunk_hash = hash(&buffer);
                 let ring_index = chunk_hash as usize % N_RINGS;
                 let ring = &rings[ring_index];
                 let first = ring.partition_point(|(x, _)| *x < chunk_hash);
@@ -100,8 +105,4 @@ pub fn distribute(chunks: &[Chunk], workers: Vec<PeerId>, worker_capacity: u64) 
 struct WorkerAssignment {
     chunks: Vec<ChunkIndex>,
     allocated: u64,
-}
-
-fn hash(str: &str) -> u64 {
-    seahash::hash(str.as_bytes())
 }
