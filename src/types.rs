@@ -7,5 +7,6 @@ pub type ChunkIndex = u32;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Assignment {
+    // chunk indexes are sorted
     pub workers: BTreeMap<PeerId, Vec<ChunkIndex>>,
 }

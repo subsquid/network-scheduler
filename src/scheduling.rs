@@ -1,5 +1,3 @@
-use std::collections::BTreeMap;
-
 use itertools::Itertools;
 use libp2p_identity::PeerId;
 use rayon::iter::{
@@ -60,36 +58,48 @@ pub fn distribute(chunks: &[Chunk], workers: Vec<PeerId>, worker_capacity: u64) 
         .collect();
 
     println!("Distributing chunks");
-    let mut capacities: Vec<u64> = workers.iter().map(|_| worker_capacity).collect();
-    let distribution: Vec<(ChunkIndex, WorkerIndex)> = orderings
+    let mut results: Vec<WorkerAssignment> = workers
+        .iter()
+        .map(|_| WorkerAssignment {
+            chunks: Vec::new(),
+            allocated: 0,
+        })
+        .collect();
+    orderings
         .into_iter()
-        .map(|(chunk_index, ring_index, first)| {
+        .for_each(|(chunk_index, ring_index, first)| {
             let chunk = &chunks[chunk_index as usize];
             let ring = &rings[ring_index as usize];
             let first = first as usize;
             let candidates = ring[first..].iter().chain(ring[..first].iter());
             for &(_, worker_index) in candidates {
-                let capacity = &mut capacities[worker_index as usize];
-                if *capacity >= chunk.size as u64 {
-                    *capacity -= chunk.size as u64;
-                    return (chunk_index, worker_index);
+                let worker = &mut results[worker_index as usize];
+
+                // indexes are added in increasing order, so it's enough to check the last one for duplicates
+                if worker.allocated + chunk.size as u64 <= worker_capacity
+                    && worker.chunks.last() != Some(&chunk_index)
+                {
+                    worker.allocated += chunk.size as u64;
+                    worker.chunks.push(chunk_index);
+                    return;
                 }
             }
             panic!("No worker found for chunk {}", chunk.id);
-        })
-        .collect();
+        });
     drop(rings);
-    drop(capacities);
 
-    println!("Packing assignments");
-    let mut results: BTreeMap<PeerId, Vec<ChunkIndex>> = BTreeMap::new();
-    for (chunk_index, worker_index) in distribution {
-        results
-            .entry(workers[worker_index as usize].clone())
-            .or_default()
-            .push(chunk_index);
+    Assignment {
+        workers: results
+            .into_iter()
+            .enumerate()
+            .map(|(id, worker)| (workers[id], worker.chunks))
+            .collect(),
     }
-    Assignment { workers: results }
+}
+
+struct WorkerAssignment {
+    chunks: Vec<ChunkIndex>,
+    allocated: u64,
 }
 
 fn hash(str: &str) -> u64 {

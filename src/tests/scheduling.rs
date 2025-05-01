@@ -16,6 +16,16 @@ fn test_scheduling_stable() {
 }
 
 #[test]
+fn test_scheduling_sorted() {
+    let (chunks, workers, total_size) = generate_input(100, 100_000);
+    let capacity = (total_size as f64 / workers.len() as f64 * 1.1) as u64;
+    let assignment = distribute(&chunks, workers.clone(), capacity);
+    for chunks in assignment.workers.into_values() {
+        assert!(chunks.into_iter().is_sorted());
+    }
+}
+
+#[test]
 fn test_scheduling_uniform() {
     let (chunks, workers, total_size) = generate_input(100, 50_000);
     let per_worker = total_size / workers.len() as u64;
