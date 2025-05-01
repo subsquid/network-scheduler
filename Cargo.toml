@@ -5,16 +5,8 @@ edition = "2024"
 
 [dependencies]
 itertools = "0.14.0"
+libp2p-identity = { version = "0.2.10", features = ["peerid", "rand"] }
+multihash = "0.19.3"
 rand = "0.9.1"
 rayon = "1.10.0"
 seahash = "4.1.0"
-
-[profile.release]
-codegen-units = 1
-lto = true
-target-cpu = "native"
-
-[profile.dev]
-codegen-units = 1
-lto = false
-debug = true
