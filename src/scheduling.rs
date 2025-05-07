@@ -16,7 +16,7 @@ const N_RINGS: usize = 6000;
 pub struct Chunk {
     pub id: String,
     pub size: u32,
-    pub replication: u8,
+    pub replication: u16,
 }
 
 #[instrument(skip_all)]

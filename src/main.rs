@@ -1,4 +1,5 @@
 mod assignment_fb;
+mod replication;
 mod scheduling;
 mod tests;
 mod types;
