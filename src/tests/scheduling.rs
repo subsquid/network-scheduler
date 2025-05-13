@@ -1,4 +1,7 @@
+use std::collections::BTreeMap;
+
 use itertools::Itertools;
+use libp2p_identity::PeerId;
 
 use super::{
     input::generate_input,
@@ -6,7 +9,7 @@ use super::{
 };
 use crate::{
     scheduling::{SchedulingConfig, schedule},
-    types::WorkerIndex,
+    types::{Assignment, WorkerIndex},
 };
 
 #[test]
@@ -114,6 +117,76 @@ fn test_rescheduling_workers_left_strict() {
     let compare_result = compare_intersection(&chunks, &assignment1, &assignment2);
     compare_result.display_stats("GB", 1 << 30);
     assert!(compare_result.removed.values().all(|size| *size == 0));
+}
+
+#[test]
+fn test_rescheduling_workers_became_reliable() {
+    const WORKERS: WorkerIndex = 100;
+    const UNRELIABLE: WorkerIndex = 30;
+
+    let (chunks, workers, total_size) = generate_input(WORKERS, 50_000, &[1]);
+    let workers_with_unreliable = {
+        let mut workers = workers.clone();
+        for i in 0..UNRELIABLE {
+            workers[i as usize].reliable = false;
+        }
+        workers
+    };
+
+    let worker_capacity = 30 * total_size / WORKERS as u64;
+    let config = SchedulingConfig {
+        worker_capacity,
+        saturation: 0.99,
+        min_replication: 1,
+    };
+
+    let assignment1 = schedule(&chunks, &workers_with_unreliable, config.clone()).unwrap();
+    let assignment2 = schedule(&chunks, &workers, config).unwrap();
+
+    let is_reliable = workers_with_unreliable
+        .into_iter()
+        .map(|w| (w.id, w.reliable))
+        .collect::<BTreeMap<_, _>>();
+    let (assignment1_reliable, assignment1_unreliable) =
+        split_by_workers(assignment1, |worker| is_reliable[worker]);
+    let (assignment2_reliable, assignment2_unreliable) =
+        split_by_workers(assignment2, |worker| is_reliable[worker]);
+
+    println!("Reliable workers: {}", assignment1_reliable.workers.len());
+    let compare_result =
+        compare_intersection(&chunks, &assignment1_reliable, &assignment2_reliable);
+    compare_result.display_stats("GB", 1 << 30);
+    assert!(
+        compare_result
+            .removed
+            .values()
+            .all(|size| (*size as f64) < 0.35 * worker_capacity as f64)
+    );
+
+    println!(
+        "Unreliable workers: {}",
+        assignment1_unreliable.workers.len()
+    );
+    let compare_result =
+        compare_intersection(&chunks, &assignment1_unreliable, &assignment2_unreliable);
+    compare_result.display_stats("GB", 1 << 30);
+
+    assert!(compare_result.removed.values().all(|size| *size == 0));
+    assert!(compare_result.added.values().all(|size| *size == 0));
+}
+
+fn split_by_workers(
+    assignment: Assignment,
+    mut predicate: impl FnMut(&PeerId) -> bool,
+) -> (Assignment, Assignment) {
+    let (first, second) = assignment
+        .workers
+        .into_iter()
+        .partition(|(worker, _)| predicate(worker));
+    (
+        Assignment { workers: first },
+        Assignment { workers: second },
+    )
 }
 
 fn ring_iter<'l, T: Ord>(v: &'l [T], from: &T) -> impl Iterator<Item = &'l T> {
