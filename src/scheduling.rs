@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 use itertools::Itertools;
 use libp2p_identity::PeerId;
 use rayon::iter::{
@@ -6,21 +8,114 @@ use rayon::iter::{
 use seahash::hash;
 use tracing::instrument;
 
-use crate::types::{Assignment, ChunkIndex, WorkerIndex};
+use crate::{
+    replication::{ReplicationError, calc_replication_factors},
+    types::{Assignment, ChunkIndex, Worker, WorkerIndex},
+};
 
 type RingIndex = u16;
 
 const N_RINGS: usize = 6000;
 
+#[derive(Debug, Clone)]
+pub struct SchedulingConfig {
+    pub worker_capacity: u64,
+    pub saturation: f64,
+    pub min_replication: u16,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Chunk {
+pub struct WeightedChunk {
     pub id: String,
     pub size: u32,
-    pub replication: u16,
+    pub weight: u16,
+}
+
+pub fn schedule(
+    chunks: &[WeightedChunk],
+    workers: &[Worker],
+    config: SchedulingConfig,
+) -> Result<Assignment, ReplicationError> {
+    tracing::info!("Sorting chunks");
+    let mut worker_ids = Vec::with_capacity(workers.len());
+    worker_ids.extend(workers.iter().filter(|w| w.reliable).map(|w| w.id));
+    let reliable_workers = worker_ids.len();
+    worker_ids.extend(workers.iter().filter(|w| !w.reliable).map(|w| w.id));
+
+    tracing::info!(
+        "Scheduling {} chunks to {} reliable workers",
+        chunks.len(),
+        reliable_workers
+    );
+    let reliable = schedule_to_workers(&chunks, &worker_ids[..reliable_workers], &config)?;
+
+    if reliable_workers == workers.len() {
+        return Ok(reliable);
+    }
+
+    tracing::info!(
+        "Scheduling {} chunks to {} total workers",
+        chunks.len(),
+        workers.len()
+    );
+    let mut all = schedule_to_workers(&chunks, &worker_ids, &config)?;
+
+    // Use assignment from `reliable` for reliable workers and from `all` for unreliable workers
+    for (worker_id, chunk_indexes) in reliable.workers {
+        all.workers.insert(worker_id, chunk_indexes);
+    }
+    Ok(all)
+}
+
+fn schedule_to_workers(
+    chunks: &[WeightedChunk],
+    workers: &[PeerId],
+    config: &SchedulingConfig,
+) -> Result<Assignment, ReplicationError> {
+    let size_by_weight = chunks
+        .iter()
+        .map(|chunk| (chunk.weight, chunk.size as u64))
+        .into_grouping_map()
+        .sum()
+        .into_iter()
+        .collect();
+
+    let capacity =
+        (config.worker_capacity as f64 * workers.len() as f64 * config.saturation) as u64;
+
+    let mapping = calc_replication_factors(size_by_weight, capacity, config.min_replication)?;
+
+    let chunks = chunks
+        .iter()
+        .map(|c| ReplicatedChunk {
+            id: Cow::Borrowed(&c.id),
+            replication: mapping[&c.weight],
+            size: c.size,
+        })
+        .sorted_unstable_by(|l, r| l.id.cmp(&r.id))
+        .collect_vec();
+    tracing::info!(
+        "Replication factors by weight: {:?}, total vchunks: {}",
+        mapping,
+        chunks.iter().map(|c| c.replication as u64).sum::<u64>()
+    );
+
+    Ok(distribute(&chunks, workers, capacity))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReplicatedChunk<'id> {
+    id: Cow<'id, str>,
+    size: u32,
+    replication: u16,
 }
 
 #[instrument(skip_all)]
-pub fn distribute(chunks: &[Chunk], workers: Vec<PeerId>, worker_capacity: u64) -> Assignment {
+fn distribute(
+    chunks: &[ReplicatedChunk],
+    workers: &[PeerId],
+    worker_capacity: u64,
+) -> Assignment {
     let rings = hash_workers(&workers);
     let orderings = hash_chunks(chunks, &rings);
     assign_chunks(orderings, chunks, &workers, rings, worker_capacity)
@@ -54,7 +149,7 @@ fn hash_workers(workers: &[PeerId]) -> Vec<Vec<(u64, WorkerIndex)>> {
 
 #[instrument(skip_all)]
 fn hash_chunks(
-    chunks: &[Chunk],
+    chunks: &[ReplicatedChunk],
     rings: &[Vec<(u64, u16)>],
 ) -> Vec<(ChunkIndex, RingIndex, WorkerIndex)> {
     tracing::info!("Hashing chunks");
@@ -82,7 +177,7 @@ fn hash_chunks(
 #[instrument(skip_all)]
 fn assign_chunks(
     orderings: Vec<(ChunkIndex, RingIndex, WorkerIndex)>,
-    chunks: &[Chunk],
+    chunks: &[ReplicatedChunk],
     worker_ids: &[PeerId],
     rings: Vec<Vec<(u64, WorkerIndex)>>,
     worker_capacity: u64,
@@ -127,7 +222,7 @@ fn assign_chunks(
         workers: workers
             .into_iter()
             .enumerate()
-            .map(|(id, worker)| (worker_ids[id], worker.chunks))
+            .map(|(index, worker)| (worker_ids[index], worker.chunks))
             .collect(),
     }
 }

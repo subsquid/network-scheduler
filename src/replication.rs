@@ -1,5 +1,7 @@
 use std::collections::BTreeMap;
 
+use crate::types::ChunkWeight;
+
 /// Finds such multiplier `K` that
 /// `sum(size_by_weight[w_i] * max(min_replication, round(w_i * K)))` is close to the `capacity`.
 /// Returns the values `max(min_replication, round(w_i * K))` for each weight `w_i`.
@@ -9,10 +11,10 @@ use std::collections::BTreeMap;
 ///
 /// Note that the total resulting size may exceed the `capacity`.
 pub fn calc_replication_factors(
-    size_by_weight: BTreeMap<u16, u64>,
+    size_by_weight: BTreeMap<ChunkWeight, u64>,
     capacity: u64,
     min_replication: u16,
-) -> Result<BTreeMap<u16, u16>, ReplicationError> {
+) -> Result<BTreeMap<ChunkWeight, u16>, ReplicationError> {
     let total_size: u64 = size_by_weight.values().sum();
     if total_size * min_replication as u64 > capacity {
         return Err(ReplicationError::NotEnoughCapacity);

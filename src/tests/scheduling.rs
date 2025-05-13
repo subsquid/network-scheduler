@@ -4,22 +4,43 @@ use super::{
     input::generate_input,
     utils::{Stats, compare_intersection},
 };
-use crate::{scheduling::distribute, types::WorkerIndex};
+use crate::{
+    scheduling::{SchedulingConfig, schedule},
+    types::WorkerIndex,
+};
 
 #[test]
 fn test_scheduling_stable() {
-    let (chunks, workers, total_size) = generate_input(100, 100_000);
-    let capacity = (total_size as f64 / workers.len() as f64 * 1.1) as u64;
-    let assignment1 = distribute(&chunks, workers.clone(), capacity);
-    let assignment2 = distribute(&chunks, workers.clone(), capacity);
+    let (mut chunks, mut workers, total_size) = generate_input(100, 100_000, &[1]);
+    let capacity = (total_size as f64 / workers.len() as f64 * 30.) as u64;
+    let config = SchedulingConfig {
+        worker_capacity: capacity,
+        saturation: 0.95,
+        min_replication: 1,
+    };
+
+    let assignment1 = schedule(&chunks, &workers, config.clone()).unwrap();
+    chunks.reverse();
+    workers.reverse();
+    let assignment2 = schedule(&chunks, &workers, config).unwrap();
+
     assert_eq!(assignment1, assignment2);
 }
 
 #[test]
 fn test_scheduling_sorted() {
-    let (chunks, workers, total_size) = generate_input(100, 100_000);
-    let capacity = (total_size as f64 / workers.len() as f64 * 1.1) as u64;
-    let assignment = distribute(&chunks, workers.clone(), capacity);
+    let (chunks, workers, total_size) = generate_input(100, 100_000, &[1]);
+    let capacity = (total_size as f64 / workers.len() as f64 * 30.) as u64;
+    let assignment = schedule(
+        &chunks,
+        &workers,
+        SchedulingConfig {
+            worker_capacity: capacity,
+            saturation: 0.999,
+            min_replication: 1,
+        },
+    )
+    .unwrap();
     for chunks in assignment.workers.into_values() {
         assert!(chunks.into_iter().is_sorted());
     }
@@ -27,10 +48,18 @@ fn test_scheduling_sorted() {
 
 #[test]
 fn test_scheduling_uniform() {
-    let (chunks, workers, total_size) = generate_input(100, 50_000);
-    let per_worker = total_size / workers.len() as u64;
-    let capacity = (per_worker as f64 * 1.05) as u64;
-    let assignment = distribute(&chunks, workers.clone(), capacity);
+    let (chunks, workers, total_size) = generate_input(100, 50_000, &[1]);
+    let capacity = (total_size as f64 / workers.len() as f64 * 30.) as u64;
+    let assignment = schedule(
+        &chunks,
+        &workers,
+        SchedulingConfig {
+            worker_capacity: capacity,
+            saturation: 0.95,
+            min_replication: 1,
+        },
+    )
+    .unwrap();
 
     let mut sizes: Vec<u64> = vec![0; workers.len()];
     for (worker_index, chunk_indexes) in assignment.workers.into_values().enumerate() {
@@ -52,45 +81,35 @@ fn test_scheduling_uniform() {
 }
 
 #[test]
-fn test_rescheduling_workers_left() {
-    const ALPHA: f64 = 1.05;
-    const WORKERS: WorkerIndex = 100;
-
-    let (chunks, mut workers, total_size) = generate_input(WORKERS, 50_000);
-    let assignment1 = distribute(
-        &chunks,
-        workers.clone(),
-        ((total_size / workers.len() as u64) as f64 * ALPHA) as u64,
-    );
-    workers.truncate(WORKERS as usize - 10);
-    // Capacity grows to accomodate all the chunks
-    let assignment2 = distribute(
-        &chunks,
-        workers.clone(),
-        ((total_size / workers.len() as u64) as f64 * ALPHA) as u64,
-    );
-
-    let compare_result = compare_intersection(&chunks, &assignment1, &assignment2);
-    compare_result.display_stats("GB", 1 << 30);
-    assert!(
-        compare_result
-            .removed
-            .values()
-            .all(|size| *size < total_size / WORKERS as u64 / 50)
-    );
-}
-
-#[test]
 fn test_rescheduling_workers_left_strict() {
-    const ALPHA: f64 = 1.001;
     const WORKERS_BEFORE: WorkerIndex = 100;
     const WORKERS_AFTER: WorkerIndex = 90;
 
-    let (chunks, mut workers, total_size) = generate_input(WORKERS_BEFORE, 50_000);
-    let capacity = ((total_size / WORKERS_AFTER as u64) as f64 * ALPHA) as u64;
-    let assignment1 = distribute(&chunks, workers.clone(), capacity);
+    let (chunks, mut workers, total_size) = generate_input(WORKERS_BEFORE, 50_000, &[1]);
+    let total_capacity = 30 * total_size;
+    let assignment1 = schedule(
+        &chunks,
+        &workers,
+        SchedulingConfig {
+            worker_capacity: total_capacity / WORKERS_BEFORE as u64,
+            saturation: 0.99,
+            min_replication: 1,
+        },
+    )
+    .unwrap();
+
     workers.truncate(WORKERS_AFTER as usize);
-    let assignment2 = distribute(&chunks, workers.clone(), capacity);
+    // Capacity grows to accomodate all the chunks
+    let assignment2 = schedule(
+        &chunks,
+        &workers,
+        SchedulingConfig {
+            worker_capacity: total_capacity / WORKERS_AFTER as u64,
+            saturation: 0.99,
+            min_replication: 1,
+        },
+    )
+    .unwrap();
 
     let compare_result = compare_intersection(&chunks, &assignment1, &assignment2);
     compare_result.display_stats("GB", 1 << 30);
