@@ -1,34 +1,38 @@
-use itertools::Itertools;
-use types::Worker;
+use clap::Parser;
+use tracing_subscriber::filter;
 
-mod assignment_fb;
+mod cli;
+mod metrics;
+mod parquet;
+mod pool;
 mod replication;
 mod scheduling;
+mod storage;
 mod tests;
 mod types;
 
-fn main() {
+#[tokio::main]
+async fn main() {
+    dotenv::dotenv().ok();
+    let args = cli::Args::parse();
+
     tracing_subscriber::fmt()
+        .with_env_filter(filter::EnvFilter::from_default_env())
         .with_span_events(tracing_subscriber::fmt::format::FmtSpan::CLOSE)
         .init();
 
-    let chunks = tests::input::generate_chunks(10_000_000, &[1, 2, 6, 12]);
-    let workers = tests::input::generate_workers(2000)
-        .into_iter()
-        .map(|id| Worker {
-            id,
-            reliable: rand::random_bool(0.9),
-        })
-        .collect_vec();
-    let worker_capacity = 1 << 43; // 8TB
-    scheduling::schedule(
-        &chunks,
-        &workers,
-        scheduling::SchedulingConfig {
-            worker_capacity,
-            saturation: 0.95,
-            min_replication: 5,
-        },
-    )
-    .unwrap();
+    let datasets_storage = storage::S3Storage::new(args.s3_config().await);
+    let chunks = datasets_storage
+        .load_all_chunks(
+            [
+                "ethereum-mainnet-1",
+                "exosama-1",
+                "svm-bnb-mainnet-0",
+                "turing-mainnet",
+            ],
+            3,
+        )
+        .await
+        .unwrap();
+    println!("{:?}", chunks.keys());
 }

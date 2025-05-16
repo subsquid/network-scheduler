@@ -4,11 +4,24 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+anyhow = "1.0.98"
+aws-config = { version = "1.6.2", features = ["behavior-version-latest"] }
+aws-sdk-s3 = "1.85.0"
+clap = { version = "4.5.38", features = ["derive", "env"] }
+dotenv = "0.15.0"
+futures = "0.3.31"
 itertools = "0.14.0"
+lazy_static = "1.5.0"
 libp2p-identity = { version = "0.2.10", features = ["peerid", "rand"] }
 multihash = "0.19.3"
+parking_lot = "0.12.3"
+parquet = "54.2"
+prometheus-client = "0.23.1"
 rand = "0.9.1"
 rayon = "1.10.0"
 seahash = "4.1.0"
+sqd-messages = { git = "https://github.com/subsquid/sqd-network.git", rev = "6538cd5", features = ["bitstring", "assignment_writer"] }
+tempfile = "3.20.0"
+tokio = { version = "1.45.0", features = ["full"] }
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.19", features = ["env-filter", "parking_lot"] }
