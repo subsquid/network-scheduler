@@ -12,9 +12,10 @@ mod tests;
 mod types;
 
 #[tokio::main]
-async fn main() {
+async fn main() -> anyhow::Result<()> {
     dotenv::dotenv().ok();
     let args = cli::Args::parse();
+    let config = cli::Config::load(&args.config)?;
 
     tracing_subscriber::fmt()
         .with_env_filter(filter::EnvFilter::from_default_env())
@@ -23,16 +24,9 @@ async fn main() {
 
     let datasets_storage = storage::S3Storage::new(args.s3_config().await);
     let chunks = datasets_storage
-        .load_all_chunks(
-            [
-                "ethereum-mainnet-1",
-                "exosama-1",
-                "svm-bnb-mainnet-0",
-                "turing-mainnet",
-            ],
-            3,
-        )
+        .load_all_chunks(config.datasets.keys(), 3)
         .await
         .unwrap();
     println!("{:?}", chunks.keys());
+    Ok(())
 }
