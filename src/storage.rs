@@ -66,8 +66,9 @@ impl DatasetStorage {
         self.dataset.clone()
     }
 
-    #[instrument(skip_all, fields(dataset = %self.dataset))]
+    #[instrument(skip_all, level = "debug", fields(dataset = %self.dataset))]
     pub async fn list_new_chunks(&self, last_chunk: Option<Chunk>) -> anyhow::Result<Vec<Chunk>> {
+        tracing::debug!("Downloading chunks from {}", self.dataset);
         let mut next_expected_block = last_chunk.as_ref().map(|chunk| chunk.blocks.end() + 1);
         let last_key =
             last_chunk.map(|chunk| format!("{}/{}", chunk.id, chunk.files.iter().max().unwrap()));
@@ -190,7 +191,7 @@ impl DatasetStorage {
     }
 
     async fn download_object(&self, key: &str, file: &mut tokio::fs::File) -> anyhow::Result<()> {
-        tracing::debug!(
+        tracing::trace!(
             "Downloading object {}/{} to extract summary",
             self.bucket,
             key
@@ -204,7 +205,7 @@ impl DatasetStorage {
             .await?;
         let mut stream = response.body.into_async_read();
         tokio::io::copy(&mut stream, file).await?;
-        tracing::debug!("Downloaded object {}/{}", self.bucket, key);
+        tracing::trace!("Downloaded object {}/{}", self.bucket, key);
         Ok(())
     }
 }

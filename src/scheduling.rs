@@ -36,7 +36,6 @@ pub fn schedule(
     workers: &[Worker],
     config: SchedulingConfig,
 ) -> Result<Assignment, ReplicationError> {
-    tracing::info!("Sorting chunks");
     let mut worker_ids = Vec::with_capacity(workers.len());
     worker_ids.extend(workers.iter().filter(|w| w.reliable).map(|w| w.id));
     let reliable_workers = worker_ids.len();
@@ -80,10 +79,10 @@ fn schedule_to_workers(
         .into_iter()
         .collect();
 
-    let capacity =
+    let total_capacity =
         (config.worker_capacity as f64 * workers.len() as f64 * config.saturation) as u64;
 
-    let mapping = calc_replication_factors(size_by_weight, capacity, config.min_replication)?;
+    let mapping = calc_replication_factors(size_by_weight, total_capacity, config.min_replication)?;
 
     let chunks = chunks
         .iter()
@@ -92,15 +91,16 @@ fn schedule_to_workers(
             replication: mapping[&c.weight],
             size: c.size,
         })
-        .sorted_unstable_by(|l, r| l.id.cmp(&r.id))
         .collect_vec();
+    debug_assert!(chunks.is_sorted_by_key(|c| &c.id));
+
     tracing::info!(
         "Replication factors by weight: {:?}, total vchunks: {}",
         mapping,
         chunks.iter().map(|c| c.replication as u64).sum::<u64>()
     );
 
-    Ok(distribute(&chunks, workers, capacity))
+    Ok(distribute(&chunks, workers, config.worker_capacity))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -111,11 +111,7 @@ struct ReplicatedChunk<'id> {
 }
 
 #[instrument(skip_all)]
-fn distribute(
-    chunks: &[ReplicatedChunk],
-    workers: &[PeerId],
-    worker_capacity: u64,
-) -> Assignment {
+fn distribute(chunks: &[ReplicatedChunk], workers: &[PeerId], worker_capacity: u64) -> Assignment {
     let rings = hash_workers(&workers);
     let orderings = hash_chunks(chunks, &rings);
     assign_chunks(orderings, chunks, &workers, rings, worker_capacity)
