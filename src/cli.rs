@@ -24,6 +24,15 @@ pub struct Args {
     )]
     pub config: PathBuf,
 
+    #[command(flatten)]
+    pub s3: S3Args,
+
+    #[command(flatten)]
+    pub clickhouse: ClickhouseArgs,
+}
+
+#[derive(clap::Args, Debug)]
+pub struct S3Args {
     #[arg(env, hide = true)]
     aws_s3_endpoint: String,
 
@@ -37,8 +46,20 @@ pub struct Args {
     aws_region: String,
 }
 
-impl Args {
-    pub async fn s3_config(&self) -> aws_config::SdkConfig {
+#[derive(clap::Args, Debug)]
+pub struct ClickhouseArgs {
+    #[arg(long, env)]
+    pub clickhouse_url: String,
+    #[arg(long, env)]
+    pub clickhouse_database: String,
+    #[arg(long, env)]
+    pub clickhouse_user: String,
+    #[arg(long, env)]
+    pub clickhouse_password: String,
+}
+
+impl S3Args {
+    pub async fn config(&self) -> aws_config::SdkConfig {
         aws_config::from_env()
             .endpoint_url(self.aws_s3_endpoint.clone())
             .load()
@@ -58,6 +79,12 @@ pub struct Config {
     pub worker_storage_bytes: u64,
 
     pub min_replication: u16,
+
+    /// The fraction of the worker storage that is actually filled (on average).
+    /// The closer it gets to 1, the less consisent the distribution is.
+    /// Corresponds to `1 / (1 + epsilon)` from this paper:
+    /// https://research.google/blog/consistent-hashing-with-bounded-loads/
+    pub saturation: f64,
 
     pub storage_domain: String,
 

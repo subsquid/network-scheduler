@@ -54,8 +54,9 @@ pub fn calc_replication_factors(
         .collect())
 }
 
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum ReplicationError {
+    #[error("Not enough capacity to schedule chunks")]
     NotEnoughCapacity,
 }
 

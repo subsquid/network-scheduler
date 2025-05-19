@@ -8,6 +8,7 @@ anyhow = "1.0.98"
 aws-config = { version = "1.6.2", features = ["behavior-version-latest"] }
 aws-sdk-s3 = "1.85.0"
 clap = { version = "4.5.38", features = ["derive", "env"] }
+clickhouse = "0.13.2"
 dotenv = "0.15.0"
 futures = "0.3.31"
 itertools = "0.14.0"
@@ -26,6 +27,7 @@ serde_with = "3.12.0"
 serde_yaml = "0.9.34"
 sqd-messages = { git = "https://github.com/subsquid/sqd-network.git", rev = "6538cd5", features = ["bitstring", "assignment_writer"] }
 tempfile = "3.20.0"
+thiserror = "2.0.12"
 tokio = { version = "1.45.0", features = ["full"] }
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.19", features = ["env-filter", "parking_lot"] }
