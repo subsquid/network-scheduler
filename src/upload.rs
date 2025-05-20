@@ -14,8 +14,8 @@ pub struct Uploader {
 }
 
 impl Uploader {
-    pub fn new(s3_config: aws_config::SdkConfig) -> Self {
-        let client = s3::Client::new(&s3_config);
+    pub fn new(s3_config: &aws_config::SdkConfig) -> Self {
+        let client = s3::Client::new(s3_config);
         Self { client }
     }
 

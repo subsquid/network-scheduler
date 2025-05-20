@@ -46,7 +46,7 @@ pub fn schedule(
         chunks.len(),
         reliable_workers
     );
-    let reliable = schedule_to_workers(&chunks, &worker_ids[..reliable_workers], &config)?;
+    let reliable = schedule_to_workers(chunks, &worker_ids[..reliable_workers], &config)?;
 
     if reliable_workers == workers.len() {
         return Ok(reliable);
@@ -57,7 +57,7 @@ pub fn schedule(
         chunks.len(),
         workers.len()
     );
-    let mut all = schedule_to_workers(&chunks, &worker_ids, &config)?;
+    let mut all = schedule_to_workers(chunks, &worker_ids, &config)?;
 
     // Use assignment from `reliable` for reliable workers and from `all` for unreliable workers
     for (worker_id, chunk_indexes) in reliable.workers {
@@ -112,9 +112,9 @@ struct ReplicatedChunk<'id> {
 
 #[instrument(skip_all)]
 fn distribute(chunks: &[ReplicatedChunk], workers: &[PeerId], worker_capacity: u64) -> Assignment {
-    let rings = hash_workers(&workers);
+    let rings = hash_workers(workers);
     let orderings = hash_chunks(chunks, &rings);
-    assign_chunks(orderings, chunks, &workers, rings, worker_capacity)
+    assign_chunks(orderings, chunks, workers, rings, worker_capacity)
 }
 
 #[instrument(skip_all)]

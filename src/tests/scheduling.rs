@@ -14,7 +14,7 @@ use crate::{
 
 #[test]
 fn test_scheduling_stable() {
-    let (mut chunks, mut workers, total_size) = generate_input(100, 100_000, &[1]);
+    let (chunks, mut workers, total_size) = generate_input(100, 100_000, &[1]);
     let capacity = (total_size as f64 / workers.len() as f64 * 30.) as u64;
     let config = SchedulingConfig {
         worker_capacity: capacity,

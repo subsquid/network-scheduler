@@ -20,7 +20,7 @@ impl Assignment {
                 "Worker {}: {}GB, {} chunks",
                 worker_id,
                 chunk_indexes
-                    .into_iter()
+                    .iter()
                     .map(|i| chunks[*i as usize].size as u64)
                     .sum::<u64>()
                     / (1 << 30),
@@ -30,7 +30,7 @@ impl Assignment {
     }
 
     pub fn encode(self, chunks: Vec<Chunk>, config: &cli::Config) -> model::Assignment {
-        let mut assignment: model::Assignment = Default::default();
+        let mut assignment = model::Assignment::default();
         for chunk in chunks {
             let download_url = format!("https://{}.{}", chunk.bucket(), config.storage_domain);
             let chunk_str = chunk.id;

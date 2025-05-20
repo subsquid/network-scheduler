@@ -21,8 +21,8 @@ pub struct S3Storage {
 }
 
 impl S3Storage {
-    pub fn new(s3_config: aws_config::SdkConfig) -> Self {
-        let client = s3::Client::new(&s3_config);
+    pub fn new(s3_config: &aws_config::SdkConfig) -> Self {
+        let client = s3::Client::new(s3_config);
         Self { client }
     }
 
@@ -76,11 +76,7 @@ impl DatasetStorage {
         let objects = self.list_new_objects(last_key).await?;
 
         let mut chunks = Vec::new();
-        for (_, objects) in objects
-            .into_iter()
-            .chunk_by(|obj| obj.prefix.clone())
-            .into_iter()
-        {
+        for (_, objects) in &objects.into_iter().chunk_by(|obj| obj.prefix.clone()) {
             match self.objects_to_chunk(objects)? {
                 Some(chunk) => chunks.push(chunk),
                 None => break,
@@ -88,7 +84,7 @@ impl DatasetStorage {
         }
 
         // Verify if chunks are continuous
-        for chunk in chunks.iter() {
+        for chunk in &chunks {
             if next_expected_block.is_some_and(|next_block| *chunk.blocks.start() != next_block) {
                 anyhow::bail!(
                     "Blocks {} to {} missing from {}",
@@ -103,10 +99,7 @@ impl DatasetStorage {
         if let Some(last_chunk) = chunks.last_mut() {
             self.populate_with_summary(last_chunk)
                 .await
-                .context(format!(
-                    "couldn't download chunk summary for {}",
-                    last_chunk
-                ))?;
+                .context(format!("couldn't download chunk summary for {last_chunk}"))?;
         }
 
         tracing::debug!("Downloaded {} chunks", chunks.len());
@@ -216,12 +209,6 @@ struct S3Object {
     prefix: String,
     file_name: String,
     size: u32,
-}
-
-impl S3Object {
-    fn key(&self) -> String {
-        format!("{}/{}", self.prefix, self.file_name)
-    }
 }
 
 impl TryFrom<s3::types::Object> for S3Object {

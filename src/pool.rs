@@ -31,18 +31,18 @@ impl<T: Hash + Eq> Pool<T> {
 
 // Statics with generic types are not supported, so separate statics are needed for each type
 
-trait Intern {
+pub trait Intern {
     fn intern(self) -> Arc<Self>;
 }
 
-static STRING_POOL: LazyLock<Mutex<Pool<String>>> = LazyLock::new(|| Default::default());
+static STRING_POOL: LazyLock<Mutex<Pool<String>>> = LazyLock::new(Default::default);
 impl Intern for String {
     fn intern(self) -> Arc<Self> {
         STRING_POOL.lock().intern(self)
     }
 }
 
-static VEC_STRINGS_POOL: LazyLock<Mutex<Pool<Vec<String>>>> = LazyLock::new(|| Default::default());
+static VEC_STRINGS_POOL: LazyLock<Mutex<Pool<Vec<String>>>> = LazyLock::new(Default::default);
 impl Intern for Vec<String> {
     fn intern(self) -> Arc<Self> {
         VEC_STRINGS_POOL.lock().intern(self)

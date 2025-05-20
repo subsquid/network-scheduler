@@ -12,6 +12,7 @@ mod pool;
 mod replication;
 mod scheduling;
 mod storage;
+#[cfg(test)]
 mod tests;
 mod types;
 mod upload;
@@ -26,7 +27,7 @@ async fn main() -> anyhow::Result<()> {
     let config = cli::Config::load(&args.config).context("Can't parse config")?;
 
     tracing::info!("Reading datasets...");
-    let datasets_storage = storage::S3Storage::new(args.s3.config().await);
+    let datasets_storage = storage::S3Storage::new(&args.s3.config().await);
     let datasets = datasets_storage
         .load_all_chunks(config.datasets.keys(), config.concurrent_dataset_downloads)
         .await
@@ -73,7 +74,7 @@ async fn main() -> anyhow::Result<()> {
     let encoded = assignment.encode(chunks, &config);
 
     tracing::info!("Uploading assignment");
-    let uploader = upload::Uploader::new(args.s3.config().await);
+    let uploader = upload::Uploader::new(&args.s3.config().await);
     let url = uploader.save_assignment(encoded, &config).await?;
 
     tracing::info!("Assignment uploaded to {url}");

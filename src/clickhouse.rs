@@ -12,7 +12,6 @@ const PINGS_TABLE: &str = "worker_pings_v2";
 #[derive(Row, Debug, Deserialize)]
 struct PingRow {
     worker_id: String,
-    timestamp: u64,
     version: String,
     stored_bytes: u64,
 }
@@ -39,12 +38,12 @@ impl ClickhouseReader {
         let from_time = (SystemTime::now() - threshold)
             .duration_since(UNIX_EPOCH)?
             .as_secs();
-        let query = r#"
-            SELECT DISTINCT ON (worker_id) worker_id, timestamp, version, stored_bytes
+        let query = r"
+            SELECT DISTINCT ON (worker_id) worker_id, version, stored_bytes
             FROM ?
             WHERE timestamp >= ?
             ORDER BY worker_id, timestamp DESC
-        "#;
+        ";
 
         let mut cursor = self
             .client

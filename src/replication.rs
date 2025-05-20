@@ -27,7 +27,7 @@ pub fn calc_replication_factors(
     let mut remaining_size_per_weight_sum = size_per_weight_sum;
     let mut fixed_size = 0;
     let mut multiplier = 0.;
-    for (&weight, &size) in size_by_weight.iter() {
+    for (&weight, &size) in &size_by_weight {
         // All previous chunks get the minimal replication factor
         // Try to distribute what's left between the remaining chunks
         let surplus = capacity.saturating_sub(fixed_size);
@@ -41,11 +41,11 @@ pub fn calc_replication_factors(
     }
     tracing::debug!("Replication multiplier: {multiplier:.2}");
 
-    assert!((*size_by_weight.last_key_value().unwrap().0 as f64 * multiplier as f64) < 10000.);
+    assert!((*size_by_weight.last_key_value().unwrap().0 as f64 * multiplier) < 10000.);
 
     Ok(size_by_weight
-        .into_iter()
-        .map(|(weight, _)| {
+        .into_keys()
+        .map(|weight| {
             (
                 weight,
                 min_replication.max((weight as f64 * multiplier) as u16),
