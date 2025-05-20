@@ -25,6 +25,9 @@ impl Chunk {
         let files = pool::intern(files);
         let chunk = sqd_messages::data_chunk::DataChunk::from_str(&id)
             .map_err(|()| anyhow::anyhow!("Can't parse chunk id: {id}"))?;
+        if !dataset.starts_with("s3://") {
+            anyhow::bail!("Dataset must start with s3://");
+        }
         Ok(Self {
             dataset,
             id,
@@ -33,6 +36,10 @@ impl Chunk {
             size,
             summary: None,
         })
+    }
+
+    pub fn bucket(&self) -> &str {
+        self.dataset.strip_prefix("s3://").unwrap()
     }
 }
 

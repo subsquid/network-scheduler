@@ -86,6 +86,8 @@ pub struct Config {
     /// https://research.google/blog/consistent-hashing-with-bounded-loads/
     pub saturation: f64,
 
+    pub network: String,
+
     pub storage_domain: String,
 
     pub network_state_name: String,
@@ -110,6 +112,9 @@ pub struct Config {
     #[serde_as(as = "DurationSeconds")]
     #[serde(rename = "assignment_ttl_sec", default = "default_assignment_ttl")]
     pub assignment_ttl: Duration,
+
+    #[serde(skip_serializing, default = "default_concurrent_downloads")]
+    pub concurrent_dataset_downloads: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -142,4 +147,8 @@ fn default_assignment_delay() -> Duration {
 
 fn default_weight() -> ChunkWeight {
     1
+}
+
+fn default_concurrent_downloads() -> usize {
+    20
 }

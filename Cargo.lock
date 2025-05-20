@@ -889,8 +889,10 @@ checksum = "c469d952047f47f91b68d1cba3f10d63c11d73e4636f24f08daf0278abf01c4d"
 dependencies = [
  "android-tzdata",
  "iana-time-zone",
+ "js-sys",
  "num-traits",
  "serde",
+ "wasm-bindgen",
  "windows-link",
 ]
 
@@ -2399,9 +2401,11 @@ dependencies = [
  "anyhow",
  "aws-config",
  "aws-sdk-s3",
+ "chrono",
  "clap",
  "clickhouse",
  "dotenv",
+ "flate2",
  "futures",
  "itertools 0.14.0",
  "lazy_static",
@@ -2415,8 +2419,10 @@ dependencies = [
  "seahash",
  "semver",
  "serde",
+ "serde_json",
  "serde_with",
  "serde_yaml",
+ "sha2",
  "sqd-messages",
  "tempfile",
  "thiserror 2.0.12",
