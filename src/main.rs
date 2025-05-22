@@ -26,6 +26,17 @@ async fn main() -> anyhow::Result<()> {
 
     let config = cli::Config::load(&args.config).context("Can't parse config")?;
 
+    let db = clickhouse::ClickhouseReader::new(&args.clickhouse);
+    let workers = db
+        .get_active_workers(
+            config.worker_inactive_timeout,
+            &config.supported_worker_versions,
+        )
+        .await
+        .context("Can't read active workers from Clickhouse")?;
+    tracing::info!("Found {} workers", workers.len());
+    tracing::debug!("Workers: {workers:#?}");
+
     tracing::info!("Reading datasets...");
     let datasets_storage = storage::S3Storage::new(&args.s3.config().await);
     let datasets = datasets_storage
@@ -42,16 +53,6 @@ async fn main() -> anyhow::Result<()> {
         datasets_num,
         chunks.len()
     );
-
-    let db = clickhouse::ClickhouseReader::new(&args.clickhouse);
-    let workers = db
-        .get_active_workers(
-            config.worker_inactive_timeout,
-            &config.supported_worker_versions,
-        )
-        .await
-        .context("Can't read active workers from Clickhouse")?;
-    tracing::info!("Found {} workers", workers.len());
 
     let weighted_chunks = weight_chunks(&chunks, &config);
 
