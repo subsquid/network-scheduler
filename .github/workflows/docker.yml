@@ -10,7 +10,7 @@ env:
 jobs:
   publish:
     name: Build and publish docker image
-    runs-on: [self-hosted]
+    runs-on: ubuntu-latest
     steps:
       - name: Get version
         run: |
@@ -28,7 +28,7 @@ jobs:
           password: ${{ secrets.DOCKER_TOKEN }}
 
       - name: Docker build and push
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@v6
         with:
           platforms: linux/amd64,linux/arm/v7,linux/arm64/v8,linux/386
           push: true
