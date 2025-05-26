@@ -1,4 +1,4 @@
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use anyhow::Result;
 use clickhouse::{Client, Row};
@@ -35,13 +35,11 @@ impl ClickhouseReader {
         threshold: Duration,
         versions: &VersionReq,
     ) -> Result<Vec<Worker>> {
-        let from_time = (SystemTime::now() - threshold)
-            .duration_since(UNIX_EPOCH)?
-            .as_secs();
+        let seconds = threshold.as_secs();
         let query = r"
             SELECT DISTINCT ON (worker_id) worker_id, version, stored_bytes
             FROM ?
-            WHERE timestamp >= ?
+            WHERE timestamp >= (SELECT MAX(timestamp) FROM ?) - INTERVAL ? SECOND
             ORDER BY worker_id, timestamp DESC
         ";
 
@@ -49,7 +47,8 @@ impl ClickhouseReader {
             .client
             .query(query)
             .bind(PINGS_TABLE)
-            .bind(from_time)
+            .bind(PINGS_TABLE)
+            .bind(seconds)
             .fetch::<PingRow>()?;
 
         let mut results = Vec::new();
