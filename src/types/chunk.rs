@@ -6,7 +6,7 @@ use super::BlockNumber;
 
 #[derive(Debug, Clone)]
 pub struct Chunk {
-    pub dataset: Arc<str>,
+    pub dataset: Arc<String>,
     pub id: String,
     pub size: u32,
     pub blocks: RangeInclusive<BlockNumber>,
@@ -16,7 +16,7 @@ pub struct Chunk {
 
 impl Chunk {
     pub fn new(
-        dataset: Arc<str>,
+        dataset: Arc<String>,
         id: String,
         size: u32,
         mut files: Vec<String>,

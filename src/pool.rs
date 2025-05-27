@@ -6,7 +6,7 @@ use std::{
 
 use parking_lot::Mutex;
 
-/// Reusus memory for frequently used values
+/// Reuses memory for frequently used values
 pub fn intern<T: Intern>(value: T) -> Arc<T> {
     value.intern()
 }

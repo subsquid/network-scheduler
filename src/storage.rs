@@ -1,5 +1,4 @@
 use std::collections::BTreeMap;
-use std::fmt::Display;
 use std::sync::Arc;
 
 use anyhow::Context;
@@ -26,18 +25,17 @@ impl S3Storage {
         Self { client }
     }
 
-    pub async fn load_all_chunks(
+    pub async fn load_newer_chunks(
         &self,
-        buckets: impl IntoIterator<Item = impl Display>,
+        datasets: impl IntoIterator<Item = (Arc<String>, Option<&Chunk>)>,
         concurrent_downloads: usize,
-    ) -> anyhow::Result<BTreeMap<Arc<str>, Vec<Chunk>>> {
-        stream::iter(buckets)
-            .map(|bucket| {
-                let storage = DatasetStorage::new(self.client.clone(), bucket);
+    ) -> anyhow::Result<BTreeMap<Arc<String>, Vec<Chunk>>> {
+        stream::iter(datasets)
+            .map(|(dataset, last_chunk)| {
+                let storage = DatasetStorage::new(self.client.clone(), dataset);
                 async move {
-                    let last_chunk = None;
                     let chunks = storage.list_new_chunks(last_chunk).await?;
-                    anyhow::Ok((storage.dataset(), chunks))
+                    anyhow::Ok((storage.dataset, chunks))
                 }
             })
             .buffer_unordered(concurrent_downloads)
@@ -48,26 +46,23 @@ impl S3Storage {
 
 #[derive(Clone)]
 struct DatasetStorage {
-    bucket: String,
     client: s3::Client,
-    dataset: Arc<str>,
+    dataset: Arc<String>,
 }
 
 impl DatasetStorage {
-    pub fn new(client: s3::Client, bucket: impl Display) -> Self {
-        Self {
-            dataset: format!("s3://{bucket}").into(),
-            bucket: bucket.to_string(),
-            client,
-        }
+    pub fn new(client: s3::Client, dataset: Arc<String>) -> Self {
+        Self { dataset, client }
     }
 
-    pub fn dataset(&self) -> Arc<str> {
-        self.dataset.clone()
+    pub fn bucket(&self) -> &str {
+        self.dataset
+            .strip_prefix("s3://")
+            .expect("Dataset should start with s3://")
     }
 
     #[instrument(skip_all, level = "debug", fields(dataset = %self.dataset))]
-    pub async fn list_new_chunks(&self, last_chunk: Option<Chunk>) -> anyhow::Result<Vec<Chunk>> {
+    pub async fn list_new_chunks(&self, last_chunk: Option<&Chunk>) -> anyhow::Result<Vec<Chunk>> {
         tracing::debug!("Downloading chunks from {}", self.dataset);
         let mut next_expected_block = last_chunk.as_ref().map(|chunk| chunk.blocks.end() + 1);
         let last_key =
@@ -117,7 +112,7 @@ impl DatasetStorage {
             let objects = self
                 .client
                 .list_objects_v2()
-                .bucket(&self.bucket)
+                .bucket(self.bucket())
                 .set_start_after(last_key.take())
                 .set_continuation_token(continuation_token)
                 .send()
@@ -126,7 +121,7 @@ impl DatasetStorage {
             metrics::S3_KEYS_LISTED.inc_by(objects.key_count().unwrap() as i64);
             tracing::trace!("Got {} S3 objects", objects.key_count().unwrap());
 
-            for object in objects.contents.unwrap() {
+            for object in objects.contents.into_iter().flatten() {
                 result.push(S3Object::try_from(object)?);
             }
             continuation_token = objects.next_continuation_token;
@@ -178,7 +173,7 @@ impl DatasetStorage {
             tokio::task::spawn_blocking(move || crate::parquet::read_chunk_summary(temp_file))
                 .await??;
 
-        tracing::debug!("Adding summary to {}/{}: {:?}", self.bucket, key, summary);
+        tracing::debug!("Adding summary to {}/{}: {:?}", self.bucket(), key, summary);
         data_chunk.summary = Some(summary);
         Ok(())
     }
@@ -186,19 +181,19 @@ impl DatasetStorage {
     async fn download_object(&self, key: &str, file: &mut tokio::fs::File) -> anyhow::Result<()> {
         tracing::trace!(
             "Downloading object {}/{} to extract summary",
-            self.bucket,
+            self.bucket(),
             key
         );
         let response = self
             .client
             .get_object()
-            .bucket(&self.bucket)
+            .bucket(self.bucket())
             .key(key)
             .send()
             .await?;
         let mut stream = response.body.into_async_read();
         tokio::io::copy(&mut stream, file).await?;
-        tracing::trace!("Downloaded object {}/{}", self.bucket, key);
+        tracing::trace!("Downloaded object {}/{}", self.bucket(), key);
         Ok(())
     }
 }

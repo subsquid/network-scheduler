@@ -24,7 +24,7 @@ pub struct SchedulingConfig {
     pub min_replication: u16,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct WeightedChunk {
     pub id: String,
     pub size: u32,
