@@ -5,7 +5,7 @@ use rayon::iter::{IntoParallelIterator, ParallelIterator};
 
 use crate::{
     scheduling::WeightedChunk,
-    types::{ChunkIndex, ChunkWeight, Worker, WorkerIndex},
+    types::{ChunkIndex, ChunkWeight, Worker, WorkerIndex, WorkerStatus},
 };
 
 #[tracing::instrument(skip_all)]
@@ -18,7 +18,10 @@ pub fn generate_input(
     let chunks = generate_chunks(n_chunks, weights);
     let workers = generate_workers(n_workers)
         .into_iter()
-        .map(|id| Worker { id, reliable: true })
+        .map(|id| Worker {
+            id,
+            status: WorkerStatus::Online,
+        })
         .collect_vec();
     let total_size: u64 = chunks.iter().map(|chunk| chunk.size as u64).sum();
     let per_worker = total_size / workers.len() as u64;

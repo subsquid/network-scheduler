@@ -10,7 +10,7 @@ use sqd_messages::assignments::ChunkSummary;
 use crate::{
     cli::ClickhouseArgs,
     pool,
-    types::{Chunk, Worker},
+    types::{Chunk, Worker, WorkerStatus},
 };
 
 const PINGS_TABLE: &str = "worker_pings_v2";
@@ -73,9 +73,14 @@ impl ClickhouseClient {
                     continue;
                 }
             };
+            let status = if row.stored_bytes > 0 {
+                WorkerStatus::Online
+            } else {
+                WorkerStatus::Stale // TODO: set a higher threshold
+            };
             results.push(Worker {
                 id: peer_id,
-                reliable: row.stored_bytes > 0, // TODO: set a higher threshold
+                status,
             });
         }
 

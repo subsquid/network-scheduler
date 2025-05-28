@@ -37,9 +37,9 @@ pub fn schedule(
     config: SchedulingConfig,
 ) -> Result<Assignment, ReplicationError> {
     let mut worker_ids = Vec::with_capacity(workers.len());
-    worker_ids.extend(workers.iter().filter(|w| w.reliable).map(|w| w.id));
+    worker_ids.extend(workers.iter().filter(|w| w.reliable()).map(|w| w.id));
     let reliable_workers = worker_ids.len();
-    worker_ids.extend(workers.iter().filter(|w| !w.reliable).map(|w| w.id));
+    worker_ids.extend(workers.iter().filter(|w| !w.reliable()).map(|w| w.id));
 
     tracing::info!(
         "Scheduling {} chunks to {} reliable workers",
@@ -60,8 +60,8 @@ pub fn schedule(
     let mut all = schedule_to_workers(chunks, &worker_ids, &config)?;
 
     // Use assignment from `reliable` for reliable workers and from `all` for unreliable workers
-    for (worker_id, chunk_indexes) in reliable.workers {
-        all.workers.insert(worker_id, chunk_indexes);
+    for (worker_id, chunk_indexes) in reliable.worker_chunks {
+        all.worker_chunks.insert(worker_id, chunk_indexes);
     }
     Ok(all)
 }
@@ -215,7 +215,7 @@ fn assign_chunks(
         });
 
     Assignment {
-        workers: workers
+        worker_chunks: workers
             .into_iter()
             .enumerate()
             .map(|(index, worker)| (worker_ids[index], worker.chunks))

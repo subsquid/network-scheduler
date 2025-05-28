@@ -1,35 +1,43 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use libp2p_identity::PeerId;
 use sqd_messages::assignments as model;
 
 use crate::cli;
 
-use super::{Chunk, ChunkIndex};
+use super::{Chunk, ChunkIndex, Worker, WorkerStatus};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Assignment {
     // chunk indexes are sorted
-    pub workers: BTreeMap<PeerId, Vec<ChunkIndex>>,
+    pub worker_chunks: BTreeMap<PeerId, Vec<ChunkIndex>>,
 }
 
 impl Assignment {
     pub fn log_stats(&self, chunks: &[Chunk]) {
-        self.workers.iter().for_each(|(worker_id, chunk_indexes)| {
-            tracing::debug!(
-                "Worker {}: {}GB, {} chunks",
-                worker_id,
-                chunk_indexes
-                    .iter()
-                    .map(|i| chunks[*i as usize].size as u64)
-                    .sum::<u64>()
-                    / (1 << 30),
-                chunk_indexes.len()
-            );
-        });
+        self.worker_chunks
+            .iter()
+            .for_each(|(worker_id, chunk_indexes)| {
+                tracing::debug!(
+                    "Worker {}: {}GB, {} chunks",
+                    worker_id,
+                    chunk_indexes
+                        .iter()
+                        .map(|i| chunks[*i as usize].size as u64)
+                        .sum::<u64>()
+                        / (1 << 30),
+                    chunk_indexes.len()
+                );
+            });
     }
 
-    pub fn encode(self, chunks: Vec<Chunk>, config: &cli::Config) -> model::Assignment {
+    pub fn encode(
+        self,
+        chunks: Vec<Chunk>,
+        config: &cli::Config,
+        workers: &[Worker],
+    ) -> model::Assignment {
+        let statuses: HashMap<_, _> = workers.iter().map(|w| (w.id, w.status)).collect();
         let mut assignment = model::Assignment::default();
         for chunk in chunks {
             let download_url = format!("https://{}.{}", chunk.bucket(), config.storage_domain);
@@ -47,8 +55,12 @@ impl Assignment {
             assignment.add_chunk(chunk, dataset_id, download_url);
         }
 
-        for (peer_id, indexes) in self.workers {
-            let jail_reason = None; // TODO: add jail reason
+        for (peer_id, indexes) in self.worker_chunks {
+            let jail_reason = match statuses[&peer_id] {
+                WorkerStatus::Online => None,
+                WorkerStatus::Offline => Some("unreachable".to_string()),
+                WorkerStatus::Stale => Some("stale".to_string()),
+            };
 
             // delta encode chunk_indexes
             let mut last = 0;

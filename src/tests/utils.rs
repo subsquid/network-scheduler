@@ -75,8 +75,8 @@ pub fn compare_intersection(
     assignment2: &Assignment,
 ) -> CompareResult {
     let mut result = CompareResult::default();
-    for (worker_id, chunks1) in &assignment1.workers {
-        let Some(chunks2) = assignment2.workers.get(worker_id) else {
+    for (worker_id, chunks1) in &assignment1.worker_chunks {
+        let Some(chunks2) = assignment2.worker_chunks.get(worker_id) else {
             continue;
         };
         let chunks1 = chunks1.iter().copied().collect::<BTreeSet<_>>();

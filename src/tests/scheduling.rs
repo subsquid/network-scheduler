@@ -9,7 +9,7 @@ use super::{
 };
 use crate::{
     scheduling::{SchedulingConfig, schedule},
-    types::{Assignment, WorkerIndex},
+    types::{Assignment, WorkerIndex, WorkerStatus},
 };
 
 #[test]
@@ -43,7 +43,7 @@ fn test_scheduling_sorted() {
         },
     )
     .unwrap();
-    for chunks in assignment.workers.into_values() {
+    for chunks in assignment.worker_chunks.into_values() {
         assert!(chunks.into_iter().is_sorted());
     }
 }
@@ -64,7 +64,7 @@ fn test_scheduling_uniform() {
     .unwrap();
 
     let mut sizes: Vec<u64> = vec![0; workers.len()];
-    for (worker_index, chunk_indexes) in assignment.workers.into_values().enumerate() {
+    for (worker_index, chunk_indexes) in assignment.worker_chunks.into_values().enumerate() {
         for chunk_index in chunk_indexes {
             sizes[worker_index as usize] += chunks[chunk_index as usize].size as u64;
         }
@@ -127,7 +127,7 @@ fn test_rescheduling_workers_became_reliable() {
     let workers_with_unreliable = {
         let mut workers = workers.clone();
         for i in 0..UNRELIABLE {
-            workers[i as usize].reliable = false;
+            workers[i as usize].status = WorkerStatus::Offline;
         }
         workers
     };
@@ -144,14 +144,17 @@ fn test_rescheduling_workers_became_reliable() {
 
     let is_reliable = workers_with_unreliable
         .into_iter()
-        .map(|w| (w.id, w.reliable))
+        .map(|w| (w.id, w.reliable()))
         .collect::<BTreeMap<_, _>>();
     let (assignment1_reliable, assignment1_unreliable) =
         split_by_workers(assignment1, |worker| is_reliable[worker]);
     let (assignment2_reliable, assignment2_unreliable) =
         split_by_workers(assignment2, |worker| is_reliable[worker]);
 
-    println!("Reliable workers: {}", assignment1_reliable.workers.len());
+    println!(
+        "Reliable workers: {}",
+        assignment1_reliable.worker_chunks.len()
+    );
     let compare_result =
         compare_intersection(&chunks, &assignment1_reliable, &assignment2_reliable);
     compare_result.display_stats("GB", 1 << 30);
@@ -164,7 +167,7 @@ fn test_rescheduling_workers_became_reliable() {
 
     println!(
         "Unreliable workers: {}",
-        assignment1_unreliable.workers.len()
+        assignment1_unreliable.worker_chunks.len()
     );
     let compare_result =
         compare_intersection(&chunks, &assignment1_unreliable, &assignment2_unreliable);
@@ -179,12 +182,16 @@ fn split_by_workers(
     mut predicate: impl FnMut(&PeerId) -> bool,
 ) -> (Assignment, Assignment) {
     let (first, second) = assignment
-        .workers
+        .worker_chunks
         .into_iter()
         .partition(|(worker, _)| predicate(worker));
     (
-        Assignment { workers: first },
-        Assignment { workers: second },
+        Assignment {
+            worker_chunks: first,
+        },
+        Assignment {
+            worker_chunks: second,
+        },
     )
 }
 

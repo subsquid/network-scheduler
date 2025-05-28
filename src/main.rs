@@ -70,14 +70,14 @@ async fn main() -> anyhow::Result<()> {
         .load_newer_chunks(
             datasets
                 .iter()
-                .map(|dataset| (dataset.clone(), last_chunks.get(dataset).map(|d| *d))),
+                .map(|dataset| (dataset.clone(), last_chunks.get(dataset).copied())),
             config.concurrent_dataset_downloads,
         )
         .await
         .context("Can't load datasets")?;
     let new_chunks_count = new_chunks
-        .iter()
-        .map(|(_, chunks)| chunks.len())
+        .values()
+        .map(|chunks| chunks.len())
         .sum::<usize>();
     let datasets_num = new_chunks.len();
 
@@ -122,13 +122,17 @@ async fn main() -> anyhow::Result<()> {
     assignment.log_stats(&chunks);
 
     tracing::info!("Serializing assignment");
-    let encoded = assignment.encode(chunks, &config);
+    let encoded = assignment.encode(chunks, &config, &workers);
 
     tracing::info!("Uploading assignment");
-    let uploader = upload::Uploader::new(&args.s3.config().await);
-    let url = uploader.save_assignment(encoded, &config).await?;
-
+    let uploader = upload::Uploader::new(config, &args.s3.config().await);
+    let url = uploader.save_assignment(encoded).await?;
     tracing::info!("Assignment uploaded to {url}");
+
+    tracing::info!("Uploading metadata");
+    uploader.upload_status(workers).await?;
+
+    tracing::info!("Done");
 
     Ok(())
 }

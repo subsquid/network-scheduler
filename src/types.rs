@@ -8,12 +8,29 @@ pub type BlockNumber = u64;
 
 mod assignment;
 mod chunk;
+mod status;
 
 pub use assignment::Assignment;
 pub use chunk::Chunk;
+use serde::Serialize;
+pub use status::{SchedulingStatus, SchedulingStatusConfig};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum WorkerStatus {
+    Online,
+    Stale,
+    Offline,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Worker {
+    #[serde(rename = "peer_id")]
     pub id: PeerId,
-    pub reliable: bool,
+    pub status: WorkerStatus,
+}
+
+impl Worker {
+    pub fn reliable(&self) -> bool {
+        matches!(self.status, WorkerStatus::Online)
+    }
 }
