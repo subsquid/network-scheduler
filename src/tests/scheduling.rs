@@ -188,9 +188,11 @@ fn split_by_workers(
     (
         Assignment {
             worker_chunks: first,
+            replication_by_weight: assignment.replication_by_weight.clone(),
         },
         Assignment {
             worker_chunks: second,
+            replication_by_weight: assignment.replication_by_weight,
         },
     )
 }
