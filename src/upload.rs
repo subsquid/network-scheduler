@@ -1,15 +1,15 @@
-use std::io::Write;
-
 use anyhow::Context;
 use aws_sdk_s3 as s3;
 use chrono::Utc;
 use flate2::{Compression, write::GzEncoder};
 use sha2::{Digest, Sha256};
 use sqd_messages::assignments::{Assignment as EncodedAssignment, NetworkAssignment, NetworkState};
+use tracing::instrument;
 
 use crate::{
     cli,
     types::{SchedulingStatus, SchedulingStatusConfig, Worker},
+    utils::CountWrite,
 };
 
 pub struct Uploader {
@@ -23,14 +23,29 @@ impl Uploader {
         Self { config, client }
     }
 
-    pub async fn save_assignment(&self, assignment: EncodedAssignment) -> anyhow::Result<String> {
+    #[instrument(skip_all)]
+    pub async fn upload_assignment(&self, assignment: EncodedAssignment) -> anyhow::Result<String> {
         tracing::debug!("Encoding assignment");
-        let mut encoder = GzEncoder::new(Vec::new(), Compression::best());
-        let _ = encoder.write_all(serde_json::to_vec(&assignment).unwrap().as_slice());
-        let compressed_bytes = encoder.finish().unwrap();
+        let compressed_bytes;
+        {
+            let _timer = crate::metrics::Timer::new("encode_assignment");
+            let encoder = GzEncoder::new(Vec::new(), Compression::best());
+            let mut count_encoder = CountWrite::new(encoder);
+            serde_json::to_writer(&mut count_encoder, &assignment)?;
+            let written = count_encoder.count();
+            let encoder = count_encoder.into_inner();
+            compressed_bytes = encoder.finish()?;
+            crate::metrics::ASSIGNMENT_JSON_SIZE.set(written as i64);
+            crate::metrics::ASSIGNMENT_COMPRESSED_JSON_SIZE.set(compressed_bytes.len() as i64);
+        }
+
+        let hash = {
+            let _timer = crate::metrics::Timer::new("hash_assignment");
+            Sha256::digest(&compressed_bytes)
+        };
 
         tracing::debug!("Saving assignment");
-        let hash = Sha256::digest(&compressed_bytes);
+        let _timer = crate::metrics::Timer::new("upload_assignment");
         let network = self.config.network.clone();
         let system_time = std::time::SystemTime::now();
         let chrono_time = Utc::now();
@@ -75,6 +90,7 @@ impl Uploader {
         Ok(assignment_url)
     }
 
+    #[instrument(skip_all)]
     pub async fn upload_status(&self, workers: Vec<Worker>) -> anyhow::Result<()> {
         let status = SchedulingStatus {
             config: SchedulingStatusConfig {
@@ -96,6 +112,7 @@ impl Uploader {
         Ok(())
     }
 
+    #[instrument(skip_all)]
     pub async fn upload_metrics(&self, metrics: String) -> anyhow::Result<()> {
         let contents = metrics.into_bytes();
         self.client

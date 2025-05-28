@@ -40,6 +40,7 @@ pub fn calc_replication_factors(
         remaining_size_per_weight_sum -= size * weight as u64;
     }
     tracing::debug!("Replication multiplier: {multiplier:.2}");
+    crate::metrics::WEIGHT_MULTIPLIER.set(multiplier);
 
     assert!((*size_by_weight.last_key_value().unwrap().0 as f64 * multiplier) < 10000.);
 

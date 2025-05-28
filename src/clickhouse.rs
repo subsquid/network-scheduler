@@ -6,6 +6,7 @@ use itertools::Itertools;
 use semver::VersionReq;
 use serde::{Deserialize, Serialize};
 use sqd_messages::assignments::ChunkSummary;
+use tracing::instrument;
 
 use crate::{
     cli::ClickhouseArgs,
@@ -39,12 +40,15 @@ impl ClickhouseClient {
         Ok(this)
     }
 
+    #[instrument(skip_all)]
     pub async fn get_active_workers(
         &self,
         inactive_timeout: Duration,
         stale_threshold: u64,
         versions: &VersionReq,
     ) -> Result<Vec<Worker>> {
+        let _timer = crate::metrics::Timer::new("get_active_workers");
+
         let seconds = inactive_timeout.as_secs();
         let query = r"
             SELECT DISTINCT ON (worker_id) worker_id, version, stored_bytes
@@ -71,6 +75,7 @@ impl ClickhouseClient {
                 Ok(peer_id) => peer_id,
                 Err(e) => {
                     tracing::warn!("Failed to parse worker ID \"{}\": {}", row.worker_id, e);
+                    crate::metrics::failure("invalid_peer_id");
                     continue;
                 }
             };
@@ -85,13 +90,17 @@ impl ClickhouseClient {
             });
         }
 
+        crate::metrics::report_workers(&results);
         Ok(results)
     }
 
+    #[instrument(skip_all)]
     pub async fn get_existing_chunks(
         &self,
         datasets: impl Iterator<Item = impl Into<&str>>,
     ) -> anyhow::Result<BTreeMap<Arc<String>, Vec<Chunk>>> {
+        let _timer = crate::metrics::Timer::new("get_existing_chunks");
+
         let query = format!(
             r"
             SELECT dataset, id, size, files, last_block_hash
@@ -115,7 +124,10 @@ impl ClickhouseClient {
         Ok(result)
     }
 
+    #[instrument(skip_all)]
     pub async fn store_new_chunks(&self, chunks: impl IntoIterator<Item = Chunk>) -> Result<()> {
+        let _timer = crate::metrics::Timer::new("store_new_chunks");
+
         let mut inserter = self.client.insert(CHUNKS_TABLE)?;
         for chunk in chunks {
             inserter.write(&ChunkRow::from(chunk)).await?;

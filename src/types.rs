@@ -23,6 +23,16 @@ pub enum WorkerStatus {
     Offline,
 }
 
+impl std::fmt::Display for WorkerStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            WorkerStatus::Online => write!(f, "online"),
+            WorkerStatus::Stale => write!(f, "stale"),
+            WorkerStatus::Offline => write!(f, "offline"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Worker {
     #[serde(rename = "peer_id")]

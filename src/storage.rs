@@ -30,6 +30,7 @@ impl S3Storage {
         datasets: impl IntoIterator<Item = (Arc<String>, Option<&Chunk>)>,
         concurrent_downloads: usize,
     ) -> anyhow::Result<BTreeMap<Arc<String>, Vec<Chunk>>> {
+        let _timer = crate::metrics::Timer::new("load_newer_chunks");
         stream::iter(datasets)
             .map(|(dataset, last_chunk)| {
                 let storage = DatasetStorage::new(self.client.clone(), dataset);

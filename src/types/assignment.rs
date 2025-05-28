@@ -11,11 +11,12 @@ use super::{Chunk, ChunkIndex, Worker, WorkerStatus};
 pub struct Assignment {
     // chunk indexes are sorted
     pub worker_chunks: BTreeMap<PeerId, Vec<ChunkIndex>>,
+    pub replication_by_weight: BTreeMap<u16, u16>,
 }
 
 impl Assignment {
-    pub fn log_stats(&self, chunks: &[Chunk], min_bytes_per_worker: u64, workers: &[Worker]) {
-        let statuses: HashMap<_, _> = workers.iter().map(|w| (w.id, w.status)).collect();
+    pub fn log_stats(&self, chunks: &[Chunk], config: &cli::Config, workers: &[Worker]) {
+        let statuses: HashMap<_, _> = workers.iter().map(|w: &Worker| (w.id, w.status)).collect();
         let min = self
             .worker_chunks
             .iter()
@@ -24,28 +25,43 @@ impl Assignment {
                     .iter()
                     .map(|i| chunks[*i as usize].size as u64)
                     .sum::<u64>();
+                let num_chunks = chunk_indexes.len();
+
                 let status_str = match statuses[worker_id] {
-                    WorkerStatus::Online => "",
-                    WorkerStatus::Offline => " (offline)",
-                    WorkerStatus::Stale => " (stale)",
+                    WorkerStatus::Online => String::new(),
+                    status => format!(" ({status})"),
                 };
+
                 tracing::debug!(
                     "Worker {}: {}GB, {} chunks{}",
                     worker_id,
                     bytes / (1 << 30),
-                    chunk_indexes.len(),
+                    num_chunks,
                     status_str,
                 );
+
+                crate::metrics::report_worker_stats(*worker_id, num_chunks, bytes);
+
                 bytes
             })
             .min();
+
+        let min_bytes_per_worker = config.worker_stale_bytes;
         if let Some(min) = min {
             if min < min_bytes_per_worker {
                 tracing::warn!(
                     "Some workers have less than the minimum required storage: {min} < {min_bytes_per_worker}"
                 );
+                crate::metrics::failure("min_assignment");
             }
         }
+
+        crate::metrics::report_replication_factors(config.datasets.iter().map(|(ds, config)| {
+            (
+                format!("s3://{ds}"),
+                self.replication_by_weight[&config.weight],
+            )
+        }));
     }
 
     pub fn encode(
@@ -54,6 +70,7 @@ impl Assignment {
         config: &cli::Config,
         workers: &[Worker],
     ) -> model::Assignment {
+        let _timer = crate::metrics::Timer::new("serialize_assignment");
         let statuses: HashMap<_, _> = workers.iter().map(|w| (w.id, w.status)).collect();
         let mut assignment = model::Assignment::default();
         for chunk in chunks {

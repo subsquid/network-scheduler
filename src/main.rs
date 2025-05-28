@@ -18,13 +18,17 @@ mod storage;
 mod tests;
 mod types;
 mod upload;
+mod utils;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    let _timer = crate::metrics::Timer::new("process");
+
     dotenv::dotenv().ok();
     let args = cli::Args::parse();
 
     setup_tracing(&args);
+    let metrics_registry = metrics::register_metrics();
 
     let config = cli::Config::load(&args.config).context("Can't parse config")?;
     let datasets = config
@@ -94,6 +98,7 @@ async fn main() -> anyhow::Result<()> {
             known_chunks.insert(dataset, chunks);
         }
     }
+    metrics::report_chunks(&known_chunks);
     let chunks = known_chunks
         .into_iter()
         .flat_map(|(_, chunks)| chunks.into_iter())
@@ -117,21 +122,28 @@ async fn main() -> anyhow::Result<()> {
             min_replication: config.min_replication,
         },
     )
-    .map_err(|e| anyhow::anyhow!("Couldn't schedule chunks: {e}"))?;
+    .context("Can't schedule chunks")?;
     drop(weighted_chunks);
 
-    assignment.log_stats(&chunks, config.worker_stale_bytes, &workers);
+    assignment.log_stats(&chunks, &config, &workers);
 
     tracing::info!("Serializing assignment");
     let encoded = assignment.encode(chunks, &config, &workers);
 
     tracing::info!("Uploading assignment");
     let uploader = upload::Uploader::new(config, &args.s3.config().await);
-    let url = uploader.save_assignment(encoded).await?;
+    let url = uploader.upload_assignment(encoded).await?;
     tracing::info!("Assignment uploaded to {url}");
 
     tracing::info!("Uploading metadata");
     uploader.upload_status(workers).await?;
+
+    drop(_timer);
+    let metrics = metrics::encode_metrics(&metrics_registry)?;
+    uploader
+        .upload_metrics(metrics)
+        .await
+        .context("Can't upload metrics")?;
 
     tracing::info!("Done");
 
@@ -140,7 +152,7 @@ async fn main() -> anyhow::Result<()> {
 
 fn setup_tracing(_args: &cli::Args) {
     use tracing::level_filters::LevelFilter;
-    use tracing_subscriber::{EnvFilter, fmt::format::FmtSpan};
+    use tracing_subscriber::EnvFilter;
 
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -148,7 +160,6 @@ fn setup_tracing(_args: &cli::Args) {
                 .with_default_directive(LevelFilter::INFO.into())
                 .from_env_lossy(),
         )
-        .with_span_events(FmtSpan::CLOSE)
         .compact()
         .init();
 }

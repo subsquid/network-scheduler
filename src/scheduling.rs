@@ -1,4 +1,4 @@
-use std::borrow::Cow;
+use std::{borrow::Cow, collections::BTreeMap};
 
 use itertools::Itertools;
 use libp2p_identity::PeerId;
@@ -36,6 +36,7 @@ pub fn schedule(
     workers: &[Worker],
     config: SchedulingConfig,
 ) -> Result<Assignment, ReplicationError> {
+    let _timer = crate::metrics::Timer::new("schedule");
     let mut worker_ids = Vec::with_capacity(workers.len());
     worker_ids.extend(workers.iter().filter(|w| w.reliable()).map(|w| w.id));
     let reliable_workers = worker_ids.len();
@@ -46,7 +47,7 @@ pub fn schedule(
         chunks.len(),
         reliable_workers
     );
-    let reliable = schedule_to_workers(chunks, &worker_ids[..reliable_workers], &config)?;
+    let mut reliable = schedule_to_workers(chunks, &worker_ids[..reliable_workers], &config)?;
 
     if reliable_workers == workers.len() {
         return Ok(reliable);
@@ -57,13 +58,16 @@ pub fn schedule(
         chunks.len(),
         workers.len()
     );
-    let mut all = schedule_to_workers(chunks, &worker_ids, &config)?;
+    let all = schedule_to_workers(chunks, &worker_ids, &config)?;
 
     // Use assignment from `reliable` for reliable workers and from `all` for unreliable workers
-    for (worker_id, chunk_indexes) in reliable.worker_chunks {
-        all.worker_chunks.insert(worker_id, chunk_indexes);
+    for (worker_id, chunk_indexes) in all.worker_chunks {
+        reliable
+            .worker_chunks
+            .entry(worker_id)
+            .or_insert(chunk_indexes);
     }
-    Ok(all)
+    Ok(reliable)
 }
 
 fn schedule_to_workers(
@@ -100,7 +104,11 @@ fn schedule_to_workers(
         chunks.iter().map(|c| c.replication as u64).sum::<u64>()
     );
 
-    Ok(distribute(&chunks, workers, config.worker_capacity))
+    let worker_chunks = distribute(&chunks, workers, config.worker_capacity);
+    Ok(Assignment {
+        worker_chunks,
+        replication_by_weight: mapping,
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -111,7 +119,12 @@ struct ReplicatedChunk<'id> {
 }
 
 #[instrument(skip_all)]
-fn distribute(chunks: &[ReplicatedChunk], workers: &[PeerId], worker_capacity: u64) -> Assignment {
+fn distribute(
+    chunks: &[ReplicatedChunk],
+    workers: &[PeerId],
+    worker_capacity: u64,
+) -> BTreeMap<PeerId, Vec<ChunkIndex>> {
+    let _timer = crate::metrics::Timer::new("schedule:distribute");
     let rings = hash_workers(workers);
     let orderings = hash_chunks(chunks, &rings);
     assign_chunks(orderings, chunks, workers, rings, worker_capacity)
@@ -120,6 +133,7 @@ fn distribute(chunks: &[ReplicatedChunk], workers: &[PeerId], worker_capacity: u
 #[instrument(skip_all)]
 fn hash_workers(workers: &[PeerId]) -> Vec<Vec<(u64, WorkerIndex)>> {
     tracing::info!("Hashing workers");
+    let _timer = crate::metrics::Timer::new("schedule:distribute:hash_workers");
 
     (0..N_RINGS as RingIndex)
         .into_par_iter()
@@ -149,6 +163,7 @@ fn hash_chunks(
     rings: &[Vec<(u64, u16)>],
 ) -> Vec<(ChunkIndex, RingIndex, WorkerIndex)> {
     tracing::info!("Hashing chunks");
+    let _timer = crate::metrics::Timer::new("schedule:distribute:hash_chunks");
 
     chunks
         .par_iter()
@@ -177,8 +192,9 @@ fn assign_chunks(
     worker_ids: &[PeerId],
     rings: Vec<Vec<(u64, WorkerIndex)>>,
     worker_capacity: u64,
-) -> Assignment {
+) -> BTreeMap<PeerId, Vec<ChunkIndex>> {
     tracing::info!("Assigning chunks");
+    let _timer = crate::metrics::Timer::new("schedule:distribute:assign_chunks");
 
     struct WorkerAssignment {
         chunks: Vec<ChunkIndex>,
@@ -214,11 +230,9 @@ fn assign_chunks(
             panic!("No worker found for chunk {}", chunk.id);
         });
 
-    Assignment {
-        worker_chunks: workers
-            .into_iter()
-            .enumerate()
-            .map(|(index, worker)| (worker_ids[index], worker.chunks))
-            .collect(),
-    }
+    workers
+        .into_iter()
+        .enumerate()
+        .map(|(index, worker)| (worker_ids[index], worker.chunks))
+        .collect()
 }
