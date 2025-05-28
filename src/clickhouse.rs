@@ -41,10 +41,11 @@ impl ClickhouseClient {
 
     pub async fn get_active_workers(
         &self,
-        threshold: Duration,
+        inactive_timeout: Duration,
+        stale_threshold: u64,
         versions: &VersionReq,
     ) -> Result<Vec<Worker>> {
-        let seconds = threshold.as_secs();
+        let seconds = inactive_timeout.as_secs();
         let query = r"
             SELECT DISTINCT ON (worker_id) worker_id, version, stored_bytes
             FROM ?
@@ -73,7 +74,7 @@ impl ClickhouseClient {
                     continue;
                 }
             };
-            let status = if row.stored_bytes > 0 {
+            let status = if row.stored_bytes > stale_threshold {
                 WorkerStatus::Online
             } else {
                 WorkerStatus::Stale // TODO: set a higher threshold

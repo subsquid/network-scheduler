@@ -16,6 +16,7 @@ use serde::Serialize;
 pub use status::{SchedulingStatus, SchedulingStatusConfig};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum WorkerStatus {
     Online,
     Stale,

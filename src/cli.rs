@@ -78,6 +78,8 @@ pub struct Config {
 
     pub worker_storage_bytes: u64,
 
+    pub worker_stale_bytes: u64,
+
     pub min_replication: u16,
 
     /// The fraction of the worker storage that is actually filled (on average).

@@ -14,21 +14,38 @@ pub struct Assignment {
 }
 
 impl Assignment {
-    pub fn log_stats(&self, chunks: &[Chunk]) {
-        self.worker_chunks
+    pub fn log_stats(&self, chunks: &[Chunk], min_bytes_per_worker: u64, workers: &[Worker]) {
+        let statuses: HashMap<_, _> = workers.iter().map(|w| (w.id, w.status)).collect();
+        let min = self
+            .worker_chunks
             .iter()
-            .for_each(|(worker_id, chunk_indexes)| {
+            .map(|(worker_id, chunk_indexes)| {
+                let bytes = chunk_indexes
+                    .iter()
+                    .map(|i| chunks[*i as usize].size as u64)
+                    .sum::<u64>();
+                let status_str = match statuses[worker_id] {
+                    WorkerStatus::Online => "",
+                    WorkerStatus::Offline => " (offline)",
+                    WorkerStatus::Stale => " (stale)",
+                };
                 tracing::debug!(
-                    "Worker {}: {}GB, {} chunks",
+                    "Worker {}: {}GB, {} chunks{}",
                     worker_id,
-                    chunk_indexes
-                        .iter()
-                        .map(|i| chunks[*i as usize].size as u64)
-                        .sum::<u64>()
-                        / (1 << 30),
-                    chunk_indexes.len()
+                    bytes / (1 << 30),
+                    chunk_indexes.len(),
+                    status_str,
                 );
-            });
+                bytes
+            })
+            .min();
+        if let Some(min) = min {
+            if min < min_bytes_per_worker {
+                tracing::warn!(
+                    "Some workers have less than the minimum required storage: {min} < {min_bytes_per_worker}"
+                );
+            }
+        }
     }
 
     pub fn encode(

@@ -37,6 +37,7 @@ async fn main() -> anyhow::Result<()> {
     let workers = db
         .get_active_workers(
             config.worker_inactive_timeout,
+            config.worker_stale_bytes,
             &config.supported_worker_versions,
         )
         .await
@@ -119,7 +120,7 @@ async fn main() -> anyhow::Result<()> {
     .map_err(|e| anyhow::anyhow!("Couldn't schedule chunks: {e}"))?;
     drop(weighted_chunks);
 
-    assignment.log_stats(&chunks);
+    assignment.log_stats(&chunks, config.worker_stale_bytes, &workers);
 
     tracing::info!("Serializing assignment");
     let encoded = assignment.encode(chunks, &config, &workers);
