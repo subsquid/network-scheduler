@@ -1,4 +1,5 @@
 use std::{
+    borrow::Cow,
     collections::BTreeMap,
     sync::{Arc, atomic::AtomicU64},
 };
@@ -31,6 +32,7 @@ lazy_static::lazy_static! {
 
     pub static ref FAILURE: Family<Labels, Gauge> = Default::default();
     pub static ref EXEC_TIMES: Family<Labels, Gauge<f64, AtomicU64>> = Default::default();
+    pub static ref ASSIGNMENT_TIMESTAMP: Gauge = Default::default();
 }
 
 pub fn report_workers(workers: &[Worker]) {
@@ -82,8 +84,11 @@ pub fn failure(target: impl Into<String>) {
         .set(1);
 }
 
-pub fn register_metrics() -> Registry {
-    let mut registry = Registry::with_prefix("scheduler");
+pub fn register_metrics(network: String) -> Registry {
+    let mut registry = Registry::with_prefix_and_labels(
+        "scheduler",
+        [(Cow::Borrowed("network"), Cow::Owned(network))].into_iter(),
+    );
 
     registry.register(
         "dataset_chunks",
@@ -154,6 +159,12 @@ pub fn register_metrics() -> Registry {
         "Execution times of various procedures",
         Unit::Seconds,
         EXEC_TIMES.clone(),
+    );
+    registry.register_with_unit(
+        "assignment_timestamp",
+        "Timestamp of the last assignment",
+        Unit::Seconds,
+        ASSIGNMENT_TIMESTAMP.clone(),
     );
 
     registry

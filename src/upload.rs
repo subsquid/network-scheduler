@@ -53,6 +53,7 @@ impl Uploader {
         let assignment_id = format!("{timestamp}_{hash:X}");
         let filename: String = format!("assignments/{network}/{assignment_id}.json.gz");
         let expiration = s3::primitives::DateTime::from(system_time + self.config.assignment_ttl);
+        crate::metrics::ASSIGNMENT_TIMESTAMP.set(chrono_time.timestamp());
 
         self.client
             .put_object()

@@ -28,7 +28,6 @@ async fn main() -> anyhow::Result<()> {
     let args = cli::Args::parse();
 
     setup_tracing(&args);
-    let metrics_registry = metrics::register_metrics();
 
     let config = cli::Config::load(&args.config).context("Can't parse config")?;
     let datasets = config
@@ -36,6 +35,8 @@ async fn main() -> anyhow::Result<()> {
         .keys()
         .map(|bucket| Arc::<String>::from(format!("s3://{bucket}")))
         .collect_vec();
+
+    let metrics_registry = metrics::register_metrics(config.network.clone());
 
     let db = clickhouse::ClickhouseClient::new(&args.clickhouse).await?;
     let workers = db
