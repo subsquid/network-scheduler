@@ -1,25 +1,11 @@
 use libp2p_identity::PeerId;
 
-pub type WorkerIndex = u16;
-pub type ChunkIndex = u32;
-pub type ChunkWeight = u16;
-
-pub type BlockNumber = u64;
-
-mod assignment;
-mod chunk;
-mod status;
-
-pub use assignment::Assignment;
-pub use chunk::Chunk;
-use serde::Serialize;
-pub use status::{SchedulingStatus, SchedulingStatusConfig};
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkerStatus {
     Online,
     Stale,
+    UnsupportedVersion,
     Offline,
 }
 
@@ -28,12 +14,13 @@ impl std::fmt::Display for WorkerStatus {
         match self {
             WorkerStatus::Online => write!(f, "online"),
             WorkerStatus::Stale => write!(f, "stale"),
+            WorkerStatus::UnsupportedVersion => write!(f, "unsupported_version"),
             WorkerStatus::Offline => write!(f, "offline"),
         }
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct Worker {
     #[serde(rename = "peer_id")]
     pub id: PeerId,

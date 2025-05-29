@@ -93,6 +93,7 @@ impl Assignment {
             let jail_reason = match statuses[&peer_id] {
                 WorkerStatus::Online => None,
                 WorkerStatus::Offline => Some("unreachable".to_string()),
+                WorkerStatus::UnsupportedVersion => Some("unsupported_version".to_string()),
                 WorkerStatus::Stale => Some("stale".to_string()),
             };
 

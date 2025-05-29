@@ -22,6 +22,7 @@ struct PingRow {
     worker_id: String,
     version: String,
     stored_bytes: u64,
+    timestamp: u64,
 }
 
 pub struct ClickhouseClient {
@@ -49,28 +50,25 @@ impl ClickhouseClient {
     ) -> Result<Vec<Worker>> {
         let _timer = crate::metrics::Timer::new("get_active_workers");
 
-        let seconds = inactive_timeout.as_secs();
-        let query = r"
-            SELECT DISTINCT ON (worker_id) worker_id, version, stored_bytes
-            FROM ?
-            WHERE timestamp >= (SELECT MAX(timestamp) FROM ?) - INTERVAL ? SECOND
-            ORDER BY worker_id, timestamp DESC
-        ";
+        let inactive_threshold = (std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("Failed to get system time")
+            - inactive_timeout)
+            .as_millis() as u64;
 
-        let mut cursor = self
-            .client
-            .query(query)
-            .bind(PINGS_TABLE)
-            .bind(PINGS_TABLE)
-            .bind(seconds)
-            .fetch::<PingRow>()?;
+        let query = format!(
+            r"
+            SELECT DISTINCT ON (worker_id) worker_id, version, stored_bytes, timestamp
+            FROM {PINGS_TABLE}
+            WHERE timestamp >= (SELECT MAX(timestamp) FROM {PINGS_TABLE}) - INTERVAL 1 DAY
+            ORDER BY worker_id, timestamp DESC
+            "
+        );
+
+        let mut cursor = self.client.query(&query).fetch::<PingRow>()?;
 
         let mut results = Vec::new();
         while let Some(row) = cursor.next().await? {
-            let version_ok = row.version.parse().is_ok_and(|ver| versions.matches(&ver));
-            if !version_ok {
-                continue;
-            }
             let peer_id = match row.worker_id.parse() {
                 Ok(peer_id) => peer_id,
                 Err(e) => {
@@ -79,11 +77,16 @@ impl ClickhouseClient {
                     continue;
                 }
             };
-            let status = if row.stored_bytes > stale_threshold {
-                WorkerStatus::Online
-            } else {
-                WorkerStatus::Stale // TODO: set a higher threshold
-            };
+            let mut status = WorkerStatus::Online;
+            if row.stored_bytes < stale_threshold {
+                status = WorkerStatus::Stale;
+            }
+            if !row.version.parse().is_ok_and(|ver| versions.matches(&ver)) {
+                status = WorkerStatus::UnsupportedVersion;
+            }
+            if row.timestamp < inactive_threshold {
+                status = WorkerStatus::Offline;
+            }
             results.push(Worker {
                 id: peer_id,
                 status,
@@ -107,7 +110,7 @@ impl ClickhouseClient {
             FROM {CHUNKS_TABLE}
             WHERE dataset IN ?
             ORDER BY dataset, id
-        "
+            "
         );
 
         let mut cursor = self
@@ -148,7 +151,7 @@ impl ClickhouseClient {
                 last_block_hash Nullable(String)
             ) ENGINE = ReplacingMergeTree()
             ORDER BY (dataset, id)
-        "
+            "
         );
 
         self.client.query(&query).execute().await?;
