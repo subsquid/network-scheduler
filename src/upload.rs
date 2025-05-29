@@ -15,12 +15,19 @@ use crate::{
 pub struct Uploader {
     config: cli::Config,
     client: s3::Client,
+    time: chrono::DateTime<Utc>,
 }
 
 impl Uploader {
     pub fn new(config: cli::Config, s3_config: &aws_config::SdkConfig) -> Self {
         let client = s3::Client::new(s3_config);
-        Self { config, client }
+        let time = Utc::now();
+        crate::metrics::ASSIGNMENT_TIMESTAMP.set(time.timestamp());
+        Self {
+            config,
+            client,
+            time,
+        }
     }
 
     #[instrument(skip_all)]
@@ -48,12 +55,10 @@ impl Uploader {
         let _timer = crate::metrics::Timer::new("upload_assignment");
         let network = self.config.network.clone();
         let system_time = std::time::SystemTime::now();
-        let chrono_time = Utc::now();
-        let timestamp = chrono_time.format("%FT%T");
+        let timestamp = self.time.format("%FT%T");
         let assignment_id = format!("{timestamp}_{hash:X}");
         let filename: String = format!("assignments/{network}/{assignment_id}.json.gz");
         let expiration = s3::primitives::DateTime::from(system_time + self.config.assignment_ttl);
-        crate::metrics::ASSIGNMENT_TIMESTAMP.set(chrono_time.timestamp());
 
         self.client
             .put_object()
@@ -98,6 +103,7 @@ impl Uploader {
                 supported_worker_versions: self.config.supported_worker_versions.clone(),
                 recommended_worker_versions: self.config.recommended_worker_versions.clone(),
             },
+            assignment_timestamp_sec: self.time.timestamp() as u64,
             workers,
         };
         let contents = serde_json::to_vec(&status)?;
