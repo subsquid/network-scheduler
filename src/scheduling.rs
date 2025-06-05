@@ -22,6 +22,7 @@ pub struct SchedulingConfig {
     pub worker_capacity: u64,
     pub saturation: f64,
     pub min_replication: u16,
+    pub ignore_reliability: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -41,6 +42,15 @@ pub fn schedule(
     worker_ids.extend(workers.iter().filter(|w| w.reliable()).map(|w| w.id));
     let reliable_workers = worker_ids.len();
     worker_ids.extend(workers.iter().filter(|w| !w.reliable()).map(|w| w.id));
+
+    if config.ignore_reliability {
+        tracing::info!(
+            "Scheduling {} chunks to {} workers",
+            chunks.len(),
+            workers.len(),
+        );
+        return schedule_to_workers(chunks, &worker_ids, &config);
+    }
 
     tracing::info!(
         "Scheduling {} chunks to {} reliable workers",

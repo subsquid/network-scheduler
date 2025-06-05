@@ -76,6 +76,9 @@ pub struct Config {
     #[serde(rename = "worker_inactive_timeout_sec")]
     pub worker_inactive_timeout: Duration,
 
+    #[serde(default)]
+    pub ignore_reliability: bool,
+
     pub worker_storage_bytes: u64,
 
     pub worker_stale_bytes: u64,

@@ -20,6 +20,7 @@ fn test_scheduling_stable() {
         worker_capacity: capacity,
         saturation: 0.95,
         min_replication: 1,
+        ignore_reliability: false,
     };
 
     let assignment1 = schedule(&chunks, &workers, config.clone()).unwrap();
@@ -40,6 +41,7 @@ fn test_scheduling_sorted() {
             worker_capacity: capacity,
             saturation: 0.999,
             min_replication: 1,
+            ignore_reliability: false,
         },
     )
     .unwrap();
@@ -59,6 +61,7 @@ fn test_scheduling_uniform() {
             worker_capacity: capacity,
             saturation: 0.95,
             min_replication: 1,
+            ignore_reliability: false,
         },
     )
     .unwrap();
@@ -96,6 +99,7 @@ fn test_rescheduling_workers_left_strict() {
             worker_capacity: total_capacity / WORKERS_BEFORE as u64,
             saturation: 0.99,
             min_replication: 1,
+            ignore_reliability: false,
         },
     )
     .unwrap();
@@ -109,6 +113,7 @@ fn test_rescheduling_workers_left_strict() {
             worker_capacity: total_capacity / WORKERS_AFTER as u64,
             saturation: 0.99,
             min_replication: 1,
+            ignore_reliability: false,
         },
     )
     .unwrap();
@@ -137,6 +142,7 @@ fn test_rescheduling_workers_became_reliable() {
         worker_capacity,
         saturation: 0.99,
         min_replication: 1,
+        ignore_reliability: false,
     };
 
     let assignment1 = schedule(&chunks, &workers_with_unreliable, config.clone()).unwrap();

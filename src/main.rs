@@ -121,6 +121,7 @@ async fn main() -> anyhow::Result<()> {
             worker_capacity: config.worker_storage_bytes,
             saturation: config.saturation,
             min_replication: config.min_replication,
+            ignore_reliability: config.ignore_reliability,
         },
     )
     .context("Can't schedule chunks")?;
