@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, HashMap};
 use libp2p_identity::PeerId;
 use sqd_messages::assignments as model;
 
-use crate::cli;
+use crate::{cli, types::WorkerIndex};
 
 use super::{Chunk, ChunkIndex, Worker, WorkerStatus};
 
@@ -70,7 +70,7 @@ impl Assignment {
         config: &cli::Config,
         workers: &[Worker],
     ) -> model::Assignment {
-        let _timer = crate::metrics::Timer::new("serialize_assignment");
+        let _timer = crate::metrics::Timer::new("serialize_assignment_json");
         let statuses: HashMap<_, _> = workers.iter().map(|w| (w.id, w.status)).collect();
         let mut assignment = model::Assignment::default();
         for chunk in chunks {
@@ -109,5 +109,82 @@ impl Assignment {
         }
         assignment.regenerate_headers(&config.cloudflare_storage_secret);
         assignment
+    }
+
+    pub fn encode_fb(
+        self,
+        chunks: Vec<Chunk>,
+        config: &cli::Config,
+        workers: &[Worker],
+    ) -> Vec<u8> {
+        let _timer = crate::metrics::Timer::new("serialize_assignment");
+
+        let assigned_worker_ids = self.worker_ids_for_chunk();
+        assert_eq!(
+            assigned_worker_ids.len(),
+            chunks.len(),
+            "each chunk must have at least one worker assigned"
+        );
+
+        let mut assignment_builder =
+            sqd_assignments::AssignmentBuilder::new(&config.cloudflare_storage_secret);
+
+        let mut prev_dataset = None;
+        for (chunk, worker_ids) in chunks.into_iter().zip(assigned_worker_ids) {
+            if prev_dataset
+                .as_ref()
+                .is_some_and(|prev| prev != &chunk.dataset)
+            {
+                tracing::trace!("Finished serializing dataset {}", prev_dataset.unwrap());
+                assignment_builder.finish_dataset();
+            }
+            prev_dataset = Some(chunk.dataset.clone());
+
+            let download_url = format!("https://{}.{}", chunk.bucket(), config.storage_domain);
+            let mut builder = assignment_builder
+                .new_chunk()
+                .id(&chunk.id)
+                .dataset_id(&chunk.dataset)
+                .block_range(chunk.blocks)
+                .size(chunk.size)
+                .dataset_base_url(&download_url)
+                .worker_indexes(&worker_ids)
+                .files(&chunk.files);
+            if let Some(summary) = chunk.summary {
+                builder = builder.last_block_hash(&summary.last_block_hash);
+            }
+            builder.finish();
+        }
+        tracing::trace!("Finished serializing dataset {}", prev_dataset.unwrap());
+        assignment_builder.finish_dataset();
+
+        for worker in workers {
+            let status = match worker.status {
+                WorkerStatus::Online => sqd_assignments::WorkerStatus::Ok,
+                WorkerStatus::Offline => sqd_assignments::WorkerStatus::Unreliable,
+                WorkerStatus::UnsupportedVersion => {
+                    sqd_assignments::WorkerStatus::UnsupportedVersion
+                }
+                WorkerStatus::Stale => sqd_assignments::WorkerStatus::Unreliable,
+            };
+            tracing::trace!("Serializing worker {}", worker.id);
+            assignment_builder.add_worker(worker.id, status, &self.worker_chunks[&worker.id]);
+        }
+
+        assignment_builder.finish()
+    }
+
+    fn worker_ids_for_chunk(&self) -> Vec<Vec<WorkerIndex>> {
+        let _timer = crate::metrics::Timer::new("serialize_assignment:worker_ids_for_chunk");
+        let mut result = Vec::with_capacity(1000);
+        for (worker_index, indexes) in self.worker_chunks.values().enumerate() {
+            for &index in indexes {
+                if index as usize >= result.len() {
+                    result.resize(index as usize + 1, Vec::new());
+                }
+                result[index as usize].push(worker_index as u16);
+            }
+        }
+        result
     }
 }
