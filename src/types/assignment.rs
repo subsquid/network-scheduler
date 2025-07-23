@@ -145,15 +145,17 @@ impl Assignment {
                 .new_chunk()
                 .id(&chunk.id)
                 .dataset_id(&chunk.dataset)
-                .block_range(chunk.blocks)
+                .block_range(chunk.blocks.clone())
                 .size(chunk.size)
                 .dataset_base_url(&download_url)
                 .worker_indexes(&worker_ids)
                 .files(&chunk.files);
-            if let Some(summary) = chunk.summary {
+            if let Some(summary) = chunk.summary.as_ref() {
                 builder = builder.last_block_hash(&summary.last_block_hash);
             }
-            builder.finish();
+            if let Err(e) = builder.finish() {
+                panic!("Failed to serialize chunk ({}): {:?}", e, chunk);
+            }
         }
         tracing::trace!("Finished serializing dataset {}", prev_dataset.unwrap());
         assignment_builder.finish_dataset();
