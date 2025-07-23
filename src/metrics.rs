@@ -29,6 +29,8 @@ lazy_static::lazy_static! {
 
     pub static ref ASSIGNMENT_JSON_SIZE: Gauge = Default::default();
     pub static ref ASSIGNMENT_COMPRESSED_JSON_SIZE: Gauge = Default::default();
+    pub static ref ASSIGNMENT_FB_SIZE: Gauge = Default::default();
+    pub static ref ASSIGNMENT_COMPRESSED_FB_SIZE: Gauge = Default::default();
 
     pub static ref FAILURE: Family<Labels, Gauge> = Default::default();
     pub static ref EXEC_TIMES: Family<Labels, Gauge<f64, AtomicU64>> = Default::default();
@@ -148,6 +150,18 @@ pub fn register_metrics(network: String) -> Registry {
         "Size of the assignment JSON after compression",
         Unit::Bytes,
         ASSIGNMENT_COMPRESSED_JSON_SIZE.clone(),
+    );
+    registry.register_with_unit(
+        "assignment_fb_size",
+        "Size of the raw flatbuffer assignment",
+        Unit::Bytes,
+        ASSIGNMENT_FB_SIZE.clone(),
+    );
+    registry.register_with_unit(
+        "assignment_compressed_fb_size",
+        "Size of the compressed flatbuffer assignment",
+        Unit::Bytes,
+        ASSIGNMENT_COMPRESSED_FB_SIZE.clone(),
     );
     registry.register(
         "failure",

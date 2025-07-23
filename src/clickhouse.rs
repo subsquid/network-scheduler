@@ -106,7 +106,7 @@ impl ClickhouseClient {
 
         let query = format!(
             r"
-            SELECT DISTINCT ON (id) dataset, id, size, files, last_block_hash
+            SELECT DISTINCT ON (dataset, id) dataset, id, size, files, last_block_hash
             FROM {CHUNKS_TABLE}
             WHERE dataset IN ?
             ORDER BY dataset, id

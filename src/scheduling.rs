@@ -106,7 +106,6 @@ fn schedule_to_workers(
             size: c.size,
         })
         .collect_vec();
-    debug_assert!(chunks.is_sorted_by_key(|c| &c.id));
 
     tracing::info!(
         "Replication factors by weight: {:?}, total vchunks: {}",

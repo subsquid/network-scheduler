@@ -102,8 +102,14 @@ async fn main() -> anyhow::Result<()> {
     metrics::report_chunks(&known_chunks);
     let chunks = known_chunks
         .into_iter()
-        .flat_map(|(_, chunks)| chunks.into_iter())
+        .flat_map(|(_, chunks)| {
+            // Chunks order should be deterministic.
+            // Here they are sorted by the dataset+chunk_id pair
+            debug_assert!(chunks.is_sorted_by_key(|c| &c.id));
+            chunks.into_iter()
+        })
         .collect_vec();
+
     tracing::info!(
         "Loaded {} datasets with {} chunks in total",
         datasets_num,
@@ -111,7 +117,6 @@ async fn main() -> anyhow::Result<()> {
     );
 
     let weighted_chunks = weight_chunks(&chunks, &config);
-    debug_assert!(weighted_chunks.iter().is_sorted());
 
     // blocking the async executor is ok here because no other tasks are running
     let assignment = scheduling::schedule(
@@ -130,11 +135,15 @@ async fn main() -> anyhow::Result<()> {
     assignment.log_stats(&chunks, &config, &workers);
 
     tracing::info!("Serializing assignment");
-    let encoded = assignment.encode(chunks, &config, &workers);
+    let fb = assignment
+        .clone()
+        .encode_fb(chunks.clone(), &config, &workers);
+    let json = assignment.encode(chunks, &config, &workers);
+    tracing::info!("Serialized assignment size: {} bytes", fb.len());
 
     tracing::info!("Uploading assignment");
     let uploader = upload::Uploader::new(config, &args.s3.config().await);
-    let url = uploader.upload_assignment(encoded).await?;
+    let url = uploader.upload_assignment(json, fb).await?;
     tracing::info!("Assignment uploaded to {url}");
 
     tracing::info!("Uploading metadata");

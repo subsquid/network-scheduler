@@ -1,3 +1,5 @@
+use std::io::Write;
+
 use anyhow::Context;
 use aws_sdk_s3 as s3;
 use chrono::Utc;
@@ -31,24 +33,37 @@ impl Uploader {
     }
 
     #[instrument(skip_all)]
-    pub async fn upload_assignment(&self, assignment: EncodedAssignment) -> anyhow::Result<String> {
+    pub async fn upload_assignment(
+        &self,
+        assignment: EncodedAssignment,
+        fb_assignment: Vec<u8>,
+    ) -> anyhow::Result<String> {
         tracing::debug!("Encoding assignment");
-        let compressed_bytes;
+        let compressed_json;
         {
-            let _timer = crate::metrics::Timer::new("encode_assignment");
+            let _timer = crate::metrics::Timer::new("encode_assignment_json");
             let encoder = GzEncoder::new(Vec::new(), Compression::best());
             let mut count_encoder = CountWrite::new(encoder);
             serde_json::to_writer(&mut count_encoder, &assignment)?;
             let written = count_encoder.count();
             let encoder = count_encoder.into_inner();
-            compressed_bytes = encoder.finish()?;
+            compressed_json = encoder.finish()?;
             crate::metrics::ASSIGNMENT_JSON_SIZE.set(written as i64);
-            crate::metrics::ASSIGNMENT_COMPRESSED_JSON_SIZE.set(compressed_bytes.len() as i64);
+            crate::metrics::ASSIGNMENT_COMPRESSED_JSON_SIZE.set(compressed_json.len() as i64);
+        }
+        let compressed_fb;
+        {
+            let _timer = crate::metrics::Timer::new("encode_assignment");
+            let mut encoder = GzEncoder::new(Vec::new(), Compression::best());
+            encoder.write_all(&fb_assignment)?;
+            compressed_fb = encoder.finish()?;
+            crate::metrics::ASSIGNMENT_FB_SIZE.set(fb_assignment.len() as i64);
+            crate::metrics::ASSIGNMENT_COMPRESSED_FB_SIZE.set(compressed_fb.len() as i64);
         }
 
         let hash = {
             let _timer = crate::metrics::Timer::new("hash_assignment");
-            Sha256::digest(&compressed_bytes)
+            Sha256::digest(&compressed_json)
         };
 
         tracing::debug!("Saving assignment");
@@ -57,28 +72,39 @@ impl Uploader {
         let system_time = std::time::SystemTime::now();
         let timestamp = self.time.format("%FT%T");
         let assignment_id = format!("{timestamp}_{hash:X}");
-        let filename: String = format!("assignments/{network}/{assignment_id}.json.gz");
+        let json_filename: String = format!("assignments/{network}/{assignment_id}.json.gz");
+        let fb_filename: String = format!("assignments/{network}/{assignment_id}.fb.gz");
         let expiration = s3::primitives::DateTime::from(system_time + self.config.assignment_ttl);
 
-        self.client
+        let json_fut = self
+            .client
             .put_object()
             .bucket(&self.config.scheduler_state_bucket)
-            .key(&filename)
+            .key(&json_filename)
             .expires(expiration)
-            .body(compressed_bytes.into())
-            .send()
-            .await
-            .context("Can't upload assignment")?;
+            .body(compressed_json.into())
+            .send();
+        let fb_fut = self
+            .client
+            .put_object()
+            .bucket(&self.config.scheduler_state_bucket)
+            .key(&fb_filename)
+            .expires(expiration)
+            .body(compressed_fb.into())
+            .send();
+        tokio::try_join!(json_fut, fb_fut).context("Can't upload assignment")?;
 
         let effective_from = (system_time.duration_since(std::time::UNIX_EPOCH).unwrap()
             + self.config.assignment_delay)
             .as_secs();
 
-        let assignment_url = format!("{}/{filename}", self.config.network_state_url);
+        let json_url = format!("{}/{json_filename}", self.config.network_state_url);
+        let fb_url = format!("{}/{fb_filename}", self.config.network_state_url);
         let network_state = NetworkState {
             network,
             assignment: NetworkAssignment {
-                url: assignment_url.clone(),
+                url: json_url.clone(),
+                fb_url: Some(fb_url),
                 id: assignment_id,
                 effective_from,
             },
@@ -93,7 +119,7 @@ impl Uploader {
             .await
             .context("Can't save link to the assignment")?;
 
-        Ok(assignment_url)
+        Ok(json_url)
     }
 
     #[instrument(skip_all)]

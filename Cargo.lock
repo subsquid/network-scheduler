@@ -211,7 +211,7 @@ dependencies = [
  "arrow-buffer",
  "arrow-data",
  "arrow-schema",
- "flatbuffers",
+ "flatbuffers 24.12.23",
 ]
 
 [[package]]
@@ -1471,6 +1471,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "flatbuffers"
+version = "25.2.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1045398c1bfd89168b5fd3f1fc11f6e70b34f6f66300c87d44d3de849463abf1"
+dependencies = [
+ "bitflags 2.9.1",
+ "rustc_version",
+]
+
+[[package]]
 name = "flate2"
 version = "1.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2274,6 +2284,7 @@ dependencies = [
  "sha2",
  "thiserror 2.0.12",
  "tracing",
+ "zeroize",
 ]
 
 [[package]]
@@ -2397,7 +2408,7 @@ checksum = "1d87ecb2933e8aeadb3e3a02b828fed80a7528047e68b4f424523a0981a3a084"
 
 [[package]]
 name = "network-scheduler"
-version = "3.0.3"
+version = "3.1.0"
 dependencies = [
  "anyhow",
  "aws-config",
@@ -2406,6 +2417,7 @@ dependencies = [
  "clap",
  "clickhouse",
  "dotenv",
+ "flatbuffers 25.2.10",
  "flate2",
  "futures",
  "itertools 0.14.0",
@@ -2424,6 +2436,7 @@ dependencies = [
  "serde_with",
  "serde_yaml",
  "sha2",
+ "sqd-assignments",
  "sqd-messages",
  "tempfile",
  "thiserror 2.0.12",
@@ -3538,9 +3551,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "sqd-assignments"
+version = "0.0.1"
+source = "git+https://github.com/subsquid/sqd-network.git?rev=3c503f1#3c503f19033740cb64f1412fb102a6e68b739e6f"
+dependencies = [
+ "anyhow",
+ "crypto_box",
+ "curve25519-dalek",
+ "flatbuffers 25.2.10",
+ "libp2p-identity",
+ "sqd-messages",
+ "tracing",
+]
+
+[[package]]
 name = "sqd-messages"
 version = "2.0.2"
-source = "git+https://github.com/subsquid/sqd-network.git?rev=6538cd5#6538cd5e623f57b43c4df3348eacf5baeea93c51"
+source = "git+https://github.com/subsquid/sqd-network.git?rev=3c503f1#3c503f19033740cb64f1412fb102a6e68b739e6f"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
