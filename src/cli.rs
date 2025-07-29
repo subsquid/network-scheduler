@@ -120,6 +120,9 @@ pub struct Config {
 
     #[serde(skip_serializing, default = "default_concurrent_downloads")]
     pub concurrent_dataset_downloads: usize,
+
+    #[serde(default = "default_true")]
+    pub strict_continuity_check: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -135,6 +138,10 @@ impl Config {
         let config = serde_yaml::from_reader(reader)?;
         Ok(config)
     }
+}
+
+fn default_true() -> bool {
+    true
 }
 
 fn default_worker_versions() -> VersionReq {

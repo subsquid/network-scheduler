@@ -127,7 +127,8 @@ impl Assignment {
         );
 
         let mut assignment_builder =
-            sqd_assignments::AssignmentBuilder::new(&config.cloudflare_storage_secret);
+            sqd_assignments::AssignmentBuilder::new(&config.cloudflare_storage_secret)
+                .check_continuity(config.strict_continuity_check);
 
         let mut prev_dataset = None;
         for (chunk, worker_ids) in chunks.into_iter().zip(assigned_worker_ids) {
@@ -154,7 +155,11 @@ impl Assignment {
                 builder = builder.last_block_hash(&summary.last_block_hash);
             }
             if let Err(e) = builder.finish() {
-                panic!("Failed to serialize chunk ({}): {:?}", e, chunk);
+                if config.strict_continuity_check {
+                    panic!("Failed to serialize chunk ({}): {:?}", e, chunk);
+                } else {
+                    tracing::warn!("Failed to serialize chunk ({}): {:?}", e, chunk);
+                }
             }
         }
         tracing::trace!("Finished serializing dataset {}", prev_dataset.unwrap());
