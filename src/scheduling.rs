@@ -57,7 +57,13 @@ pub fn schedule(
         chunks.len(),
         reliable_workers
     );
-    let mut reliable = schedule_to_workers(chunks, &worker_ids[..reliable_workers], &config)?;
+    let mut reliable = match schedule_to_workers(chunks, &worker_ids[..reliable_workers], &config) {
+        Ok(assignment) => assignment,
+        Err(ReplicationError::NotEnoughCapacity) => {
+            tracing::warn!("Not enough reliable workers. Scheduling to all workers instead.");
+            return schedule_to_workers(chunks, &worker_ids, &config);
+        }
+    };
 
     if reliable_workers == workers.len() {
         return Ok(reliable);
