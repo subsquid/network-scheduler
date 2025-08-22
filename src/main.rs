@@ -6,6 +6,8 @@ use itertools::Itertools;
 use scheduling::WeightedChunk;
 use types::Chunk;
 
+use crate::types::FbVersion;
+
 mod cli;
 mod clickhouse;
 mod metrics;
@@ -135,15 +137,19 @@ async fn main() -> anyhow::Result<()> {
     assignment.log_stats(&chunks, &config, &workers);
 
     tracing::info!("Serializing assignment");
-    let fb = assignment
+    let fb_v0 = assignment
         .clone()
-        .encode_fb(chunks.clone(), &config, &workers);
+        .encode_fb(chunks.clone(), &config, &workers, FbVersion::V0);
+    let fb_v1 = assignment
+        .clone()
+        .encode_fb(chunks.clone(), &config, &workers, FbVersion::V1);
     let json = assignment.encode(chunks, &config, &workers);
-    tracing::info!("Serialized assignment size: {} bytes", fb.len());
+    tracing::info!("Serialized assignment v0 size: {} bytes", fb_v0.len());
+    tracing::info!("Serialized assignment v1 size: {} bytes", fb_v1.len());
 
     tracing::info!("Uploading assignment");
     let uploader = upload::Uploader::new(config, &args.s3.config().await);
-    let url = uploader.upload_assignment(json, fb).await?;
+    let url = uploader.upload_assignment(json, fb_v0, fb_v1).await?;
     tracing::info!("Assignment uploaded to {url}");
 
     tracing::info!("Uploading metadata");

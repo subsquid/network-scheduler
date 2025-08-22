@@ -14,6 +14,13 @@ pub struct Assignment {
     pub replication_by_weight: BTreeMap<u16, u16>,
 }
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum FbVersion {
+    #[default]
+    V0,
+    V1,
+}
+
 impl Assignment {
     pub fn log_stats(&self, chunks: &[Chunk], config: &cli::Config, workers: &[Worker]) {
         let statuses: HashMap<_, _> = workers.iter().map(|w: &Worker| (w.id, w.status)).collect();
@@ -116,6 +123,7 @@ impl Assignment {
         chunks: Vec<Chunk>,
         config: &cli::Config,
         workers: &[Worker],
+        version: FbVersion,
     ) -> Vec<u8> {
         let _timer = crate::metrics::Timer::new("serialize_assignment");
 
@@ -175,7 +183,11 @@ impl Assignment {
                 WorkerStatus::Stale => sqd_assignments::WorkerStatus::Unreliable,
             };
             tracing::trace!("Serializing worker {}", worker.id);
-            assignment_builder.add_worker(worker.id, status, &self.worker_chunks[&worker.id]);
+            let indexes = match version {
+                FbVersion::V0 => &*self.worker_chunks[&worker.id],
+                FbVersion::V1 => &[],
+            };
+            assignment_builder.add_worker(worker.id, status, indexes);
         }
 
         assignment_builder.finish()

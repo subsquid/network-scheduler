@@ -36,7 +36,8 @@ impl Uploader {
     pub async fn upload_assignment(
         &self,
         assignment: EncodedAssignment,
-        fb_assignment: Vec<u8>,
+        fb_assignment_v0: Vec<u8>,
+        fb_assignment_v1: Vec<u8>,
     ) -> anyhow::Result<String> {
         tracing::debug!("Encoding assignment");
         let compressed_json;
@@ -51,14 +52,21 @@ impl Uploader {
             crate::metrics::ASSIGNMENT_JSON_SIZE.set(written as i64);
             crate::metrics::ASSIGNMENT_COMPRESSED_JSON_SIZE.set(compressed_json.len() as i64);
         }
-        let compressed_fb;
+        let compressed_fb_v0;
         {
             let _timer = crate::metrics::Timer::new("encode_assignment");
             let mut encoder = GzEncoder::new(Vec::new(), Compression::best());
-            encoder.write_all(&fb_assignment)?;
-            compressed_fb = encoder.finish()?;
-            crate::metrics::ASSIGNMENT_FB_SIZE.set(fb_assignment.len() as i64);
-            crate::metrics::ASSIGNMENT_COMPRESSED_FB_SIZE.set(compressed_fb.len() as i64);
+            encoder.write_all(&fb_assignment_v0)?;
+            compressed_fb_v0 = encoder.finish()?;
+        }
+        let compressed_fb_v1;
+        {
+            let _timer = crate::metrics::Timer::new("encode_assignment");
+            let mut encoder = GzEncoder::new(Vec::new(), Compression::best());
+            encoder.write_all(&fb_assignment_v1)?;
+            compressed_fb_v1 = encoder.finish()?;
+            crate::metrics::ASSIGNMENT_FB_SIZE.set(fb_assignment_v1.len() as i64);
+            crate::metrics::ASSIGNMENT_COMPRESSED_FB_SIZE.set(compressed_fb_v1.len() as i64);
         }
 
         let hash = {
@@ -73,7 +81,8 @@ impl Uploader {
         let timestamp = self.time.format("%FT%T");
         let assignment_id = format!("{timestamp}_{hash:X}");
         let json_filename: String = format!("assignments/{network}/{assignment_id}.json.gz");
-        let fb_filename: String = format!("assignments/{network}/{assignment_id}.fb.gz");
+        let fb_v0_filename: String = format!("assignments/{network}/{assignment_id}.fb.0.gz");
+        let fb_v1_filename: String = format!("assignments/{network}/{assignment_id}.fb.1.gz");
         let expiration = s3::primitives::DateTime::from(system_time + self.config.assignment_ttl);
 
         let json_fut = self
@@ -84,27 +93,37 @@ impl Uploader {
             .expires(expiration)
             .body(compressed_json.into())
             .send();
-        let fb_fut = self
+        let fb_v0_fut = self
             .client
             .put_object()
             .bucket(&self.config.scheduler_state_bucket)
-            .key(&fb_filename)
+            .key(&fb_v0_filename)
             .expires(expiration)
-            .body(compressed_fb.into())
+            .body(compressed_fb_v0.into())
             .send();
-        tokio::try_join!(json_fut, fb_fut).context("Can't upload assignment")?;
+        let fb_v1_fut = self
+            .client
+            .put_object()
+            .bucket(&self.config.scheduler_state_bucket)
+            .key(&fb_v1_filename)
+            .expires(expiration)
+            .body(compressed_fb_v1.into())
+            .send();
+        tokio::try_join!(json_fut, fb_v0_fut, fb_v1_fut).context("Can't upload assignment")?;
 
         let effective_from = (system_time.duration_since(std::time::UNIX_EPOCH).unwrap()
             + self.config.assignment_delay)
             .as_secs();
 
         let json_url = format!("{}/{json_filename}", self.config.network_state_url);
-        let fb_url = format!("{}/{fb_filename}", self.config.network_state_url);
+        let fb_url_v0 = format!("{}/{fb_v0_filename}", self.config.network_state_url);
+        let fb_url_v1 = format!("{}/{fb_v1_filename}", self.config.network_state_url);
         let network_state = NetworkState {
             network,
             assignment: NetworkAssignment {
                 url: json_url.clone(),
-                fb_url: Some(fb_url),
+                fb_url: Some(fb_url_v0),
+                fb_url_v1: Some(fb_url_v1),
                 id: assignment_id,
                 effective_from,
             },
