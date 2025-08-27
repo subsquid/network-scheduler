@@ -66,15 +66,17 @@ impl Assignment {
         crate::metrics::report_replication_factors(config.datasets.iter().map(|(ds, segments)| {
             (
                 format!("s3://{ds}"),
-                segments
-                    .iter()
-                    .map(move |seg| (seg.from, self.replication_by_weight[&seg.weight])),
+                segments.iter().filter_map(|seg| {
+                    self.replication_by_weight
+                        .get(&seg.weight)
+                        .map(|r| (seg.from, *r))
+                }),
             )
         }));
     }
 
     pub fn encode(
-        self,
+        &self,
         chunks: Vec<Chunk>,
         config: &cli::Config,
         workers: &[Worker],
@@ -98,7 +100,7 @@ impl Assignment {
             assignment.add_chunk(chunk, dataset_id, download_url);
         }
 
-        for (peer_id, indexes) in self.worker_chunks {
+        for (peer_id, indexes) in &self.worker_chunks {
             let jail_reason = match statuses[&peer_id] {
                 WorkerStatus::Online => None,
                 WorkerStatus::Offline => Some("unreachable".to_string()),
@@ -109,20 +111,20 @@ impl Assignment {
             // delta encode chunk_indexes
             let mut last = 0;
             let mut deltas = Vec::with_capacity(indexes.len());
-            for index in indexes {
+            for &index in indexes {
                 deltas.push(index as u64 - last);
                 last = index as u64;
             }
 
-            assignment.insert_assignment(peer_id, jail_reason, deltas);
+            assignment.insert_assignment(*peer_id, jail_reason, deltas);
         }
         assignment.regenerate_headers(&config.cloudflare_storage_secret);
         assignment
     }
 
     pub fn encode_fb(
-        self,
-        chunks: Vec<Chunk>,
+        &self,
+        chunks: &[Chunk],
         config: &cli::Config,
         workers: &[Worker],
         version: FbVersion,
@@ -141,7 +143,7 @@ impl Assignment {
                 .check_continuity(config.strict_continuity_check);
 
         let mut prev_dataset = None;
-        for (chunk, worker_ids) in chunks.into_iter().zip(assigned_worker_ids) {
+        for (chunk, worker_ids) in chunks.iter().zip(assigned_worker_ids) {
             if prev_dataset
                 .as_ref()
                 .is_some_and(|prev| prev != &chunk.dataset)
