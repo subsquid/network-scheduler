@@ -1,0 +1,11 @@
+[package]
+name = "compare-assignments"
+version = "0.0.1"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.98"
+clap = { version = "4.5.38", features = ["derive", "env"] }
+serde_json = "1.0.140"
+sqd-assignments = { git = "https://github.com/subsquid/sqd-network.git", rev = "08363c2", features = ["reader"] }
+libp2p-identity = { version = "0.2.10", features = ["peerid"] }

@@ -1,3 +1,6 @@
+[workspace]
+members = ["tools/compare_fb"]
+
 [package]
 name = "network-scheduler"
 version = "3.3.0"
