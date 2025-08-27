@@ -18,6 +18,9 @@ pub struct Args {
 
     #[arg(value_name = "FILE")]
     pub new: PathBuf,
+
+    #[arg()]
+    pub sample_workers: Option<u16>,
 }
 
 fn read_assignment(filename: &Path) -> anyhow::Result<Assignment> {
@@ -25,10 +28,15 @@ fn read_assignment(filename: &Path) -> anyhow::Result<Assignment> {
     Ok(Assignment::from_owned_unchecked(buf))
 }
 
-fn parse_assignment(assignment: Assignment) -> BTreeMap<PeerId, Vec<(Arc<str>, u32)>> {
+fn parse_assignment(
+    assignment: Assignment,
+    sample_workers: Option<u16>,
+) -> BTreeMap<PeerId, Vec<(Arc<str>, u32)>> {
+    let sample_workers = sample_workers.unwrap_or(assignment.workers().len() as u16);
     let worker_ids = assignment
         .workers()
         .iter()
+        .take(sample_workers as usize)
         .map(|w| {
             let id: PeerId = (*w.worker_id())
                 .try_into()
@@ -40,10 +48,12 @@ fn parse_assignment(assignment: Assignment) -> BTreeMap<PeerId, Vec<(Arc<str>, u
     let mut result: BTreeMap<PeerId, Vec<(Arc<str>, u32)>> = BTreeMap::new();
 
     for ds in assignment.datasets() {
-        println!("Parsing dataset {}", ds.id());
         for chunk in ds.chunks() {
             let id = Arc::<str>::from(format!("{}/{}", chunk.dataset_id(), chunk.id()));
             for i in chunk.worker_indexes() {
+                if i >= sample_workers {
+                    break;
+                }
                 let worker_id = &worker_ids[i as usize];
                 result
                     .entry(*worker_id)
@@ -52,7 +62,6 @@ fn parse_assignment(assignment: Assignment) -> BTreeMap<PeerId, Vec<(Arc<str>, u
             }
         }
     }
-    println!();
 
     result
 }
@@ -60,9 +69,13 @@ fn parse_assignment(assignment: Assignment) -> BTreeMap<PeerId, Vec<(Arc<str>, u
 fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
-    let handle =
-        std::thread::spawn(move || anyhow::Ok(parse_assignment(read_assignment(&args.old)?)));
-    let mut new = parse_assignment(read_assignment(&args.new)?);
+    let handle = std::thread::spawn(move || {
+        anyhow::Ok(parse_assignment(
+            read_assignment(&args.old)?,
+            args.sample_workers,
+        ))
+    });
+    let mut new = parse_assignment(read_assignment(&args.new)?, args.sample_workers);
     let old = handle.join().unwrap()?;
 
     for (peer_id, old_chunks) in old {
