@@ -1,8 +1,4 @@
-use std::{
-    borrow::Cow,
-    collections::BTreeMap,
-    sync::{Arc, atomic::AtomicU64},
-};
+use std::{borrow::Cow, sync::atomic::AtomicU64};
 
 use libp2p_identity::PeerId;
 use prometheus_client::{
@@ -10,7 +6,7 @@ use prometheus_client::{
     registry::{Registry, Unit},
 };
 
-use crate::types::{Chunk, Worker};
+use crate::types::Worker;
 
 type Labels = Vec<(&'static str, String)>;
 
@@ -49,17 +45,28 @@ pub fn report_workers(workers: &[Worker]) {
     }
 }
 
-pub fn report_chunks(chunks: &BTreeMap<Arc<String>, Vec<Chunk>>) {
-    DATASET_CHUNKS.clear();
-    DATASET_SIZE.clear();
-    for (dataset, chunks) in chunks {
-        let labels = vec![("dataset", dataset.to_string())];
-        DATASET_CHUNKS
-            .get_or_create(&labels)
-            .set(chunks.len() as i64);
+pub struct DatasetSegmentStats {
+    pub from: i64,
+    pub num_chunks: u32,
+    pub total_size: u64,
+}
+
+pub fn report_chunks(dataset: &str, seg_stats: &[DatasetSegmentStats]) {
+    let default = seg_stats.len() == 1 && seg_stats[0].from == 0;
+    for stats in seg_stats {
+        let labels = vec![
+            (
+                "dataset_segment",
+                format_segment_label(dataset, (!default).then_some(stats.from)),
+            ),
+            ("dataset", dataset.to_string()),
+        ];
         DATASET_SIZE
             .get_or_create(&labels)
-            .set(chunks.iter().map(|c| c.size as i64).sum());
+            .set(stats.total_size as i64);
+        DATASET_CHUNKS
+            .get_or_create(&labels)
+            .set(stats.num_chunks as i64);
     }
 }
 
@@ -71,12 +78,24 @@ pub fn report_worker_stats(worker: PeerId, num_chunks: usize, bytes: u64) {
     ASSIGNED_SIZE.get_or_create(&labels).set(bytes as i64);
 }
 
-pub fn report_replication_factors(iter: impl IntoIterator<Item = (String, u16)>) {
+pub fn report_replication_factors(
+    iter: impl IntoIterator<Item = (String, impl IntoIterator<Item = (i64, u16)>)>,
+) {
     REPLICATION_FACTOR.clear();
-    for (dataset, factor) in iter {
-        REPLICATION_FACTOR
-            .get_or_create(&vec![("dataset", dataset.to_string())])
-            .set(factor as i64);
+    for (dataset, segments) in iter {
+        let segments: Vec<_> = segments.into_iter().collect();
+        let default = segments.len() == 1 && segments[0].0 == 0;
+        for (from, factor) in segments {
+            REPLICATION_FACTOR
+                .get_or_create(&vec![
+                    (
+                        "dataset_segment",
+                        format_segment_label(&dataset, (!default).then_some(from)),
+                    ),
+                    ("dataset", dataset.clone()),
+                ])
+                .set(factor as i64);
+        }
     }
 }
 
@@ -84,6 +103,14 @@ pub fn failure(target: impl Into<String>) {
     FAILURE
         .get_or_create(&vec![("target", target.into())])
         .set(1);
+}
+
+fn format_segment_label(dataset: &str, from: Option<i64>) -> String {
+    if let Some(block) = from {
+        format!("{}[{}..]", dataset, block)
+    } else {
+        dataset.to_string()
+    }
 }
 
 pub fn register_metrics(network: String) -> Registry {

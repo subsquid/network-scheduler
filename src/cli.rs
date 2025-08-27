@@ -4,6 +4,7 @@ use std::{
     time::Duration,
 };
 
+use anyhow::ensure;
 use clap::Parser;
 use semver::VersionReq;
 use serde::{Deserialize, Serialize};
@@ -67,10 +68,12 @@ impl S3Args {
     }
 }
 
+pub type DatasetsConfig = BTreeMap<String, Vec<DatasetSegmentConfig>>;
+
 #[serde_as]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
-    pub datasets: BTreeMap<String, DatasetConfig>,
+    pub datasets: DatasetsConfig,
 
     #[serde_as(as = "DurationSeconds")]
     #[serde(rename = "worker_inactive_timeout_sec")]
@@ -126,7 +129,10 @@ pub struct Config {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DatasetConfig {
+pub struct DatasetSegmentConfig {
+    #[serde(default)]
+    pub from: i64,
+
     #[serde(default = "default_weight")]
     pub weight: ChunkWeight,
 }
@@ -135,8 +141,40 @@ impl Config {
     pub fn load(path: &Path) -> anyhow::Result<Self> {
         let file = std::fs::File::open(path)?;
         let reader = std::io::BufReader::new(file);
-        let config = serde_yaml::from_reader(reader)?;
+        let mut config: Config = serde_yaml::from_reader(reader)?;
+        config.fill_defaults();
+        config.validate()?;
         Ok(config)
+    }
+
+    fn fill_defaults(&mut self) {
+        for ds in self.datasets.values_mut() {
+            if ds.is_empty() {
+                ds.push(DatasetSegmentConfig {
+                    from: 0,
+                    weight: default_weight(),
+                });
+            }
+        }
+    }
+
+    fn validate(&self) -> anyhow::Result<()> {
+        for segments in self.datasets.values() {
+            let mut last = segments[0].from;
+            for seg in &segments[1..] {
+                if seg.from >= 0 {
+                    ensure!(
+                        last >= 0,
+                        "Negative offsets can't be followed by positive ones"
+                    );
+                    ensure!(last < seg.from, "Segment 'from' values must be increasing");
+                } else if last < 0 {
+                    ensure!(last < seg.from, "Segment 'from' values must be increasing");
+                }
+                last = seg.from;
+            }
+        }
+        Ok(())
     }
 }
 

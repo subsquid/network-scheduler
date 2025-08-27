@@ -3,8 +3,6 @@ use std::{collections::BTreeMap, sync::Arc};
 use anyhow::Context;
 use clap::Parser;
 use itertools::Itertools;
-use scheduling::WeightedChunk;
-use types::Chunk;
 
 use crate::types::FbVersion;
 
@@ -21,6 +19,7 @@ mod tests;
 mod types;
 mod upload;
 mod utils;
+mod weight;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -101,7 +100,6 @@ async fn main() -> anyhow::Result<()> {
             known_chunks.insert(dataset, chunks);
         }
     }
-    metrics::report_chunks(&known_chunks);
     let chunks = known_chunks
         .into_iter()
         .flat_map(|(_, chunks)| {
@@ -118,7 +116,7 @@ async fn main() -> anyhow::Result<()> {
         chunks.len()
     );
 
-    let weighted_chunks = weight_chunks(&chunks, &config);
+    let (weighted_chunks, chunks) = weight::weight_chunks(chunks, &config.datasets);
 
     // blocking the async executor is ok here because no other tasks are running
     let assignment = scheduling::schedule(
@@ -179,15 +177,4 @@ fn setup_tracing(_args: &cli::Args) {
         )
         .compact()
         .init();
-}
-
-fn weight_chunks(chunks: &[Chunk], config: &cli::Config) -> Vec<WeightedChunk> {
-    chunks
-        .iter()
-        .map(|chunk| WeightedChunk {
-            id: format!("{}/{}", chunk.dataset, chunk.id),
-            size: chunk.size,
-            weight: config.datasets[chunk.bucket()].weight,
-        })
-        .collect()
 }

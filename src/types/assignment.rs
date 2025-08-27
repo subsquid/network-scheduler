@@ -63,10 +63,12 @@ impl Assignment {
             }
         }
 
-        crate::metrics::report_replication_factors(config.datasets.iter().map(|(ds, config)| {
+        crate::metrics::report_replication_factors(config.datasets.iter().map(|(ds, segments)| {
             (
                 format!("s3://{ds}"),
-                self.replication_by_weight[&config.weight],
+                segments
+                    .iter()
+                    .map(move |seg| (seg.from, self.replication_by_weight[&seg.weight])),
             )
         }));
     }
