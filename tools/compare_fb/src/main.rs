@@ -8,7 +8,7 @@ use clap::Parser;
 use libp2p_identity::PeerId;
 use sqd_assignments::Assignment;
 
-const GB: f64 = 1_000_000_000.;
+const GB: f64 = (1 << 30) as f64;
 
 #[derive(Parser, Debug)]
 #[command()]
