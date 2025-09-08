@@ -1,6 +1,7 @@
 mod assignment;
 mod chunk;
 mod status;
+mod summary;
 mod worker;
 
 pub type WorkerIndex = u16;
@@ -13,3 +14,4 @@ pub use assignment::{Assignment, FbVersion};
 pub use chunk::Chunk;
 pub use status::{SchedulingStatus, SchedulingStatusConfig};
 pub use worker::{Worker, WorkerStatus};
+pub use summary::ChunkSummary;

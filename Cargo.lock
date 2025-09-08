@@ -834,12 +834,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1628fb46dfa0b37568d12e5edd512553eccf6a22a78e8bde00bb4aed84d5bdbf"
 
 [[package]]
-name = "bytemuck"
-version = "1.23.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9134a6ef01ce4b366b50689c94f82c14bc72bc5d0386829828a2e2752ef7958c"
-
-[[package]]
 name = "byteorder"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1030,7 +1024,7 @@ dependencies = [
  "clap",
  "libp2p-identity",
  "serde_json",
- "sqd-assignments",
+ "sqd-assignments 0.0.1",
 ]
 
 [[package]]
@@ -2431,7 +2425,7 @@ checksum = "1d87ecb2933e8aeadb3e3a02b828fed80a7528047e68b4f424523a0981a3a084"
 
 [[package]]
 name = "network-scheduler"
-version = "3.3.0"
+version = "3.4.0"
 dependencies = [
  "anyhow",
  "aws-config",
@@ -2459,7 +2453,7 @@ dependencies = [
  "serde_with",
  "serde_yaml",
  "sha2",
- "sqd-assignments",
+ "sqd-assignments 0.1.0",
  "sqd-messages",
  "tempfile",
  "thiserror 2.0.12",
@@ -2884,7 +2878,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "22505a5c94da8e3b7c2996394d1c933236c4d743e81a410bcca4e6989fc066a4"
 dependencies = [
  "bytes",
- "heck 0.5.0",
+ "heck 0.4.1",
  "itertools 0.12.1",
  "log",
  "multimap",
@@ -2918,7 +2912,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8a56d757972c98b346a9b766e3f02746cde6dd1cd1d1d563472929fdd74bec4d"
 dependencies = [
  "anyhow",
- "itertools 0.14.0",
+ "itertools 0.12.1",
  "proc-macro2",
  "quote",
  "syn",
@@ -3428,7 +3422,6 @@ version = "1.0.140"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "20068b6e96dc6c9bd23e01df8827e6c7e1f2fddd43c21810382803c136b99373"
 dependencies = [
- "indexmap 2.9.0",
  "itoa",
  "memchr",
  "ryu",
@@ -3617,40 +3610,44 @@ source = "git+https://github.com/subsquid/sqd-network.git?rev=08363c2#08363c2b3e
 dependencies = [
  "anyhow",
  "crypto_box",
- "curve25519-dalek",
  "flatbuffers 25.2.10",
  "libp2p-identity",
  "ouroboros",
  "serde_json",
  "sha2",
- "sqd-messages",
  "tracing",
 ]
 
 [[package]]
-name = "sqd-messages"
-version = "2.0.2"
-source = "git+https://github.com/subsquid/sqd-network.git?rev=08363c2#08363c2b3e5e257657a0a78e830c006f029b714a"
+name = "sqd-assignments"
+version = "0.1.0"
+source = "git+https://github.com/subsquid/sqd-network.git?rev=4155753#415575321900a33c8fc3988b11bca0a21993c703"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
- "bs58",
- "bytemuck",
  "crypto_box",
  "curve25519-dalek",
- "flate2",
- "hex",
+ "flatbuffers 25.2.10",
  "hmac",
  "libp2p-identity",
- "log",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tracing",
+ "url",
+]
+
+[[package]]
+name = "sqd-messages"
+version = "2.1.0"
+source = "git+https://github.com/subsquid/sqd-network.git?rev=4155753#415575321900a33c8fc3988b11bca0a21993c703"
+dependencies = [
+ "hex",
+ "libp2p-identity",
  "prost 0.13.5",
  "prost-build",
  "serde",
- "serde_json",
- "serde_with",
- "sha2",
  "sha3",
- "url",
 ]
 
 [[package]]

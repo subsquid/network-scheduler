@@ -1,6 +1,6 @@
 use std::{ops::RangeInclusive, str::FromStr, sync::Arc};
 
-use crate::pool;
+use crate::{pool, types::ChunkSummary};
 
 use super::BlockNumber;
 
@@ -11,7 +11,7 @@ pub struct Chunk {
     pub size: u32,
     pub blocks: RangeInclusive<BlockNumber>,
     pub files: Arc<Vec<String>>,
-    pub summary: Option<sqd_messages::assignments::ChunkSummary>,
+    pub summary: Option<ChunkSummary>,
 }
 
 impl Chunk {

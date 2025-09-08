@@ -237,13 +237,10 @@ impl WithAssignment {
         let fb_v1 =
             self.assignment
                 .encode_fb(&self.chunks, &self.config, &self.workers, FbVersion::V1);
-        let json = self
-            .assignment
-            .encode(self.chunks.clone(), &self.config, &self.workers);
         tracing::info!("Serialized assignment v0 size: {} bytes", fb_v0.len());
         tracing::info!("Serialized assignment v1 size: {} bytes", fb_v1.len());
 
-        SerializedAssignment { json, fb_v0, fb_v1 }
+        SerializedAssignment { fb_v0, fb_v1 }
     }
 
     pub fn _save_to_file(&self, filename: &str) -> anyhow::Result<()> {
@@ -271,7 +268,6 @@ impl WithAssignment {
 }
 
 pub struct SerializedAssignment {
-    json: sqd_messages::assignments::Assignment,
     fb_v0: Vec<u8>,
     fb_v1: Vec<u8>,
 }
@@ -279,9 +275,7 @@ pub struct SerializedAssignment {
 impl SerializedAssignment {
     pub async fn upload(self, uploader: &upload::Uploader) -> anyhow::Result<()> {
         tracing::info!("Uploading assignment");
-        let url: String = uploader
-            .upload_assignment(self.json, self.fb_v0, self.fb_v1)
-            .await?;
+        let url: String = uploader.upload_assignment(self.fb_v0, self.fb_v1).await?;
         tracing::info!("Assignment uploaded to {url}");
         Ok(())
     }

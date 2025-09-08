@@ -1,10 +1,11 @@
 use parquet::file::reader::{FileReader, SerializedFileReader};
 use parquet::record::Field;
 use parquet::schema::types::Type;
-use sqd_messages::assignments;
 use std::fs::File;
 
-pub fn read_chunk_summary(blocks_file: File) -> anyhow::Result<assignments::ChunkSummary> {
+use crate::types::ChunkSummary;
+
+pub fn read_chunk_summary(blocks_file: File) -> anyhow::Result<ChunkSummary> {
     let reader = SerializedFileReader::new(blocks_file)?;
     let mut iter = read_blocks(&reader)?;
     let mut last_block = iter
@@ -16,16 +17,14 @@ pub fn read_chunk_summary(blocks_file: File) -> anyhow::Result<assignments::Chun
             last_block = block;
         }
     }
-    Ok(assignments::ChunkSummary {
+    Ok(ChunkSummary {
         last_block_hash: last_block.hash,
-        last_block_number: last_block.slot.unwrap_or(last_block.number),
     })
 }
 
 struct BlockSummary {
     hash: String,
     number: u64,
-    slot: Option<u64>,
 }
 
 fn read_blocks(
@@ -66,7 +65,6 @@ fn read_blocks(
             number: slot
                 .or(number)
                 .ok_or(anyhow::anyhow!("No number of block found"))?,
-            slot,
         })
     });
     Ok(iter)

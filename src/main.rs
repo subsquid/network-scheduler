@@ -16,7 +16,6 @@ mod storage;
 mod tests;
 mod types;
 mod upload;
-mod utils;
 mod weight;
 
 #[tokio::main]

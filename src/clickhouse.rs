@@ -5,13 +5,12 @@ use clickhouse::{Client, Row};
 use itertools::Itertools;
 use semver::VersionReq;
 use serde::{Deserialize, Serialize};
-use sqd_messages::assignments::ChunkSummary;
 use tracing::instrument;
 
 use crate::{
     cli::ClickhouseArgs,
     pool,
-    types::{Chunk, Worker, WorkerStatus},
+    types::{Chunk, ChunkSummary, Worker, WorkerStatus},
 };
 
 const PINGS_TABLE: &str = "worker_pings_v2";
@@ -181,10 +180,7 @@ impl TryFrom<ChunkRow> for Chunk {
             row.files.split(',').map(String::from).collect(),
         )?;
         if let Some(last_block_hash) = row.last_block_hash {
-            chunk.summary = Some(ChunkSummary {
-                last_block_hash,
-                last_block_number: *chunk.blocks.end(),
-            });
+            chunk.summary = Some(ChunkSummary { last_block_hash });
         }
         Ok(chunk)
     }
