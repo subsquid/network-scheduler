@@ -97,6 +97,7 @@ impl Uploader {
         let network_state = NetworkState {
             network,
             assignment: NetworkAssignment {
+                url: Some(String::new()),
                 fb_url: Some(fb_url_v0),
                 fb_url_v1: Some(fb_url_v1.clone()),
                 id: assignment_id,
