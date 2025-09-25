@@ -35,7 +35,9 @@ impl S3Storage {
             .map(|(dataset, last_chunk)| {
                 let storage = DatasetStorage::new(self.client.clone(), dataset);
                 async move {
-                    let chunks = storage.list_new_chunks(last_chunk).await?;
+                    let chunks = storage
+                        .list_new_chunks(last_chunk, concurrent_downloads)
+                        .await?;
                     anyhow::Ok((storage.dataset, chunks))
                 }
             })
@@ -63,7 +65,11 @@ impl DatasetStorage {
     }
 
     #[instrument(skip_all, level = "debug", fields(dataset = %self.dataset))]
-    pub async fn list_new_chunks(&self, last_chunk: Option<&Chunk>) -> anyhow::Result<Vec<Chunk>> {
+    pub async fn list_new_chunks(
+        &self,
+        last_chunk: Option<&Chunk>,
+        concurrent_downloads: usize,
+    ) -> anyhow::Result<Vec<Chunk>> {
         tracing::debug!("Downloading chunks from {}", self.dataset);
         let mut next_expected_block = last_chunk.as_ref().map(|chunk| chunk.blocks.end() + 1);
         let last_key =
@@ -92,11 +98,16 @@ impl DatasetStorage {
             next_expected_block = Some(chunk.blocks.end() + 1);
         }
 
-        if let Some(last_chunk) = chunks.last_mut() {
-            self.populate_with_summary(last_chunk)
-                .await
-                .context(format!("couldn't download chunk summary for {last_chunk}"))?;
-        }
+        stream::iter(chunks.iter_mut())
+            .map(Ok::<_, anyhow::Error>)
+            .try_for_each_concurrent(Some(concurrent_downloads), |ch| async {
+                self.populate_with_summary(ch).await.context(format!(
+                    "couldn't download chunk summary for {}",
+                    ch.clone(),
+                ))?;
+                Ok(())
+            })
+            .await?;
 
         tracing::debug!("Downloaded {} chunks", chunks.len());
 
@@ -222,5 +233,47 @@ impl TryFrom<s3::types::Object> for S3Object {
             file_name,
             size,
         })
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use aws_config::BehaviorVersion;
+    use std::env;
+
+    async fn make_s3_client() -> anyhow::Result<s3::Client> {
+        let endpoint = env::var("AWS_ENDPOINT_URL")?;
+
+        let config = aws_config::defaults(BehaviorVersion::latest())
+            .region("auto")
+            .endpoint_url(endpoint)
+            .load()
+            .await;
+
+        Ok(s3::Client::new(&config))
+    }
+
+    async fn make_storage(dataset: &str) -> anyhow::Result<DatasetStorage> {
+        let s3c = make_s3_client().await?;
+        Ok(DatasetStorage::new(s3c, Arc::new(dataset.to_string())))
+    }
+
+    #[tokio::test]
+    #[ignore = "not a unit test"]
+    // this test requires the AWS secrets and the AWS_ENDPOINT_URL variable to be set in env
+    async fn test_load_chunks() {
+        let ds = make_storage("s3://ethereum-holesky-1").await.unwrap();
+        let chunks = ds.list_new_chunks(None, 4).await.unwrap();
+        let expected = chunks.len();
+
+        assert!(expected > 0);
+
+        let have = chunks.iter().fold(
+            0,
+            |acc, ch| if ch.summary.is_some() { acc + 1 } else { acc },
+        );
+
+        assert_eq!(expected, have);
     }
 }
