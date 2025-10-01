@@ -1,7 +1,6 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use anyhow::Context;
 use aws_sdk_s3 as s3;
 use itertools::Itertools;
 use tokio::io::AsyncSeekExt;
@@ -13,6 +12,8 @@ use futures::{
     TryStreamExt,
     stream::{self, StreamExt},
 };
+
+const CONCURRENT_CHUNKS: usize = 4;
 
 #[derive(Clone)]
 pub struct S3Storage {
@@ -36,7 +37,7 @@ impl S3Storage {
                 let storage = DatasetStorage::new(self.client.clone(), dataset);
                 async move {
                     let chunks = storage
-                        .list_new_chunks(last_chunk, concurrent_downloads)
+                        .list_new_chunks(last_chunk, CONCURRENT_CHUNKS)
                         .await?;
                     anyhow::Ok((storage.dataset, chunks))
                 }
@@ -99,13 +100,11 @@ impl DatasetStorage {
         }
 
         stream::iter(chunks.iter_mut())
-            .map(Ok::<_, anyhow::Error>)
-            .try_for_each_concurrent(Some(concurrent_downloads), |ch| async {
-                self.populate_with_summary(ch).await.context(format!(
-                    "couldn't download chunk summary for {}",
-                    ch.clone(),
-                ))?;
-                Ok(())
+            .map(anyhow::Ok)
+            .try_for_each_concurrent(Some(concurrent_downloads), |ch| async move {
+                self.populate_with_summary(ch)
+                    .await
+                    .map_err(|e| e.context(format!("couldn't download chunk summary for {}", ch)))
             })
             .await?;
 
@@ -264,7 +263,7 @@ mod test {
     // this test requires the AWS secrets and the AWS_ENDPOINT_URL variable to be set in env
     async fn test_load_chunks() {
         let ds = make_storage("s3://ethereum-holesky-1").await.unwrap();
-        let chunks = ds.list_new_chunks(None, 4).await.unwrap();
+        let chunks = ds.list_new_chunks(None, CONCURRENT_CHUNKS).await.unwrap();
         let expected = chunks.len();
 
         assert!(expected > 0);
