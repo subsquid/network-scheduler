@@ -4,7 +4,7 @@ use crate::{pool, types::ChunkSummary};
 
 use super::BlockNumber;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Chunk {
     pub dataset: Arc<String>,
     pub id: String,
