@@ -181,6 +181,8 @@ impl TryFrom<ChunkRow> for Chunk {
             size,
             row.files.split(',').map(String::from).collect(),
         )?;
+        // This assumes that both hash and timestamp are either Some or None!
+        // (Compare From<Chunk> for ChunkRow)
         if let (Some(last_block_hash), Some(last_block_timestamp)) =
             (row.last_block_hash, row.last_block_timestamp)
         {
