@@ -181,14 +181,12 @@ impl TryFrom<ChunkRow> for Chunk {
             size,
             row.files.split(',').map(String::from).collect(),
         )?;
-        // This assumes that both hash and timestamp are either Some or None!
-        // (Compare From<Chunk> for ChunkRow)
-        if let (Some(last_block_hash), Some(last_block_timestamp)) =
-            (row.last_block_hash, row.last_block_timestamp)
-        {
+        // For historical reasons summary is an option;
+        // if one of the contained values is present, it should be 'Some'.
+        if row.last_block_hash.is_some() || row.last_block_timestamp != 0 {
             chunk.summary = Some(ChunkSummary {
-                last_block_hash: last_block_hash,
-                last_block_timestamp: last_block_timestamp,
+                last_block_hash: row.last_block_hash.unwrap_or(String::with_capacity(0)),
+                last_block_timestamp: row.last_block_timestamp,
             });
         }
         Ok(chunk)
@@ -197,8 +195,9 @@ impl TryFrom<ChunkRow> for Chunk {
 
 impl From<Chunk> for ChunkRow {
     fn from(chunk: Chunk) -> Self {
-        let (last_block_hash, last_block_timestamp) = chunk.summary.map_or((None, None), |s| {
-            (Some(s.last_block_hash), Some(s.last_block_timestamp))
+        // For historical reasons last_block_hash is nullable.
+        let (last_block_hash, last_block_timestamp) = chunk.summary.map_or((None, 0), |s| {
+            (Some(s.last_block_hash), s.last_block_timestamp)
         });
         Self {
             dataset: chunk.dataset.to_string(),
