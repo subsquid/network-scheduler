@@ -182,8 +182,9 @@ impl TryFrom<ChunkRow> for Chunk {
             row.files.split(',').map(String::from).collect(),
         )?;
         if let (Some(last_block_hash), Some(last_block_timestamp)) =
-            (row.last_block_hash, row.last_block_timestamp) {
-            chunk.summary = Some(ChunkSummary { 
+            (row.last_block_hash, row.last_block_timestamp)
+        {
+            chunk.summary = Some(ChunkSummary {
                 last_block_hash: last_block_hash,
                 last_block_timestamp: last_block_timestamp,
             });
@@ -194,9 +195,9 @@ impl TryFrom<ChunkRow> for Chunk {
 
 impl From<Chunk> for ChunkRow {
     fn from(chunk: Chunk) -> Self {
-        let (last_block_hash, last_block_timestamp) = chunk.summary.map_or((None, None), |s| (
-            Some(s.last_block_hash), Some(s.last_block_timestamp),
-        ));
+        let (last_block_hash, last_block_timestamp) = chunk.summary.map_or((None, None), |s| {
+            (Some(s.last_block_hash), Some(s.last_block_timestamp))
+        });
         Self {
             dataset: chunk.dataset.to_string(),
             id: chunk.id,
@@ -210,9 +211,9 @@ impl From<Chunk> for ChunkRow {
 
 #[cfg(test)]
 mod test {
-    use chrono::{TimeZone, Utc};
-    use crate::clickhouse::ClickhouseArgs;
     use super::*;
+    use crate::clickhouse::ClickhouseArgs;
+    use chrono::{TimeZone, Utc};
 
     // To run this test, start a local clickhouse instance first
     // docker run --rm \
@@ -246,16 +247,20 @@ mod test {
             size: 1000,
             blocks: std::ops::RangeInclusive::new(18246541, 18248424),
             files: Arc::new(vec!["blocks".to_string(), "transactions".to_string()]),
-            summary: Some(ChunkSummary{
+            summary: Some(ChunkSummary {
                 last_block_hash: "00BAB10C".to_string(),
                 last_block_timestamp: tstp.timestamp_millis() as u64,
             }),
         }];
 
-        client.store_new_chunks(expected.clone()).await.expect("Cannot store chunks");
+        client
+            .store_new_chunks(expected.clone())
+            .await
+            .expect("Cannot store chunks");
 
         let datasets = vec![dataset.to_string()];
-        let chunks_of_dataset = client.get_existing_chunks(datasets.iter().map(|d| d.as_str()))
+        let chunks_of_dataset = client
+            .get_existing_chunks(datasets.iter().map(|d| d.as_str()))
             .await
             .expect("Cannot retrieve chunks");
 

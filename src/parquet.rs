@@ -35,7 +35,7 @@ fn read_blocks(
     let metadata = reader.metadata();
     let schema = metadata.file_metadata().schema();
     let mut fields = schema.get_fields().to_vec();
-    fields.retain(|f| matches!(f.name(), "number" | "hash" | "slot" | "timestamp" ));
+    fields.retain(|f| matches!(f.name(), "number" | "hash" | "slot" | "timestamp"));
     let projection = Type::group_type_builder(schema.get_basic_info().name())
         .with_fields(fields)
         .build()
