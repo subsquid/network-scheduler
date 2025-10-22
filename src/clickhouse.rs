@@ -148,7 +148,7 @@ impl ClickhouseClient {
                 size UInt64 NOT NULL,
                 files LowCardinality(String) NOT NULL,
                 last_block_hash Nullable(String),
-                last_block_timestamp Nullable(UInt64)
+                last_block_timestamp UInt64
             ) ENGINE = ReplacingMergeTree()
             ORDER BY (dataset, id)
             "
@@ -166,7 +166,7 @@ struct ChunkRow {
     size: u64,
     files: String,
     last_block_hash: Option<String>,
-    last_block_timestamp: Option<u64>,
+    last_block_timestamp: u64,
 }
 
 impl TryFrom<ChunkRow> for Chunk {
