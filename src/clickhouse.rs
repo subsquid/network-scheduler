@@ -105,7 +105,7 @@ impl ClickhouseClient {
 
         let query = format!(
             r"
-            SELECT DISTINCT ON (dataset, id) dataset, id, size, files, last_block_hash
+            SELECT DISTINCT ON (dataset, id) dataset, id, size, files, last_block_hash, last_block_timestamp
             FROM {CHUNKS_TABLE}
             WHERE dataset IN ?
             ORDER BY dataset, id
@@ -147,7 +147,8 @@ impl ClickhouseClient {
                 id String NOT NULL,
                 size UInt64 NOT NULL,
                 files LowCardinality(String) NOT NULL,
-                last_block_hash Nullable(String)
+                last_block_hash Nullable(String),
+                last_block_timestamp Nullable(UInt64)
             ) ENGINE = ReplacingMergeTree()
             ORDER BY (dataset, id)
             "
@@ -165,6 +166,7 @@ struct ChunkRow {
     size: u64,
     files: String,
     last_block_hash: Option<String>,
+    last_block_timestamp: Option<u64>,
 }
 
 impl TryFrom<ChunkRow> for Chunk {
@@ -179,8 +181,15 @@ impl TryFrom<ChunkRow> for Chunk {
             size,
             row.files.split(',').map(String::from).collect(),
         )?;
-        if let Some(last_block_hash) = row.last_block_hash {
-            chunk.summary = Some(ChunkSummary { last_block_hash });
+        // This assumes that both hash and timestamp are either Some or None!
+        // (Compare From<Chunk> for ChunkRow)
+        if let (Some(last_block_hash), Some(last_block_timestamp)) =
+            (row.last_block_hash, row.last_block_timestamp)
+        {
+            chunk.summary = Some(ChunkSummary {
+                last_block_hash: last_block_hash,
+                last_block_timestamp: last_block_timestamp,
+            });
         }
         Ok(chunk)
     }
@@ -188,12 +197,85 @@ impl TryFrom<ChunkRow> for Chunk {
 
 impl From<Chunk> for ChunkRow {
     fn from(chunk: Chunk) -> Self {
+        let (last_block_hash, last_block_timestamp) = chunk.summary.map_or((None, None), |s| {
+            (Some(s.last_block_hash), Some(s.last_block_timestamp))
+        });
         Self {
             dataset: chunk.dataset.to_string(),
             id: chunk.id,
             size: chunk.size as u64,
             files: chunk.files.join(","),
-            last_block_hash: chunk.summary.map(|s| s.last_block_hash),
+            last_block_hash: last_block_hash,
+            last_block_timestamp: last_block_timestamp,
         }
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use crate::clickhouse::ClickhouseArgs;
+    use chrono::{TimeZone, Utc};
+
+    // To run this test, start a local clickhouse instance first
+    // docker run --rm \
+    //   -e CLICKHOUSE_DB=logs_db \
+    //   -e CLICKHOUSE_USER=user \
+    //   -e CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT=1 \
+    //   -e CLICKHOUSE_PASSWORD=password \
+    //   --network=host \
+    //   --ulimit nofile=262144:262144 \
+    //   clickhouse/clickhouse-server
+    #[tokio::test]
+    #[ignore = "database test"]
+    async fn test_clickhouse() {
+        let client = ClickhouseClient::new(&ClickhouseArgs {
+            clickhouse_url: "http://localhost:8123/".to_string(),
+            clickhouse_database: "logs_db".to_string(),
+            clickhouse_user: "user".to_string(),
+            clickhouse_password: "password".to_string(),
+        })
+        .await
+        .expect("Cannot connect to clickhouse");
+
+        client.create_tables().await.expect("Cannot create tables");
+
+        let dataset = "s3://solana-mainnet-1";
+        let tstp = Utc.with_ymd_and_hms(2025, 10, 20, 5, 40, 10).unwrap();
+
+        let expected = vec![Chunk {
+            dataset: dataset.to_string().into(),
+            id: "0018197829/0018246541-0018248424-c7ed95c9".to_string(),
+            size: 1000,
+            blocks: std::ops::RangeInclusive::new(18246541, 18248424),
+            files: Arc::new(vec!["blocks".to_string(), "transactions".to_string()]),
+            summary: Some(ChunkSummary {
+                last_block_hash: "00BAB10C".to_string(),
+                last_block_timestamp: tstp.timestamp_millis() as u64,
+            }),
+        }];
+
+        client
+            .store_new_chunks(expected.clone())
+            .await
+            .expect("Cannot store chunks");
+
+        let datasets = vec![dataset.to_string()];
+        let chunks_of_dataset = client
+            .get_existing_chunks(datasets.iter().map(|d| d.as_str()))
+            .await
+            .expect("Cannot retrieve chunks");
+
+        let have = chunks_of_dataset[&Arc::new(dataset.to_string())].clone();
+
+        println!("to   DB: {:?}", expected);
+        println!("from DB: {:?}", have);
+
+        assert_eq!(expected, have);
+
+        assert!(have.len() == 1);
+        assert!(have[0].summary.is_some());
+        let have_tstp = have[0].summary.as_ref().unwrap().last_block_timestamp;
+        assert_eq!(have_tstp, tstp.timestamp_millis() as u64);
     }
 }

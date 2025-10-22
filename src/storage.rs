@@ -261,8 +261,33 @@ mod test {
     #[tokio::test]
     #[ignore = "not a unit test"]
     // this test requires the AWS secrets and the AWS_ENDPOINT_URL variable to be set in env
-    async fn test_load_chunks() {
-        let ds = make_storage("s3://ethereum-holesky-1").await.unwrap();
+    async fn test_load_chunks_from_eth_holesky() {
+        test_load_chunks("ethereum-holesky-1").await;
+    }
+
+    #[tokio::test]
+    #[ignore = "not a unit test"]
+    // this test requires the AWS secrets and the AWS_ENDPOINT_URL variable to be set in env
+    async fn test_load_chunks_from_eth_sepolia() {
+        test_load_chunks("ethereum-sepolia-1").await;
+    }
+
+    #[tokio::test]
+    #[ignore = "not a unit test"]
+    // this test requires the AWS secrets and the AWS_ENDPOINT_URL variable to be set in env
+    async fn test_load_chunks_from_sol_mainnet() {
+        test_load_chunks("solana-mainnet-1").await;
+    }
+
+    #[tokio::test]
+    #[ignore = "not a unit test"]
+    // this test requires the AWS secrets and the AWS_ENDPOINT_URL variable to be set in env
+    async fn test_load_chunks_from_hyper_testnet() {
+        test_load_chunks("hyperliquid-testnet-4").await;
+    }
+
+    async fn test_load_chunks(dataset: &str) {
+        let ds = make_storage(&format!("s3://{dataset}")).await.unwrap();
         let chunks = ds.list_new_chunks(None, CONCURRENT_CHUNKS).await.unwrap();
         let expected = chunks.len();
 

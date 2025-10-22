@@ -19,11 +19,13 @@ pub fn read_chunk_summary(blocks_file: File) -> anyhow::Result<ChunkSummary> {
     }
     Ok(ChunkSummary {
         last_block_hash: last_block.hash,
+        last_block_timestamp: last_block.timestamp,
     })
 }
 
 struct BlockSummary {
     hash: String,
+    timestamp: u64,
     number: u64,
 }
 
@@ -33,7 +35,7 @@ fn read_blocks(
     let metadata = reader.metadata();
     let schema = metadata.file_metadata().schema();
     let mut fields = schema.get_fields().to_vec();
-    fields.retain(|f| matches!(f.name(), "number" | "hash" | "slot"));
+    fields.retain(|f| matches!(f.name(), "number" | "hash" | "slot" | "timestamp"));
     let projection = Type::group_type_builder(schema.get_basic_info().name())
         .with_fields(fields)
         .build()
@@ -43,6 +45,7 @@ fn read_blocks(
         let mut hash = None;
         let mut slot = None;
         let mut number = None;
+        let mut timestamp = None;
         for column in r?.into_columns() {
             match column {
                 (name, Field::Str(s)) if name == "hash" => {
@@ -57,11 +60,19 @@ fn read_blocks(
                 (name, Field::Long(n)) if name == "slot" => {
                     slot = Some(n as u64);
                 }
+                (name, Field::Long(n)) if name == "timestamp" => {
+                    timestamp = Some(n as u64);
+                }
+                (name, Field::TimestampMillis(n)) if name == "timestamp" => {
+                    timestamp = Some(n as u64);
+                }
                 _ => {}
             }
         }
         Ok(BlockSummary {
             hash: hash.ok_or(anyhow::anyhow!("No hash of block found"))?,
+            // don't trigger an error for timestamp: some datasets may have still other types or names (e.g. block_time)
+            timestamp: timestamp.unwrap_or(0),
             number: slot
                 .or(number)
                 .ok_or(anyhow::anyhow!("No number of block found"))?,
