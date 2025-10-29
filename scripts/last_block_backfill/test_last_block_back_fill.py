@@ -33,7 +33,7 @@ def list_chunks(bucket, limit=None):
     return chunks
 
 def get_all_rows(con, bucket, parq):
-    myobject = f"{bucket}/{parq}"
+    myobject = f"s3://{bucket}/{parq}"
     con.sql(f"select number, hash, timestamp from '{myobject}'").arrow()
 
 def check_table(ch):
@@ -48,14 +48,12 @@ def check_table(ch):
            assert datetime.fromtimestamp(row[5]/1000).year >= 2009
            
 
-def prepare_test_data(aws, chcfg, bucket, limit=None):
+def prepare_test_data(aws, bucket, limit=None):
     if not global_test_mode:
         return
 
     chunks = list_chunks(bucket, limit)
     ch = get_clickhouse_connection(chcfg)
-
-    dataset = f"s3://{bucket}"
 
     create_table(ch)
 
@@ -68,7 +66,7 @@ def prepare_test_data(aws, chcfg, bucket, limit=None):
                 
             ch.insert(
                 'dataset_chunks',
-                [[dataset, chunk, 0, '']],
+                [[bucket, chunk, 0, '']],
                 column_names=['dataset', 'id', 'size', 'files'],
             )
 

@@ -6,6 +6,11 @@ import linecache
 from loguru import logger
 import os
 import pandas
+import clickhouse_connect
+from datetime import datetime
+import duckdb
+from loguru import logger
+import os
 import sys
 import timeit
 from urllib.parse import urlparse, ParseResult
@@ -100,15 +105,16 @@ def get_clickhouse_connection(cfg):
         database=cfg.database,
     )
 
-def process_dataset(aws, chcfg, dataset, limit=None):
-    ch = get_clickhouse_connection(chcfg)
-    bucket = dataset if dataset else get_bucket_to_process(ch)
-    logger.info(f"processing dataset {bucket}")
+def get_clickhouse_connection():
+    return clickhouse_connect.get_client(
+        host='localhost', 
+        username='user', 
+        password='password', 
+        database='logs_db',
+    )
 
-    rows = get_chunks_from_db(ch, bucket).result_rows
-    cnt = 0
-    last_timestamp = 0
-    with duckdb.connect() as con:
+def process_dataset(aws, bucket, limit=None):
+    ch = get_clickhouse_connection()
         install_and_load_httpfs(con)
         create_secrets(con, aws)
 
@@ -129,8 +135,6 @@ def process_dataset(aws, chcfg, dataset, limit=None):
             if not ok:
                logger.error(f"weird timestamp: {stmp}")
                break
-
-            last_timestamp, stmp = stmp, new_timestamp 
 
             store( 
                 ch,
@@ -185,13 +189,12 @@ if __name__ == "__main__":
 
     logger.info("start processing")
 
+    aws = AwsConfig()
+
     global global_test_mode
     global_test_mode = False
 
-    aws = AwsConfig()
-    ch = parse_args()
-
-    process_dataset(aws, ch, None)
+    process_dataset(aws, bucket, limit=limit)
 
     logger.info("success")
 
