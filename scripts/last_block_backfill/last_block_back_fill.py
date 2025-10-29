@@ -1,3 +1,4 @@
+from argparse import ArgumentParser
 import clickhouse_connect
 from datetime import datetime
 import duckdb
@@ -25,6 +26,30 @@ class AwsConfig:
         self.secret = os.environ['AWS_SECRET_ACCESS_KEY']
         self.endpoint = strip_scheme(os.environ['AWS_ENDPOINT_URL'])
 
+class ChConfig:
+    def __init__(self, host, user, pw, db):
+        self.host = host
+        self.username = user
+        self.password = pw
+        self.database = db
+
+def parse_args():
+    parser = ArgumentParser()
+    parser.add_argument('datasets', help='datasets to process')
+    parser.add_argument('-o', '--host', help='clickhouse host')
+    parser.add_argument('-u', '--user', help='clickhouse username')
+    parser.add_argument('-p', '--password', help='clickhouse password')
+    parser.add_argument('-d', '--database', help='clickhouse database name')
+
+    args = parser.parse_args()
+
+    return args.datasets, ChConfig(
+        args.host,
+        args.user,
+        args.password,
+        args.database,
+    )
+
 def secrets_statement(cfg):
     return f"""create or replace secret (
         type s3,
@@ -49,17 +74,17 @@ def get_row_by_block(con, bucket, parq):
     block = extract_last_from_name(parq)
     return con.sql(f"select hash, timestamp from '{myobject}' where number = {block}").arrow()
 
-def get_clickhouse_connection():
-    # TODO: secrets!
+def get_clickhouse_connection(cfg):
     return clickhouse_connect.get_client(
-        host='localhost', 
-        username='user', 
-        password='password', 
-        database='logs_db',
+        host=cfg.host,
+        username=cfg.username,
+        password=cfg.password,
+        database=cfg.database,
     )
 
-def process_dataset(aws, bucket, limit=None):
-    ch = get_clickhouse_connection()
+def process_dataset(aws, chcfg, bucket, limit=None):
+    logger.info(f"processing dataset {bucket}")
+    ch = get_clickhouse_connection(chcfg)
     rows = get_chunks_from_db(ch, bucket).result_rows
     cnt = 0
     last_timestamp = 0
@@ -134,12 +159,17 @@ if __name__ == "__main__":
 
     logger.info("start processing")
 
-    aws = AwsConfig()
+    bucket = 'solana-mainnet-1'
 
     global global_test_mode
     global_test_mode = False
 
-    process_dataset(aws, bucket, limit=limit)
+    aws = AwsConfig()
+    datasets, ch = parse_args()
+
+    with open(datasets, encoding="utf-8") as f:
+        for bucket in f:
+            process_dataset(aws, ch, bucket.strip())
 
     logger.info("success")
 
