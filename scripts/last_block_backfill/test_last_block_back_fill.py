@@ -8,7 +8,7 @@ import sys
 import timeit
 from urllib.parse import urlparse, ParseResult
 
-from last_block_back_fill import AwsConfig, create_secrets, get_clickhouse_connection, process_dataset
+from last_block_back_fill import AwsConfig, ChConfig, create_secrets, get_clickhouse_connection, process_dataset
 
 def list_chunks(bucket, limit=None):
     s3 = client('s3')
@@ -45,12 +45,12 @@ def check_table(ch):
     for row in result.result_rows:
         logger.debug(row)
 
-def prepare_test_data(aws, bucket, limit=None):
+def prepare_test_data(aws, chcfg, bucket, limit=None):
     if not global_test_mode:
         return
 
     chunks = list_chunks(bucket, limit)
-    ch = get_clickhouse_connection()
+    ch = get_clickhouse_connection(chcfg)
 
     create_table(ch)
 
@@ -100,15 +100,16 @@ if __name__ == "__main__":
     logger.info(f"start processing {bucket}")
 
     aws = AwsConfig()
+    chcfg = ChConfig('localhost', 'user', 'password', 'logs_db')
 
     global global_test_mode
     global_test_mode = True
 
     limit = 10
-    prepare_test_data(aws, bucket, limit=limit)
-    t = timeit.Timer(lambda: process_dataset(aws, bucket, limit=limit))
+    prepare_test_data(aws, chcfg, bucket, limit=limit)
+    t = timeit.Timer(lambda: process_dataset(aws, chcfg, bucket, limit=limit))
     logger.info(f'processing of {limit if limit else "all"} took {t.timeit(1)}s')
-    check_table(get_clickhouse_connection())
+    check_table(get_clickhouse_connection(chcfg))
 
     """
     with duckdb.connect() as con:
