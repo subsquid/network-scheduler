@@ -48,7 +48,7 @@ def check_table(ch):
            assert datetime.fromtimestamp(row[5]/1000).year >= 2009
            
 
-def prepare_test_data(aws, bucket, limit=None):
+def prepare_test_data(aws, chcfg, bucket, limit=None):
     if not global_test_mode:
         return
 
@@ -110,7 +110,7 @@ if __name__ == "__main__":
 
     limit = 10
     prepare_test_data(aws, chcfg, bucket, limit=limit)
-    t = timeit.Timer(lambda: process_dataset(aws, chcfg, f's3://{bucket}', limit=limit))
+    t = timeit.Timer(lambda: process_dataset(aws, chcfg, bucket, limit=limit))
     logger.info(f'processing of {limit if limit else "all"} took {t.timeit(1)}s')
     check_table(get_clickhouse_connection(chcfg))
 
