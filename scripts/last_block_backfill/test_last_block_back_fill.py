@@ -33,7 +33,7 @@ def list_chunks(bucket, limit=None):
     return chunks
 
 def get_all_rows(con, bucket, parq):
-    myobject = f"s3://{bucket}/{parq}"
+    myobject = f"{bucket}/{parq}"
     con.sql(f"select number, hash, timestamp from '{myobject}'").arrow()
 
 def check_table(ch):
@@ -52,6 +52,8 @@ def prepare_test_data(aws, chcfg, bucket, limit=None):
     chunks = list_chunks(bucket, limit)
     ch = get_clickhouse_connection(chcfg)
 
+    dataset = f"s3://{bucket}"
+
     create_table(ch)
 
     cnt = 0
@@ -63,7 +65,7 @@ def prepare_test_data(aws, chcfg, bucket, limit=None):
                 
             ch.insert(
                 'dataset_chunks',
-                [[bucket, chunk, 0, '']],
+                [[dataset, chunk, 0, '']],
                 column_names=['dataset', 'id', 'size', 'files'],
             )
 
@@ -107,7 +109,7 @@ if __name__ == "__main__":
 
     limit = 10
     prepare_test_data(aws, chcfg, bucket, limit=limit)
-    t = timeit.Timer(lambda: process_dataset(aws, chcfg, bucket, limit=limit))
+    t = timeit.Timer(lambda: process_dataset(aws, chcfg, f's3://{bucket}', limit=limit))
     logger.info(f'processing of {limit if limit else "all"} took {t.timeit(1)}s')
     check_table(get_clickhouse_connection(chcfg))
 

@@ -1,0 +1,66 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: last-block-backfill-job
+  namespace: testnet-control-plane
+spec:
+  completions: 9
+  parallelism: 3
+  completionMode: Indexed
+  backoffLimit: 3
+  suspend: false
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: backfill
+          image: subsquid/last_block_backfill:0.1.0
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: JOB_COMPLETION_INDEX
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.annotations['batch.kubernetes.io/job-completion-index']
+
+            - name: SHARD_COUNT
+              value: "9"
+
+            - name: AWS_S3_ENDPOINT
+              value: {{ .Values.s3.endpoint }}
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: secrets
+                  key: s3_access_key_id
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: secrets
+                  key: s3_access_key_secret
+            - name: AWS_REGION
+              valueFrom:
+                secretKeyRef:
+                  name: secrets
+                  key: s3_region
+
+            - name: datasets
+              value: /config/datasets.txt
+
+            - name: CLICKHOUSE_URL
+              value: {{ .Values.clickhouse.url }}
+            - name: CLICKHOUSE_DATABASE
+              value: {{ .Values.clickhouse.database }}
+            - name: CLICKHOUSE_USER
+              value: {{ .Values.clickhouse.user }}
+            - name: CLICKHOUSE_PASSWORD
+              value: {{ .Values.clickhouse.password }}
+
+          command: ["/bin/sh","-lc"]
+          args:
+            - |
+              set -euo pipefail
+              idx="${JOB_COMPLETION_INDEX}"
+              echo "Shard index=$idx"
+
+              python last_block_back_fill.py
+

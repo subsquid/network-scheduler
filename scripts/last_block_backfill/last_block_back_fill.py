@@ -2,6 +2,7 @@ from argparse import ArgumentParser
 import clickhouse_connect
 from datetime import datetime
 import duckdb
+import linecache
 from loguru import logger
 import os
 import sys
@@ -16,6 +17,15 @@ def get_chunks_from_db(ch, dataset):
          order by id
     """)
 
+def get_bucket_to_process(ch):
+    n = int(os.environ['JOB_COMPLETION_INDEX'])
+    return ch.query(f"""
+        select distinct dataset
+          from dataset_chunks
+         order by dataset
+         limit 1 offset {n}
+    """).result_rows[0][0]
+
 def strip_scheme(url):
    parsed_result = urlparse(url)
    return parsed_result.geturl().replace('https://', '', 1)
@@ -28,14 +38,15 @@ class AwsConfig:
 
 class ChConfig:
     def __init__(self, host, user, pw, db):
-        self.host = host
-        self.username = user
-        self.password = pw
-        self.database = db
+        self.host = host if host else os.environ['CLICKHOUSE_URL']
+        self.username = user if user else os.environ['CLICKHOUSE_USER']
+        self.password = pw if pw else os.environ['CLICKHOUSE_PASSWORD']
+        self.database = db if db else os.environ['CLICKHOUSE_DATABASE']
 
 def parse_args():
     parser = ArgumentParser()
-    parser.add_argument('datasets', help='datasets to process')
+    # parser.add_argument('dataset', help='datasets to process')
+    # parser.add_argument('-b', '--bucket', help='bucket to process')
     parser.add_argument('-o', '--host', help='clickhouse host')
     parser.add_argument('-u', '--user', help='clickhouse username')
     parser.add_argument('-p', '--password', help='clickhouse password')
@@ -43,7 +54,7 @@ def parse_args():
 
     args = parser.parse_args()
 
-    return args.datasets, ChConfig(
+    return ChConfig(
         args.host,
         args.user,
         args.password,
@@ -64,13 +75,16 @@ def create_secrets(con, cfg):
     stmt = secrets_statement(cfg)
     con.execute(stmt)
 
+def install_and_load_httpfs(con):
+    con.execute("install httpfs; load httpfs")
+
 def extract_last_from_name(parq):
     s = parq.split('/')
     s = s[1].split('-')
     return int(s[1])
 
 def get_row_by_block(con, bucket, parq):
-    myobject = f"s3://{bucket}/{parq}"
+    myobject = f"{bucket}/{parq}"
     block = extract_last_from_name(parq)
     return con.sql(f"select hash, timestamp from '{myobject}' where number = {block}").arrow()
 
@@ -82,13 +96,16 @@ def get_clickhouse_connection(cfg):
         database=cfg.database,
     )
 
-def process_dataset(aws, chcfg, bucket, limit=None):
-    logger.info(f"processing dataset {bucket}")
+def process_dataset(aws, chcfg, dataset, limit=None):
     ch = get_clickhouse_connection(chcfg)
+    bucket = dataset if dataset else get_bucket_to_process(ch)
+    logger.info(f"processing dataset {bucket}")
+
     rows = get_chunks_from_db(ch, bucket).result_rows
     cnt = 0
     last_timestamp = 0
     with duckdb.connect() as con:
+        install_and_load_httpfs(con)
         create_secrets(con, aws)
 
         for row in rows:
@@ -137,7 +154,7 @@ def check_timestamp(cur_timestamp, last_timestamp):
 
     logger.debug(f"DATETIME: {dt}")
 
-    dt = datetime.fromtimestamp(cur_timestamp/1e3)
+    dt = datetime.fromtimestamp(cur_timestamp/1000)
     if dt.Year >= 2009:
         return True
 
@@ -159,17 +176,13 @@ if __name__ == "__main__":
 
     logger.info("start processing")
 
-    bucket = 'solana-mainnet-1'
-
     global global_test_mode
     global_test_mode = False
 
     aws = AwsConfig()
-    datasets, ch = parse_args()
+    ch = parse_args()
 
-    with open(datasets, encoding="utf-8") as f:
-        for bucket in f:
-            process_dataset(aws, ch, bucket.strip())
+    process_dataset(aws, ch, None)
 
     logger.info("success")
 
