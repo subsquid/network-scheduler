@@ -28,7 +28,7 @@ impl Controller {
             .get_active_workers(
                 self.config.worker_inactive_timeout,
                 self.config.worker_stale_bytes,
-                &self.config.supported_worker_versions,
+                &self.config.min_supported_worker_version,
             )
             .await
             .context("Can't read active workers from ClickHouse")?;

@@ -121,8 +121,14 @@ impl Uploader {
     pub async fn upload_status(&self, workers: Vec<Worker>) -> anyhow::Result<()> {
         let status = SchedulingStatus {
             config: SchedulingStatusConfig {
-                supported_worker_versions: self.config.supported_worker_versions.clone(),
-                recommended_worker_versions: self.config.recommended_worker_versions.clone(),
+                supported_worker_versions: format!(
+                    ">={}",
+                    self.config.min_supported_worker_version
+                ),
+                recommended_worker_versions: format!(
+                    ">={}",
+                    self.config.min_recommended_worker_version
+                ),
             },
             assignment_timestamp_sec: self.time.timestamp() as u64,
             workers,

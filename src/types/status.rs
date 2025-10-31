@@ -1,4 +1,3 @@
-use semver::VersionReq;
 use serde::Serialize;
 
 use super::Worker;
@@ -12,6 +11,6 @@ pub struct SchedulingStatus {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct SchedulingStatusConfig {
-    pub supported_worker_versions: VersionReq,
-    pub recommended_worker_versions: VersionReq,
+    pub supported_worker_versions: String,
+    pub recommended_worker_versions: String,
 }

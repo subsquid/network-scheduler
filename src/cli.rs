@@ -6,7 +6,7 @@ use std::{
 
 use anyhow::ensure;
 use clap::Parser;
-use semver::VersionReq;
+use semver::Version;
 use serde::{Deserialize, Serialize};
 use serde_with::{DurationSeconds, serde_as};
 
@@ -107,11 +107,11 @@ pub struct Config {
     #[serde(skip_serializing)]
     pub cloudflare_storage_secret: String,
 
-    #[serde(default = "default_worker_versions")]
-    pub supported_worker_versions: VersionReq,
+    #[serde(default = "default_min_worker_version")]
+    pub min_supported_worker_version: Version,
 
-    #[serde(default = "default_worker_versions")]
-    pub recommended_worker_versions: VersionReq,
+    #[serde(default = "default_min_worker_version")]
+    pub min_recommended_worker_version: Version,
 
     #[serde_as(as = "DurationSeconds")]
     #[serde(rename = "assignment_delay_sec", default = "default_assignment_delay")]
@@ -182,8 +182,8 @@ fn default_true() -> bool {
     true
 }
 
-fn default_worker_versions() -> VersionReq {
-    ">=2.0.0".parse().unwrap()
+fn default_min_worker_version() -> Version {
+    "2.0.0".parse().unwrap()
 }
 
 fn default_assignment_ttl() -> Duration {

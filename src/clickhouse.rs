@@ -1,9 +1,9 @@
-use std::{collections::BTreeMap, sync::Arc, time::Duration};
+use std::{collections::BTreeMap, str::FromStr, sync::Arc, time::Duration};
 
 use anyhow::Result;
 use clickhouse::{Client, Row};
 use itertools::Itertools;
-use semver::VersionReq;
+use semver::Version;
 use serde::{Deserialize, Serialize};
 use tracing::instrument;
 
@@ -45,7 +45,7 @@ impl ClickhouseClient {
         &self,
         inactive_timeout: Duration,
         stale_threshold: u64,
-        versions: &VersionReq,
+        min_version: &Version,
     ) -> Result<Vec<Worker>> {
         let _timer = crate::metrics::Timer::new("get_active_workers");
 
@@ -80,7 +80,7 @@ impl ClickhouseClient {
             if row.stored_bytes < stale_threshold {
                 status = WorkerStatus::Stale;
             }
-            if !row.version.parse().is_ok_and(|ver| versions.matches(&ver)) {
+            if !Version::from_str(&row.version).is_ok_and(|ver| ver >= *min_version) {
                 status = WorkerStatus::UnsupportedVersion;
             }
             if row.timestamp < inactive_threshold {
@@ -276,5 +276,21 @@ mod test {
         assert!(have[0].summary.is_some());
         let have_tstp = have[0].summary.as_ref().unwrap().last_block_timestamp;
         assert_eq!(have_tstp, tstp.timestamp_millis() as u64);
+    }
+
+    #[test]
+    fn test_semver() {
+        use semver::{Version, VersionReq};
+
+        let a = Version::parse("1.0.0").unwrap();
+        let b = Version::parse("1.0.1-rc1").unwrap();
+        assert!(a < b);
+
+        // Faulty behaviour — that's why we compare versions instead of using VersionReq
+        let req = VersionReq::parse(">=1.0.0").unwrap();
+        assert!(!req.matches(&b));
+        // Even * doesn't match pre-releases
+        let all = VersionReq::parse("*").unwrap();
+        assert!(!all.matches(&b));
     }
 }
