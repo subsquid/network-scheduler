@@ -136,6 +136,8 @@ def process_dataset(aws, chcfg, dataset, limit=None):
                logger.error(f"weird timestamp: {stmp}")
                break
 
+            last_timestamp, stmp = stmp, new_timestamp 
+
             store( 
                 ch,
                 bucket,
