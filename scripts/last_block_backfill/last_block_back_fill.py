@@ -5,6 +5,7 @@ import duckdb
 import linecache
 from loguru import logger
 import os
+import pandas
 import sys
 import timeit
 from urllib.parse import urlparse, ParseResult
@@ -89,14 +90,6 @@ def get_row_by_block(con, bucket, parq):
     block = extract_last_from_name(parq)
     tp = "block_time" if bucket in DATASETS_WITH_BLOCK_TIME else "timestamp"
     return con.sql(f"select hash, {tp} from '{myobject}' where number = {block}").arrow()
-
-def get_clickhouse_connection(cfg):
-    return clickhouse_connect.get_client(
-        host=cfg.host,
-        username=cfg.username,
-        password=cfg.password,
-        database=cfg.database,
-    )
 
 def get_clickhouse_connection(cfg):
     return clickhouse_connect.get_client(
