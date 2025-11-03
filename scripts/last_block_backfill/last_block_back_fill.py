@@ -5,9 +5,12 @@ import duckdb
 import linecache
 from loguru import logger
 import os
+import pandas
 import sys
 import timeit
 from urllib.parse import urlparse, ParseResult
+
+DATASETS_WITH_BLOCK_TIME = set(['s3://hl-explorer-blocks'])
 
 def get_chunks_from_db(ch, dataset):
     return ch.query(f"""
@@ -86,7 +89,8 @@ def extract_last_from_name(parq):
 def get_row_by_block(con, bucket, parq):
     myobject = f"{bucket}/{parq}"
     block = extract_last_from_name(parq)
-    return con.sql(f"select hash, timestamp from '{myobject}' where number = {block}").arrow()
+    tp = "block_time" if bucket in DATASETS_WITH_BLOCK_TIME else "timestamp"
+    return con.sql(f"select hash, {tp} from '{myobject}' where number = {block}").arrow()
 
 def get_clickhouse_connection(cfg):
     return clickhouse_connect.get_client(
@@ -149,6 +153,9 @@ def check_and_adapt_timestamp(cur_timestamp, last_timestamp):
     if cur_timestamp < last_timestamp:
         logger.error(f"DATETIME: {cur_timestamp} < {last_timestamp}")
         return False, None
+
+    if isinstance(cur_timestamp, pandas.Timestamp):
+        return True, cur_timestamp
 
     dt = datetime.fromtimestamp(cur_timestamp/1000)
     if dt.year >= 2009:
