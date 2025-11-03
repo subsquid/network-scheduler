@@ -61,7 +61,7 @@ fn read_blocks(
                     slot = Some(n as u64);
                 }
                 (name, Field::Long(n)) if name == "timestamp" => {
-                    timestamp = Some(n as u64);
+                    timestamp = Some(n as u64 * 1000);
                 }
                 (name, Field::TimestampMillis(n)) if name == "timestamp" => {
                     timestamp = Some(n as u64);

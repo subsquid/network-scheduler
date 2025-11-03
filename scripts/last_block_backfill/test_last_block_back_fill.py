@@ -44,6 +44,9 @@ def check_table(ch):
     result = ch.query("select * from dataset_chunks")
     for row in result.result_rows:
         logger.debug(row)
+        if row[5] > 0:
+           assert datetime.fromtimestamp(row[5]/1000).year >= 2009
+           
 
 def prepare_test_data(aws, chcfg, bucket, limit=None):
     if not global_test_mode:

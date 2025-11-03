@@ -120,11 +120,13 @@ def process_dataset(aws, chcfg, dataset, limit=None):
             hash = p.iat[0, 0]
             stmp = p.iat[0, 1]
 
-            if not check_timestamp(stmp, last_timestamp):
+            ok, new_timestamp = check_and_adapt_timestamp(stmp, last_timestamp)
+
+            if not ok:
                logger.error(f"weird timestamp: {stmp}")
                break
 
-            last_timestamp = stmp 
+            last_timestamp, stmp = stmp, new_timestamp 
 
             store( 
                 ch,
@@ -143,24 +145,24 @@ def process_dataset(aws, chcfg, dataset, limit=None):
     logger.info(f"processed {cnt} chunks")
     ch.close()
 
-def check_timestamp(cur_timestamp, last_timestamp):
+def check_and_adapt_timestamp(cur_timestamp, last_timestamp):
     if cur_timestamp < last_timestamp:
         logger.error(f"DATETIME: {cur_timestamp} < {last_timestamp}")
-        return False
-
-    dt = datetime.fromtimestamp(cur_timestamp)
-    if dt.year >= 2009:
-        return True
-
-    logger.debug(f"DATETIME: {dt}")
+        return False, None
 
     dt = datetime.fromtimestamp(cur_timestamp/1000)
-    if dt.Year >= 2009:
-        return True
+    if dt.year >= 2009:
+        return True, cur_timestamp
+
+    new_timestamp = cur_timestamp * 1000
+
+    dt = datetime.fromtimestamp(new_timestamp/1000)
+    if dt.year >= 2009:
+        return True, new_timestamp
 
     logger.error(f"DATETIME: {dt}")
     
-    return False
+    return False, None
 
 def store(ch, bucket, chunk, hash, timestamp):
     ch.command(f"""alter table dataset_chunks
@@ -185,5 +187,4 @@ if __name__ == "__main__":
     process_dataset(aws, ch, None)
 
     logger.info("success")
-
 
