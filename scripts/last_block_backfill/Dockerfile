@@ -12,13 +12,13 @@ RUN apt-get update && \
     rm -rf /var/lib/apt/lists/*
 
 # Copy requirements.txt first for caching
-COPY requirements.txt .
+COPY ./scripts/last_block_backfill/requirements.txt .
 
 # Install Python dependencies
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy the rest of your codebase into the container
-COPY last_block_back_fill.py .
+COPY ./scripts/last_block_backfill/last_block_back_fill.py .
 
 # Default command: run your Python script
 CMD ["python", "-u", "last_block_back_fill.py"]
