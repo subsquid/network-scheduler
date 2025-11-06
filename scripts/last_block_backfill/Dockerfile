@@ -1,6 +1,6 @@
 FROM python:3.11-slim
 
-RUN apt-get update && apt-get install -y --no-install-recommends curl && \
+RUN apt-get update && apt-get install -y cargo rustc curl && \
     curl -LsSf https://astral.sh/uv/install.sh | sh && \
     rm -rf /var/lib/apt/lists/*
 ENV PATH="/root/.local/bin:${PATH}"
