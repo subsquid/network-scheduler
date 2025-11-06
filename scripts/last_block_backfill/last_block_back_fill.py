@@ -171,11 +171,22 @@ def check_and_adapt_timestamp(cur_timestamp, last_timestamp):
     return False, None
 
 def store(ch, bucket, chunk, hash, timestamp):
-    ch.command(f"""alter table dataset_chunks
+    if test_mode_on(): 
+        first_line = "alter table dataset_chunks"
+    else:
+        first_line = "alter table dataset_chunks_local on cluster default"
+    ch.command(f"""{first_line}
                    update last_block_hash = '{hash}',
                           last_block_timestamp = {timestamp}
                     where id = '{chunk}'
                       and dataset = '{bucket}'""")
+
+def set_test_mode(t):
+    global global_test_mode
+    global_test_mode = t
+
+def test_mode_on():
+    return global_test_mode
 
 if __name__ == "__main__":
 
@@ -184,8 +195,7 @@ if __name__ == "__main__":
 
     logger.info("start processing")
 
-    global global_test_mode
-    global_test_mode = False
+    set_test_mode(False)
 
     aws = AwsConfig()
     ch = parse_args()
