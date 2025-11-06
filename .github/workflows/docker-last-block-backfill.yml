@@ -10,6 +10,7 @@ jobs:
     name: Build and publish docker image for one-time last_block_back_fill script
     uses: ./.github/workflows/docker-reusable.yml
     with:
+      dockerfile_path: "./scripts/last_block_backfill/Dockerfile"
       image_name: subsquid/last-block-backfill.yml
       push_latest: true
     secrets:
