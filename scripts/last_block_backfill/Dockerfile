@@ -3,10 +3,10 @@ FROM python:3.11-slim
 RUN apt-get update && apt-get install -y protobuf-compiler build-essential clang make cmake curl && \
     curl -LsSf https://astral.sh/uv/install.sh | sh && \
     rm -rf /var/lib/apt/lists/*
-ENV PATH="/root/.local/bin:${PATH}"
 
-# RUN curl -y --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 RUN curl -y -sSf https://sh.rustup.rs | sh
+
+ENV PATH="/root/.local/bin:/root/.cargo/bin:${PATH}"
 
 WORKDIR /app
 
