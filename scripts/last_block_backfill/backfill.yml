@@ -14,7 +14,7 @@ spec:
       restartPolicy: OnFailure
       containers:
         - name: backfill
-          image: subsquid/last_block_backfill:0.1.0
+          image: subsquid/last_block_backfill:latest
           imagePullPolicy: IfNotPresent
           env:
             - name: JOB_COMPLETION_INDEX

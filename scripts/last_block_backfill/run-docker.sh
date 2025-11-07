@@ -9,5 +9,5 @@ docker run --rm --net=host \
     -e CLICKHOUSE_PASSWORD=$CLICKHOUSE_PASSWORD \
     -e CLICKHOUSE_DATABASE=$CLICKHOUSE_DATABASE \
     -e JOB_COMPLETION_INDEX=0 \
-last-block-backfill
+subsquid/last-block-backfill:latest
 
