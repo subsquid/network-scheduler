@@ -1,6 +1,6 @@
 FROM python:3.11-slim
 
-RUN apt-get update && apt-get install -y zlib1g \
+RUN apt-get update && apt-get install -y zlib1g  libgcc-s1 libstdc++6 \
       ca-certificates protobuf-compiler build-essential clang make cmake curl && \
     curl -LsSf https://astral.sh/uv/install.sh | sh && \
     curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable && \
@@ -8,6 +8,9 @@ RUN apt-get update && apt-get install -y zlib1g \
 
 ENV PATH="/root/.local/bin:/root/.cargo/bin:${PATH}"
 
+RUN dpkg -s zlib1g libgcc-s1 libstdc++6 | grep -E '^Package|^Status|^Version' || true
+RUN ls -l /lib/x86_64-linux-gnu/libz.so.1 || true
+RUN ldd /root/.rustup/toolchains/stable-*/bin/rustc || true
 RUN which cargo && cargo --version && rustc --version
 
 WORKDIR /app
