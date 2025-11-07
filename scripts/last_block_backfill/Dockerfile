@@ -1,26 +1,31 @@
+FROM rust:1-slim-bookworm AS builder
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      python3 python3-pip python3-venv python3-dev build-essential pkg-config \
+      ca-certificates curl protobuf-compiler \
+  && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /w
+COPY scripts/last_block_backfill/requirements.txt .
+
+RUN python3 -m venv /w/venv
+ENV PATH="/w/venv/bin:${PATH}"
+
+RUN python3 -m pip install -U pip wheel \
+ && pip wheel --wheel-dir /wheels --prefer-binary -r requirements.txt
+
 FROM python:3.11-slim
 
-RUN apt-get update && apt-get install -y zlib1g  libgcc-s1 libstdc++6 \
-      ca-certificates protobuf-compiler build-essential clang make cmake curl && \
-    curl -LsSf https://astral.sh/uv/install.sh | sh && \
-    curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable && \
-    rm -rf /var/lib/apt/lists/*
-
-ENV PATH="/root/.local/bin:/root/.cargo/bin:${PATH}"
-
-RUN dpkg -s zlib1g libgcc-s1 libstdc++6 | grep -E '^Package|^Status|^Version' || true
-RUN ls -l /lib/x86_64-linux-gnu/libz.so.1 || true
-RUN ldd /root/.rustup/toolchains/stable-*/bin/rustc || true
-RUN which cargo && cargo --version && rustc --version
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      ca-certificates zlib1g \
+  && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
-COPY ./scripts/last_block_backfill/requirements.txt .
+COPY --from=builder /wheels /wheels
+COPY scripts/last_block_backfill/requirements.txt .
+RUN pip install --no-cache-dir --no-index --find-links=/wheels -r requirements.txt
 
-RUN uv pip compile requirements.txt -o uv.lock
+COPY scripts/last_block_backfill/last_block_back_fill.py .
 
-RUN uv pip sync --system uv.lock
-
-COPY ./scripts/last_block_backfill/last_block_back_fill.py .
 CMD ["python", "-u", "last_block_back_fill.py"]
 
