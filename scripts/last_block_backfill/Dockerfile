@@ -2,10 +2,12 @@ FROM python:3.11-slim
 
 RUN apt-get update && apt-get install -y protobuf-compiler build-essential clang make cmake curl && \
     curl -LsSf https://astral.sh/uv/install.sh | sh && \
-    curl -y -sSf https://sh.rustup.rs | sh && \
+    curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable && \
     rm -rf /var/lib/apt/lists/*
 
 ENV PATH="/root/.local/bin:/root/.cargo/bin:${PATH}"
+
+RUN which cargo && cargo --version && rustc --version
 
 WORKDIR /app
 
