@@ -1,4 +1,4 @@
-docker run --net=host \
+docker run --rm --net=host \
     -e AWS_ACCESS_KEY_ID=$AWS_ACCESS_KEY \
     -e AWS_SECRET_ACCESS_KEY=$AWS_SECRET_ACCESS_KEY \
     -e AWS_ENDPOINT_URL=$AWS_ENDPOINT_URL \
