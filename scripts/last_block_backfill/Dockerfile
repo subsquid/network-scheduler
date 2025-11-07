@@ -1,6 +1,7 @@
 FROM python:3.11-slim
 
-RUN apt-get update && apt-get install -y protobuf-compiler build-essential clang make cmake curl && \
+RUN apt-get update && apt-get install -y zlib1g \
+      ca-certificates protobuf-compiler build-essential clang make cmake curl && \
     curl -LsSf https://astral.sh/uv/install.sh | sh && \
     curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable && \
     rm -rf /var/lib/apt/lists/*
