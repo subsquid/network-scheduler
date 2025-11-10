@@ -47,8 +47,7 @@ class ChConfig:
         self.database = db if db else os.environ['CLICKHOUSE_DATABASE']
 
 def parse_args():
-    parser.add_argument('datasets', help='datasets to process')
-    return args.datasets, ChConfig(None, None, None, None)
+    parser = ArgumentParser()
     parser.add_argument('-o', '--host', help='clickhouse host')
     parser.add_argument('-u', '--user', help='clickhouse username')
     parser.add_argument('-p', '--password', help='clickhouse password')
@@ -149,7 +148,7 @@ def process_dataset(aws, chcfg, dataset, limit=None):
     ch.close()
 
 def check_and_adapt_timestamp(cur_timestamp, last_timestamp):
-    if cur_timestamp < last_timestamp:
+    if last_timestamp == 0 or cur_timestamp < last_timestamp:
         logger.error(f"DATETIME: {cur_timestamp} < {last_timestamp}")
         return False, None
 
