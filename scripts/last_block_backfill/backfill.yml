@@ -15,7 +15,7 @@ spec:
       restartPolicy: Never
       containers:
         - name: backfill
-          image: subsquid/last-block-backfill:latest
+          image: subsquid/last-block-backfill:0.2.0
           imagePullPolicy: Always
           env:
             - name: JOB_COMPLETION_INDEX

@@ -153,7 +153,7 @@ def check_and_adapt_timestamp(cur_timestamp, last_timestamp):
         return False, None
 
     if isinstance(cur_timestamp, pandas.Timestamp):
-        return True, cur_timestamp
+        return True, cur_timestamp.value // (10**6)
 
     dt = datetime.fromtimestamp(cur_timestamp/1000)
     if dt.year >= 2009:
@@ -174,11 +174,13 @@ def store(ch, bucket, chunk, hash, timestamp):
         first_line = "alter table dataset_chunks"
     else:
         first_line = "alter table dataset_chunks_local on cluster default"
-    ch.command(f"""{first_line}
-                   update last_block_hash = '{hash}',
-                          last_block_timestamp = {timestamp}
-                    where id = '{chunk}'
-                      and dataset = '{bucket}'""")
+    cmd = f"""{first_line}
+              update last_block_hash = '{hash}',
+                     last_block_timestamp = {timestamp}
+               where id = '{chunk}'
+                 and dataset = '{bucket}'"""
+    logger.debug(cmd)
+    ch.command(cmd)
 
 def set_test_mode(t):
     global global_test_mode
