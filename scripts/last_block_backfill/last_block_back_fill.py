@@ -148,7 +148,7 @@ def process_dataset(aws, chcfg, dataset, limit=None):
     ch.close()
 
 def check_and_adapt_timestamp(cur_timestamp, last_timestamp):
-    if last_timestamp == 0 or cur_timestamp < last_timestamp:
+    if last_timestamp != 0 and cur_timestamp < last_timestamp:
         logger.error(f"DATETIME: {cur_timestamp} < {last_timestamp}")
         return False, None
 
