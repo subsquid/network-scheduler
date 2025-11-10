@@ -1,6 +1,9 @@
 name: last block backfill docker
 
-on: workflow_dispatch
+on:
+  push:
+    branches: [ last-block-backfill ]
+  workflow_dispatch
 
 jobs:
   docker:
