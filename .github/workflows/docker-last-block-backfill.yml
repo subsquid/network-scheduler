@@ -11,7 +11,8 @@ jobs:
     with:
       dockerfile_path: "./scripts/last_block_backfill/Dockerfile"
       platforms: linux/amd64
-      image_name: subsquid/last-block-backfill:0.1.0
+      image_name: subsquid/last-block-backfill
+      tags: subsquid/last-block-backfill:0.1.0
       push_latest: true
     secrets:
       DOCKER_LOGIN: ${{ secrets.DOCKER_LOGIN }}
