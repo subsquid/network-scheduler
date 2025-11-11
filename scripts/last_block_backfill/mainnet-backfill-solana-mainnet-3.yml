@@ -1,7 +1,7 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: last-block-backfill-job
+  name: last-block-backfill-mainnet-solana-3
   namespace: secure-mainnet-control-plane
 spec:
   completions: 32
