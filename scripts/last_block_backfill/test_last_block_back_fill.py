@@ -109,7 +109,7 @@ if __name__ == "__main__":
 
     set_test_mode(True)
 
-    limit = 10
+    limit = 100
     prepare_test_data(aws, chcfg, bucket, limit=limit)
     t = timeit.Timer(lambda: process_dataset(aws, chcfg, f's3://{bucket}', limit=limit))
     logger.info(f'processing of {limit if limit else "all"} took {t.timeit(1)}s')
