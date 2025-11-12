@@ -155,7 +155,7 @@ def process_dataset(aws, chcfg, dataset, limit=None):
 
     logger.info(f"processing dataset {bucket}")
 
-    upd = Upd(dataset, 20) # 100
+    upd = Upd(dataset, 100)
 
     rows = get_dedicated_chunks_from_db(ch, bucket).result_rows if dataset else get_chunks_from_db(ch, bucket).result_rows
 

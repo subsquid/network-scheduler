@@ -1,10 +1,10 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: last-block-backfill-job
-  namespace: testnet-control-plane
+  name: last-block-backfill-mainnet-eclipse
+  namespace: secure-mainnet-control-plane
 spec:
-  completions: 9
+  completions: 5
   parallelism: 3
   completionMode: Indexed
   ttlSecondsAfterFinished: 1800
@@ -15,7 +15,7 @@ spec:
       restartPolicy: Never
       containers:
         - name: backfill
-          image: subsquid/last-block-backfill:0.2.0
+          image: subsquid/last-block-backfill:0.4.0
           imagePullPolicy: Always
           env:
             - name: JOB_COMPLETION_INDEX
@@ -24,7 +24,7 @@ spec:
                   fieldPath: metadata.annotations['batch.kubernetes.io/job-completion-index']
 
             - name: SHARD_COUNT
-              value: "9"
+              value: "5"
 
             - name: AWS_ENDPOINT_URL
               valueFrom:
@@ -75,6 +75,6 @@ spec:
               idx="${JOB_COMPLETION_INDEX}"
               echo "Shard index=$idx"
 
-              python last_block_back_fill.py \
+              python last_block_back_fill.py -d 's3://eclipse-mainnet' \
               || { echo "Script failed; sleeping for debug"; sleep 900; exit 1; }
 
