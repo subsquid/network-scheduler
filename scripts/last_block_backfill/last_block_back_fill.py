@@ -203,21 +203,26 @@ def process_dataset(aws, chcfg, dataset, limit=None):
     ch.close()
 
 def check_and_adapt_timestamp(cur_timestamp, last_timestamp):
+    """
     if last_timestamp != 0 and cur_timestamp < last_timestamp:
         logger.error(f"DATETIME: {cur_timestamp} < {last_timestamp}")
         return False, None
+    """
 
     if isinstance(cur_timestamp, pandas.Timestamp):
         return True, cur_timestamp.value // (10**6)
 
+    if cur_timestamp == 0:
+        return True, cur_timestamp
+
     dt = datetime.fromtimestamp(cur_timestamp/1000)
-    if dt.year >= 2009:
+    if dt.year >= 2009 and dt.year < 2026:
         return True, cur_timestamp
 
     new_timestamp = cur_timestamp * 1000
 
     dt = datetime.fromtimestamp(new_timestamp/1000)
-    if dt.year >= 2009:
+    if dt.year >= 2009 and dt.year < 2026:
         return True, new_timestamp
 
     logger.error(f"DATETIME: {dt}")

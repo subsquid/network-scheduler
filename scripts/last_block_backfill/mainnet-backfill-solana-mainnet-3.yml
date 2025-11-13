@@ -8,11 +8,11 @@ spec:
   parallelism: 10
   completionMode: Indexed
   ttlSecondsAfterFinished: 1800
-  backoffLimit: 0
+  backoffLimit: 3
   suspend: false
   template:
     spec:
-      restartPolicy: Never
+      restartPolicy: OnFailure
       containers:
         - name: backfill
           image: subsquid/last-block-backfill:0.3.0

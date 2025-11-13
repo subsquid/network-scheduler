@@ -8,14 +8,14 @@ spec:
   parallelism: 4
   completionMode: Indexed
   ttlSecondsAfterFinished: 1800
-  backoffLimit: 0
+  backoffLimit: 3
   suspend: false
   template:
     spec:
-      restartPolicy: Never
+      restartPolicy: Always
       containers:
         - name: backfill
-          image: subsquid/last-block-backfill:0.4.0
+          image: subsquid/last-block-backfill:0.5.0
           imagePullPolicy: Always
           env:
             - name: JOB_COMPLETION_INDEX
