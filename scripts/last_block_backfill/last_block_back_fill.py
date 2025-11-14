@@ -30,12 +30,12 @@ def get_dedicated_chunks_from_db(ch, dataset):
          limit 100000 offset {n*100000} 
     """)
 
-def get_bucket_to_process(ch):
+def get_bucket_to_process(ch, ignore_datasets):
     n = int(os.environ['JOB_COMPLETION_INDEX'])
     return ch.query(f"""
         select distinct dataset
           from dataset_chunks
-         where dataset not in ('s3://solana-mainnet-3', 's3://solana-mainnet-2', 's3://eclipse-mainnet')
+         where dataset not in ({ignore_datasets})
          order by dataset
          limit 1 offset {n}
     """).result_rows[0][0]
@@ -151,7 +151,14 @@ class Upd:
 def process_dataset(aws, chcfg, dataset, limit=None):
     ch = get_clickhouse_connection(chcfg)
 
-    bucket = dataset if dataset else get_bucket_to_process(ch)
+   
+    if 'IGNORE_DATASETS' in os.environ:
+        ignore_datasets = os.environ['IGNORE_DATASETS']
+        logger.debug(f"ignoring {ignore_datasets}")
+    else:
+        ignore_datasets = "'does-not-exist'"
+
+    bucket = dataset if dataset else get_bucket_to_process(ch, ignore_datasets)
 
     logger.info(f"processing dataset {bucket}")
 
