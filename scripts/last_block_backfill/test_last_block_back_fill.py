@@ -8,7 +8,7 @@ import sys
 import timeit
 from urllib.parse import urlparse, ParseResult
 
-from last_block_back_fill import AwsConfig, ChConfig, create_secrets, get_clickhouse_connection, process_dataset
+from last_block_back_fill import AwsConfig, ChConfig, create_secrets, get_clickhouse_connection, process_dataset, set_test_mode, test_mode_on
 
 def list_chunks(bucket, limit=None):
     s3 = client('s3')
@@ -37,7 +37,7 @@ def get_all_rows(con, bucket, parq):
     con.sql(f"select number, hash, timestamp from '{myobject}'").arrow()
 
 def check_table(ch):
-    if not global_test_mode:
+    if not test_mode_on():
         return
 
     logger.debug("HAVE:")
@@ -49,7 +49,7 @@ def check_table(ch):
            
 
 def prepare_test_data(aws, chcfg, bucket, limit=None):
-    if not global_test_mode:
+    if not test_mode_on():
         return
 
     chunks = list_chunks(bucket, limit)
@@ -107,12 +107,12 @@ if __name__ == "__main__":
     aws = AwsConfig()
     chcfg = ChConfig('localhost', 'user', 'password', 'logs_db')
 
-    global global_test_mode
-    global_test_mode = True
+    set_test_mode(True)
 
-    limit = 10
+    limit = 100
     prepare_test_data(aws, chcfg, bucket, limit=limit)
-    t = timeit.Timer(lambda: process_dataset(aws, chcfg, f's3://{bucket}', limit=limit))
+    # t = timeit.Timer(lambda: process_dataset(aws, chcfg, f's3://{bucket}', limit=limit))
+    t = timeit.Timer(lambda: process_dataset(aws, chcfg, None, limit=limit))
     logger.info(f'processing of {limit if limit else "all"} took {t.timeit(1)}s')
     check_table(get_clickhouse_connection(chcfg))
 

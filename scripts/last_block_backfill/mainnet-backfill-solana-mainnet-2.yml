@@ -1,21 +1,21 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: last-block-backfill-job
-  namespace: testnet-control-plane
+  name: last-block-backfill-mainnet-solana-2
+  namespace: secure-mainnet-control-plane
 spec:
   completions: 9
-  parallelism: 3
+  parallelism: 4
   completionMode: Indexed
   ttlSecondsAfterFinished: 1800
-  backoffLimit: 0
+  backoffLimit: 3
   suspend: false
   template:
     spec:
-      restartPolicy: Never
+      restartPolicy: Always
       containers:
         - name: backfill
-          image: subsquid/last-block-backfill:0.2.0
+          image: subsquid/last-block-backfill:0.5.1
           imagePullPolicy: Always
           env:
             - name: JOB_COMPLETION_INDEX
@@ -75,6 +75,6 @@ spec:
               idx="${JOB_COMPLETION_INDEX}"
               echo "Shard index=$idx"
 
-              python last_block_back_fill.py \
+              python last_block_back_fill.py -d 's3://solana-mainnet-2' \
               || { echo "Script failed; sleeping for debug"; sleep 900; exit 1; }
 

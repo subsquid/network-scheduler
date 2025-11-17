@@ -1,0 +1,18 @@
+name: last block backfill docker
+
+on:
+  push:
+    branches: [ last-block-backfill ]
+
+jobs:
+  docker:
+    name: Build and publish docker image for one-time last_block_back_fill script
+    uses: ./.github/workflows/docker-reusable.yml
+    with:
+      dockerfile_path: "./scripts/last_block_backfill/Dockerfile"
+      platforms: linux/amd64
+      image_name: subsquid/last-block-backfill
+      push_latest: true
+    secrets:
+      DOCKER_LOGIN: ${{ secrets.DOCKER_LOGIN }}
+      DOCKER_TOKEN: ${{ secrets.DOCKER_TOKEN }}

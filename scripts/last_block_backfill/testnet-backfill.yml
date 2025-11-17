@@ -4,8 +4,8 @@ metadata:
   name: last-block-backfill-job
   namespace: testnet-control-plane
 spec:
-  completions: 9
-  parallelism: 3
+  completions: 1
+  parallelism: 1
   completionMode: Indexed
   ttlSecondsAfterFinished: 1800
   backoffLimit: 0
@@ -15,7 +15,7 @@ spec:
       restartPolicy: Never
       containers:
         - name: backfill
-          image: subsquid/last-block-backfill:0.2.0
+          image: subsquid/last-block-backfill:0.3.0
           imagePullPolicy: Always
           env:
             - name: JOB_COMPLETION_INDEX
@@ -75,6 +75,6 @@ spec:
               idx="${JOB_COMPLETION_INDEX}"
               echo "Shard index=$idx"
 
-              python last_block_back_fill.py \
+              python last_block_back_fill.py -d 's3://hl-explorer-blocks' \
               || { echo "Script failed; sleeping for debug"; sleep 900; exit 1; }
 

@@ -20,11 +20,22 @@ def get_chunks_from_db(ch, dataset):
          order by id
     """)
 
-def get_bucket_to_process(ch):
+def get_dedicated_chunks_from_db(ch, dataset):
+    n = int(os.environ['JOB_COMPLETION_INDEX'])
+    return ch.query(f"""
+        select id from dataset_chunks
+         where dataset = '{dataset}'
+           and (last_block_hash is NULL or last_block_timestamp = 0)
+         order by id
+         limit 100000 offset {n*100000} 
+    """)
+
+def get_bucket_to_process(ch, ignore_datasets):
     n = int(os.environ['JOB_COMPLETION_INDEX'])
     return ch.query(f"""
         select distinct dataset
           from dataset_chunks
+         where dataset not in ({ignore_datasets})
          order by dataset
          limit 1 offset {n}
     """).result_rows[0][0]
@@ -48,21 +59,12 @@ class ChConfig:
 
 def parse_args():
     parser = ArgumentParser()
-    # parser.add_argument('dataset', help='datasets to process')
-    # parser.add_argument('-b', '--bucket', help='bucket to process')
-    parser.add_argument('-o', '--host', help='clickhouse host')
-    parser.add_argument('-u', '--user', help='clickhouse username')
-    parser.add_argument('-p', '--password', help='clickhouse password')
-    parser.add_argument('-d', '--database', help='clickhouse database name')
+    parser.add_argument('-d', '--dataset', help='dedicated to one dataset')
+    parser.add_argument('-t', '--test', action='store_true', help='dedicated to one dataset')
 
     args = parser.parse_args()
 
-    return ChConfig(
-        args.host,
-        args.user,
-        args.password,
-        args.database,
-    )
+    return args
 
 def secrets_statement(cfg):
     return f"""create or replace secret (
@@ -100,12 +102,70 @@ def get_clickhouse_connection(cfg):
         database=cfg.database,
     )
 
+class Upd:
+    def __init__(self, bucket, group):
+        self.cnt = 0
+        self.group = group
+        self.bucket = bucket
+        self.hash_col = ''
+        self.tmst_col = ''
+        self.keys = ''
+
+    def add(self, key, hash, stmp):
+        finalized = None
+        if self.cnt == 0 or self.cnt == self.group:
+            if self.cnt == self.group:
+               finalized = self.finish()
+        
+            self.hash_col = f"last_block_hash = multiIf(id = '{key}', '{hash}'"
+            self.tmst_col = f"last_block_timestamp = multiIf(id = '{key}', {stmp}"
+            self.keys = f"'{key}'"
+            self.cnt = 1
+        else:
+            self.hash_col += f", id = '{key}', '{hash}'"
+            self.tmst_col += f", id = '{key}', {stmp}"
+            self.keys += f", '{key}'"
+            self.cnt += 1
+
+        return finalized
+    
+    def finish(self):
+        if self.cnt == 0:
+            return ''
+
+        self.hash_col += ', last_block_hash)'
+        self.tmst_col += ', last_block_timestamp)'
+
+        if test_mode_on(): 
+            first_line = "alter table dataset_chunks"
+        else:
+            first_line = "alter table dataset_chunks_local on cluster default"
+
+        return f"""{first_line}
+            update {self.hash_col},
+                   {self.tmst_col}
+             where dataset = '{self.bucket}'
+               and id in ({self.keys})
+        """
+
 def process_dataset(aws, chcfg, dataset, limit=None):
     ch = get_clickhouse_connection(chcfg)
-    bucket = dataset if dataset else get_bucket_to_process(ch)
+
+   
+    if 'IGNORE_DATASETS' in os.environ:
+        ignore_datasets = os.environ['IGNORE_DATASETS']
+        logger.debug(f"ignoring {ignore_datasets}")
+    else:
+        ignore_datasets = "'does-not-exist'"
+
+    bucket = dataset if dataset else get_bucket_to_process(ch, ignore_datasets)
+
     logger.info(f"processing dataset {bucket}")
 
-    rows = get_chunks_from_db(ch, bucket).result_rows
+    upd = Upd(bucket, 100)
+
+    rows = get_dedicated_chunks_from_db(ch, bucket).result_rows if dataset else get_chunks_from_db(ch, bucket).result_rows
+
     cnt = 0
     last_timestamp = 0
     with duckdb.connect() as con:
@@ -132,13 +192,9 @@ def process_dataset(aws, chcfg, dataset, limit=None):
 
             last_timestamp, stmp = stmp, new_timestamp 
 
-            store( 
-                ch,
-                bucket,
-                chunk,
-                hash,
-                stmp,
-            )
+            update = upd.add(chunk, hash, stmp)
+            if update:
+               ch.command(update)
 
             cnt += 1
             if limit:
@@ -146,52 +202,62 @@ def process_dataset(aws, chcfg, dataset, limit=None):
                     logger.debug(f"limit ({limit}) reached")
                     break
 
+    update = upd.finish()
+    if update:
+        ch.command(update)
+
     logger.info(f"processed {cnt} chunks")
     ch.close()
 
 def check_and_adapt_timestamp(cur_timestamp, last_timestamp):
-    if cur_timestamp < last_timestamp:
+    """
+    if last_timestamp != 0 and cur_timestamp < last_timestamp:
         logger.error(f"DATETIME: {cur_timestamp} < {last_timestamp}")
         return False, None
+    """
 
     if isinstance(cur_timestamp, pandas.Timestamp):
+        return True, cur_timestamp.value // (10**6)
+
+    if cur_timestamp == 0:
         return True, cur_timestamp
 
     dt = datetime.fromtimestamp(cur_timestamp/1000)
-    if dt.year >= 2009:
+    if dt.year >= 2009 and dt.year < 2026:
         return True, cur_timestamp
 
     new_timestamp = cur_timestamp * 1000
 
     dt = datetime.fromtimestamp(new_timestamp/1000)
-    if dt.year >= 2009:
+    if dt.year >= 2009 and dt.year < 2026:
         return True, new_timestamp
 
     logger.error(f"DATETIME: {dt}")
     
     return False, None
 
-def store(ch, bucket, chunk, hash, timestamp):
-    ch.command(f"""alter table dataset_chunks
-                   update last_block_hash = '{hash}',
-                          last_block_timestamp = {timestamp}
-                    where id = '{chunk}'
-                      and dataset = '{bucket}'""")
+def set_test_mode(t):
+    global global_test_mode
+    global_test_mode = t
+
+def test_mode_on():
+    return global_test_mode
 
 if __name__ == "__main__":
 
     logger.remove()
     logger.add(sys.stdout, colorize=False)
 
-    logger.info("start processing")
-
-    global global_test_mode
-    global_test_mode = False
+    args = parse_args()
 
     aws = AwsConfig()
-    ch = parse_args()
+    ch = ChConfig(None, None, None, None)
 
-    process_dataset(aws, ch, None)
+    set_test_mode(args.test)
+
+    logger.info("start processing")
+
+    process_dataset(aws, ch, args.dataset)
 
     logger.info("success")
 
