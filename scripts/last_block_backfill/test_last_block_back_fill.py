@@ -111,7 +111,8 @@ if __name__ == "__main__":
 
     limit = 100
     prepare_test_data(aws, chcfg, bucket, limit=limit)
-    t = timeit.Timer(lambda: process_dataset(aws, chcfg, f's3://{bucket}', limit=limit))
+    # t = timeit.Timer(lambda: process_dataset(aws, chcfg, f's3://{bucket}', limit=limit))
+    t = timeit.Timer(lambda: process_dataset(aws, chcfg, None, limit=limit))
     logger.info(f'processing of {limit if limit else "all"} took {t.timeit(1)}s')
     check_table(get_clickhouse_connection(chcfg))
 

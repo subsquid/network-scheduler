@@ -4,8 +4,8 @@ metadata:
   name: last-block-backfill-mainnet-solana-3
   namespace: secure-mainnet-control-plane
 spec:
-  completions: 32
-  parallelism: 10
+  completions: 5
+  parallelism: 5
   completionMode: Indexed
   ttlSecondsAfterFinished: 1800
   backoffLimit: 3
@@ -15,7 +15,7 @@ spec:
       restartPolicy: OnFailure
       containers:
         - name: backfill
-          image: subsquid/last-block-backfill:0.3.0
+          image: subsquid/last-block-backfill:0.5.1
           imagePullPolicy: Always
           env:
             - name: JOB_COMPLETION_INDEX
@@ -24,7 +24,7 @@ spec:
                   fieldPath: metadata.annotations['batch.kubernetes.io/job-completion-index']
 
             - name: SHARD_COUNT
-              value: "32"
+              value: "5"
 
             - name: AWS_ENDPOINT_URL
               valueFrom:
