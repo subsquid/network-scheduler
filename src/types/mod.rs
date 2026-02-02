@@ -7,7 +7,7 @@ mod worker;
 pub type WorkerIndex = u16;
 pub type ChunkIndex = u32;
 pub type ChunkWeight = u16;
-
+pub type ReplicationFactor = u16;
 pub type BlockNumber = u64;
 
 pub use assignment::{Assignment, FbVersion};

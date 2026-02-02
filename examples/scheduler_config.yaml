@@ -1,0 +1,19 @@
+ignore_reliability: true
+min_replication: 2
+saturation: 0.99
+network: tethys
+storage_domain: fake-sqd-datasets.io
+network_state_name: network-state-tethys.json
+network_state_url: "https://fake-metadata.sqd-datasets.io"
+scheduler_state_bucket: network-scheduler-state
+min_supported_worker_version: "2.6.0-rc1"
+min_recommended_worker_version: "2.6.0"
+cloudflare_storage_secret: ""
+strict_continuity_check: true
+datasets:
+  base-sepolia:
+
+# Those parameters are required, but effectively ignored in CLI mode:
+worker_inactive_timeout_sec: 600
+worker_storage_bytes: 483183820800
+worker_stale_bytes: 375809638400

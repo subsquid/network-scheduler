@@ -96,7 +96,12 @@ fn schedule_to_workers(
     let total_capacity =
         (config.worker_capacity as f64 * workers.len() as f64 * config.saturation) as u64;
 
-    let mapping = calc_replication_factors(size_by_weight, total_capacity, config.min_replication)?;
+    let mapping = calc_replication_factors(
+        size_by_weight,
+        total_capacity,
+        config.min_replication,
+        workers.len() as u16,
+    )?;
 
     let chunks = chunks
         .iter()

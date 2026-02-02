@@ -1,0 +1,7 @@
+workers:
+  - peer_id: "12D3KooWR1VSmCyVGTc8ewcm3LW82VeT68rjCKjBvGfpkt6ALxPx"
+    status: online
+  - peer_id: "12D3KooWDNGb4d3XksaGF3G8DGAbHRA3Kw8uA1H5tfCwJwhwi1Q"
+    status: online
+
+known_chunks:

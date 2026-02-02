@@ -25,11 +25,27 @@ pub struct Args {
     )]
     pub config: PathBuf,
 
+    /// Run mode: prod (with ClickHouse) or cli (with state file)
+    #[arg(short, long, default_value = "prod")]
+    pub mode: RunMode,
+
     #[command(flatten)]
     pub s3: S3Args,
 
     #[command(flatten)]
     pub clickhouse: ClickhouseArgs,
+
+    /// Path to CLI mode state file containing workers and known chunks (required for cli mode)
+    #[arg(long, env = "CLI_STATE_FILE", required_if_eq("mode", "cli"))]
+    pub cli_state_file: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+pub enum RunMode {
+    /// Production mode with ClickHouse
+    Prod,
+    /// CLI mode with static configuration file
+    Cli,
 }
 
 #[derive(clap::Args, Debug)]
@@ -49,14 +65,14 @@ pub struct S3Args {
 
 #[derive(clap::Args, Debug)]
 pub struct ClickhouseArgs {
-    #[arg(long, env)]
-    pub clickhouse_url: String,
-    #[arg(long, env)]
-    pub clickhouse_database: String,
-    #[arg(long, env)]
-    pub clickhouse_user: String,
-    #[arg(long, env)]
-    pub clickhouse_password: String,
+    #[arg(long, env, required_if_eq("mode", "prod"))]
+    pub clickhouse_url: Option<String>,
+    #[arg(long, env, required_if_eq("mode", "prod"))]
+    pub clickhouse_database: Option<String>,
+    #[arg(long, env, required_if_eq("mode", "prod"))]
+    pub clickhouse_user: Option<String>,
+    #[arg(long, env, required_if_eq("mode", "prod"))]
+    pub clickhouse_password: Option<String>,
 }
 
 impl S3Args {
@@ -89,7 +105,7 @@ pub struct Config {
     pub min_replication: u16,
 
     /// The fraction of the worker storage that is actually filled (on average).
-    /// The closer it gets to 1, the less consisent the distribution is.
+    /// The closer it gets to 1, the less consistent the distribution is.
     /// Corresponds to `1 / (1 + epsilon)` from this paper:
     /// https://research.google/blog/consistent-hashing-with-bounded-loads/
     pub saturation: f64,
@@ -98,8 +114,10 @@ pub struct Config {
 
     pub storage_domain: String,
 
+    /// Name of the json file, containing the state of the network
     pub network_state_name: String,
 
+    /// URL of the proxy server which exposes assets uploaded to S3
     pub network_state_url: String,
 
     pub scheduler_state_bucket: String,
@@ -126,6 +144,11 @@ pub struct Config {
 
     #[serde(default = "default_true")]
     pub strict_continuity_check: bool,
+
+    /// This option can be used purely for local development to create http schemes
+    /// with subdomain moved to the path-based routing
+    #[serde(default)]
+    pub storage_allow_insecure_scheme: bool 
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
