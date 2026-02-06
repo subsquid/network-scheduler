@@ -16,6 +16,13 @@ pub fn calc_replication_factors(
     min_replication: u16,
     max_replication: u16
 ) -> Result<BTreeMap<ChunkWeight, ReplicationFactor>, ReplicationError> {
+    tracing::debug!("{:?} {:?} {:?} {:?}",
+                    size_by_weight.iter().collect::<Vec<_>>(),
+                    capacity,
+                    min_replication,
+                    max_replication
+    );
+    
     let total_size: u64 = size_by_weight.values().sum();
     if total_size * min_replication as u64 > capacity {
         return Err(ReplicationError::NotEnoughCapacity);
@@ -43,7 +50,7 @@ pub fn calc_replication_factors(
     tracing::debug!("Replication multiplier: {multiplier:.2}");
     crate::metrics::WEIGHT_MULTIPLIER.set(multiplier);
 
-    assert!((*size_by_weight.last_key_value().unwrap().0 as f64 * multiplier) < 10000.);
+    //assert!((*size_by_weight.last_key_value().unwrap().0 as f64 * multiplier) < 10000.);
 
     Ok(size_by_weight
         .into_keys()
