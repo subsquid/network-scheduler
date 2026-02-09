@@ -26,6 +26,7 @@ pub struct Args {
     pub config: PathBuf,
 
     /// Run mode: prod (with ClickHouse) or cli (with state file)
+    /// Take into account that both modes utilise S3
     #[arg(short, long, default_value = "prod")]
     pub mode: RunMode,
 
