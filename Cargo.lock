@@ -2425,7 +2425,7 @@ checksum = "1d87ecb2933e8aeadb3e3a02b828fed80a7528047e68b4f424523a0981a3a084"
 
 [[package]]
 name = "network-scheduler"
-version = "3.6.4"
+version = "3.6.5"
 dependencies = [
  "anyhow",
  "aws-config",

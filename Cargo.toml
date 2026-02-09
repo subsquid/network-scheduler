@@ -3,7 +3,7 @@ members = ["tools/compare_fb"]
 
 [package]
 name = "network-scheduler"
-version = "3.6.4"
+version = "3.6.5"
 edition = "2024"
 
 [dependencies]
