@@ -105,7 +105,11 @@ impl Assignment {
             }
             prev_dataset = Some(chunk.dataset.clone());
 
-            let download_url = format!("https://{}.{}", chunk.bucket(), config.storage_domain);
+            let download_url = if config.storage_allow_insecure_scheme {
+                format!("http://{}/{}/", config.storage_domain, chunk.bucket())
+            } else {
+                format!("https://{}.{}", chunk.bucket(), config.storage_domain)
+            };
             let mut builder = assignment_builder
                 .new_chunk()
                 .id(&chunk.id)

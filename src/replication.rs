@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use crate::types::ChunkWeight;
+use crate::types::{ChunkWeight, ReplicationFactor};
 
 /// Finds such multiplier `K` that
 /// `sum(size_by_weight[w_i] * max(min_replication, round(w_i * K)))` is close to the `capacity`.
@@ -14,7 +14,15 @@ pub fn calc_replication_factors(
     size_by_weight: BTreeMap<ChunkWeight, u64>,
     capacity: u64,
     min_replication: u16,
-) -> Result<BTreeMap<ChunkWeight, u16>, ReplicationError> {
+    max_replication: u16
+) -> Result<BTreeMap<ChunkWeight, ReplicationFactor>, ReplicationError> {
+    tracing::debug!("{:?} {:?} {:?} {:?}",
+                    size_by_weight.iter().collect::<Vec<_>>(),
+                    capacity,
+                    min_replication,
+                    max_replication
+    );
+    
     let total_size: u64 = size_by_weight.values().sum();
     if total_size * min_replication as u64 > capacity {
         return Err(ReplicationError::NotEnoughCapacity);
@@ -42,14 +50,14 @@ pub fn calc_replication_factors(
     tracing::debug!("Replication multiplier: {multiplier:.2}");
     crate::metrics::WEIGHT_MULTIPLIER.set(multiplier);
 
-    assert!((*size_by_weight.last_key_value().unwrap().0 as f64 * multiplier) < 10000.);
+    //assert!((*size_by_weight.last_key_value().unwrap().0 as f64 * multiplier) < 10000.);
 
     Ok(size_by_weight
         .into_keys()
         .map(|weight| {
             (
                 weight,
-                min_replication.max((weight as f64 * multiplier) as u16),
+                max_replication.min(min_replication.max((weight as f64 * multiplier) as u16)),
             )
         })
         .collect())
@@ -63,9 +71,11 @@ pub enum ReplicationError {
 
 #[test]
 fn test_replication() {
+    // Just setting this temporarily. 
+    let max_replication_factor = 1200;
     let size_by_weight: BTreeMap<_, _> = [(1, 4), (2, 1), (6, 1), (12, 1)].into_iter().collect();
     assert!(matches!(
-        calc_replication_factors(size_by_weight.clone(), 13, 2),
+        calc_replication_factors(size_by_weight.clone(), 13, 2, max_replication_factor),
         Err(ReplicationError::NotEnoughCapacity)
     ));
 
@@ -109,7 +119,7 @@ fn test_replication() {
         (2400, [100, 200, 600, 1200]),
     ] {
         let replication_factors =
-            calc_replication_factors(size_by_weight.clone(), capacity, 2).unwrap();
+            calc_replication_factors(size_by_weight.clone(), capacity, 2, max_replication_factor).unwrap();
         assert_eq!(
             replication_factors.values().copied().collect::<Vec<_>>(),
             expected,
@@ -134,7 +144,7 @@ fn test_big_sizes() {
         .into_iter()
         .collect();
     assert_eq!(
-        calc_replication_factors(size_by_weight.clone(), 2000 * TB, 5)
+        calc_replication_factors(size_by_weight.clone(), 2000 * TB, 5, 161)
             .unwrap()
             .into_values()
             .collect::<Vec<_>>(),

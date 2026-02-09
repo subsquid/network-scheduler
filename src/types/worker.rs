@@ -1,6 +1,6 @@
 use libp2p_identity::PeerId;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkerStatus {
     Online,
@@ -20,7 +20,7 @@ impl std::fmt::Display for WorkerStatus {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Worker {
     #[serde(rename = "peer_id")]
     pub id: PeerId,

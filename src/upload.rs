@@ -20,8 +20,12 @@ pub struct Uploader {
 }
 
 impl Uploader {
-    pub fn new(config: cli::Config, s3_config: &aws_config::SdkConfig) -> Self {
-        let client = s3::Client::new(s3_config);
+    pub fn new(config: cli::Config, sdk_config: &aws_config::SdkConfig) -> Self {
+        let s3_config = aws_sdk_s3::config::Builder::from(sdk_config)
+            .force_path_style(true)
+            .build();
+        
+        let client = s3::Client::from_conf(s3_config);
         let time = Utc::now();
         crate::metrics::ASSIGNMENT_TIMESTAMP.set(time.timestamp());
         Self {

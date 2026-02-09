@@ -31,10 +31,26 @@ pub struct ClickhouseClient {
 impl ClickhouseClient {
     pub async fn new(args: &ClickhouseArgs) -> anyhow::Result<Self> {
         let client = Client::default()
-            .with_url(&args.clickhouse_url)
-            .with_database(&args.clickhouse_database)
-            .with_user(&args.clickhouse_user)
-            .with_password(&args.clickhouse_password);
+            .with_url(
+                args.clickhouse_url
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("ClickHouse URL is required"))?,
+            )
+            .with_database(
+                args.clickhouse_database
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("ClickHouse database is required"))?,
+            )
+            .with_user(
+                args.clickhouse_user
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("ClickHouse user is required"))?,
+            )
+            .with_password(
+                args.clickhouse_password
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("ClickHouse password is required"))?,
+            );
         let this = Self { client };
         this.create_tables().await?;
         Ok(this)
@@ -229,10 +245,10 @@ mod test {
     #[ignore = "database test"]
     async fn test_clickhouse() {
         let client = ClickhouseClient::new(&ClickhouseArgs {
-            clickhouse_url: "http://localhost:8123/".to_string(),
-            clickhouse_database: "logs_db".to_string(),
-            clickhouse_user: "user".to_string(),
-            clickhouse_password: "password".to_string(),
+            clickhouse_url: Some("http://localhost:8123/".to_string()),
+            clickhouse_database: Some("logs_db".to_string()),
+            clickhouse_user: Some("user".to_string()),
+            clickhouse_password: Some("password".to_string()),
         })
         .await
         .expect("Cannot connect to clickhouse");

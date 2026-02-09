@@ -40,6 +40,19 @@ impl Controller {
             workers,
         })
     }
+
+    /// Load workers from a static configuration (CLI mode)
+    pub fn load_workers_from_config(
+        self,
+        workers: Vec<types::Worker>,
+    ) -> WithWorkers {
+        tracing::info!("Loaded {} workers from config", workers.len());
+
+        WithWorkers {
+            config: self.config,
+            workers,
+        }
+    }
 }
 
 pub struct WithWorkers {
@@ -87,6 +100,31 @@ impl WithWorkers {
         })
     }
 
+    /// Load known chunks from a static configuration (CLI mode)
+    pub fn load_known_chunks_from_config(
+        self,
+        chunks: BTreeMap<Arc<String>, Vec<types::Chunk>>,
+    ) -> anyhow::Result<WithChunks> {
+        let datasets = dataset_names(&self.config);
+
+        let last_chunks = chunks
+            .iter()
+            .map(|(dataset, chunks)| {
+                debug_assert!(chunks.iter().is_sorted_by_key(|c| &c.id));
+                let last_chunk_id = &chunks.last().expect("Chunks should not be empty").id;
+                (dataset.clone(), last_chunk_id)
+            })
+            .collect::<BTreeMap<_, _>>();
+        tracing::debug!("Loaded known chunks up to {:#?}", last_chunks);
+
+        Ok(WithChunks {
+            config: self.config,
+            workers: self.workers,
+            datasets,
+            chunks,
+        })
+    }
+
     pub fn _without_known_chunks(self) -> WithChunks {
         WithChunks {
             datasets: dataset_names(&self.config),
@@ -113,7 +151,7 @@ pub enum CacheAccess {
 impl WithChunks {
     pub async fn load_new_chunks(
         mut self,
-        db: &clickhouse::ClickhouseClient,
+        db: Option<&clickhouse::ClickhouseClient>,
         datasets_storage: &storage::S3Storage,
         access: CacheAccess,
     ) -> anyhow::Result<Self> {
@@ -133,7 +171,7 @@ impl WithChunks {
             .await
             .context("Can't load datasets")?;
 
-        if access == CacheAccess::ReadWrite {
+        if let (Some(db), CacheAccess::ReadWrite) = (db, access) {
             tracing::info!(
                 "Storing {} new chunks in ClickHouse",
                 new_chunks
