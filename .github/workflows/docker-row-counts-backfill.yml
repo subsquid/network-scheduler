@@ -18,7 +18,6 @@ jobs:
 
     env:
       DOCKERFILE_PATH: "./scripts/row_counts/Dockerfile"
-      IMAGE: "gcr.io/${{ secrets.GCP_PROJECT }}/subsquid/row-counts-backfill"
 
     steps:
       - name: Checkout
@@ -45,6 +44,8 @@ jobs:
           echo "SHA=$(git rev-parse --short=12 HEAD)" >> "$GITHUB_OUTPUT"
 
       - name: Build image (latest + sha)
+        env:
+          IMAGE: "gcr.io/${{secrets.GCP_PROJECT}}/subsquid/row-counts-backfill"
         run: |
           docker build \
             -f "${DOCKERFILE_PATH}" \
