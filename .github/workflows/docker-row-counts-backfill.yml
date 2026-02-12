@@ -54,6 +54,8 @@ jobs:
             .
 
       - name: Push image (latest + sha)
+        env:
+          IMAGE: "gcr.io/${{vars.GCP_PROJECT}}/subsquid/row-counts-backfill"
         run: |
           docker push "${IMAGE}:latest"
           docker push "${IMAGE}:${{ steps.vars.outputs.SHA }}"
