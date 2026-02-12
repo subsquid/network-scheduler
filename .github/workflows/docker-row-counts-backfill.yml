@@ -1,0 +1,58 @@
+name: row counts backfill docker
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Git ref to build (branch, tag, or SHA). Leave empty to build default branch HEAD."
+        required: false
+        default: ""
+
+jobs:
+  gcr:
+    name: Build & push row-counts-backfill image to GCR
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+
+    env:
+      DOCKERFILE_PATH: "./scripts/row_counts/Dockerfile"
+      IMAGE: "gcr.io/${{ secrets.GCP_PROJECT }}/subsquid/row-counts-backfill"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.ref }}
+          fetch-depth: 1
+
+      - name: Setup gcloud
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ secrets.GCP_PROJECT }}
+          service_account_key: ${{ secrets.GCP_SERVICE_ACCOUNT_KEY }}
+          export_default_credentials: true
+
+      - name: Configure Docker auth for GCR
+        run: gcloud --quiet auth configure-docker gcr.io
+
+      - name: Compute commit tag
+        id: vars
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "SHA=$(git rev-parse --short=12 HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Build image (latest + sha)
+        run: |
+          docker build \
+            -f "${DOCKERFILE_PATH}" \
+            -t "${IMAGE}:latest" \
+            -t "${IMAGE}:${{ steps.vars.outputs.SHA }}" \
+            .
+
+      - name: Push image (latest + sha)
+        run: |
+          docker push "${IMAGE}:latest"
+          docker push "${IMAGE}:${{ steps.vars.outputs.SHA }}"
