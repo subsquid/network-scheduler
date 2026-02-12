@@ -4,7 +4,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
   && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /work
-COPY requirements.txt .
+COPY scripts/row_counts/requirements.txt .
 
 RUN python -m pip install -U pip wheel \
  && pip wheel --wheel-dir /wheels --prefer-binary -r requirements.txt
