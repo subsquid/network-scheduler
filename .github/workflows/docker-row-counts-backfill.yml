@@ -45,7 +45,7 @@ jobs:
 
       - name: Build image (latest + sha)
         env:
-          IMAGE: "gcr.io/${{secrets.GCP_PROJECT}}/subsquid/row-counts-backfill"
+          IMAGE: "gcr.io/${{vars.GCP_PROJECT}}/subsquid/row-counts-backfill"
         run: |
           docker build \
             -f "${DOCKERFILE_PATH}" \
