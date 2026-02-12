@@ -1,0 +1,89 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: row-counts-backfill-job
+  namespace: testnet-control-plane
+spec:
+  completions: 8
+  parallelism: 8
+  completionMode: Indexed
+  ttlSecondsAfterFinished: 86400   # 24h
+  backoffLimit: 0
+  suspend: false
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: backfill
+          image: gcr.io/bright-meridian-316511/network-row-counts-backfill:0.1.0
+          imagePullPolicy: Always
+          env:
+            - name: SHARD_INDEX
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.annotations['batch.kubernetes.io/job-completion-index']
+
+            - name: SHARD_COUNT
+              value: "8"
+
+            - name: BATCH_SIZE
+              value: "100000"
+
+            - name: AWS_ENDPOINT_URL
+              valueFrom:
+                secretKeyRef:
+                  name: backfill-secrets
+                  key: s3_endpoint
+
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: backfill-secrets
+                  key: s3_access_key_id
+                  
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: backfill-secrets
+                  key: s3_access_key_secret
+                  
+            - name: AWS_REGION
+              valueFrom:
+                secretKeyRef:
+                  name: backfill-secrets
+                  key: s3_region
+
+            - name: CLICKHOUSE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: backfill-secrets
+                  key: clickhouse_url
+                  
+            - name: CLICKHOUSE_DATABASE
+              valueFrom:
+                secretKeyRef:
+                  name: backfill-secrets
+                  key: clickhouse_database
+                  
+            - name: CLICKHOUSE_USER
+              valueFrom:
+                secretKeyRef:
+                  name: backfill-secrets
+                  key: clickhouse_user
+                  
+            - name: CLICKHOUSE_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: backfill-secrets
+                  key: clickhouse_password
+
+          command: ["/bin/sh","-lc"]
+          args:
+            - |
+              set -euo pipefail
+              idx="${SHARD_INDEX}"
+              echo "Shard index=$idx"
+
+              python row_counts_fill.py \
+              || { echo "Script failed; sleeping for debug"; sleep 900; exit 1; }
+

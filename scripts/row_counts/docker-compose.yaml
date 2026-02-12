@@ -1,0 +1,69 @@
+services:
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    ports:
+      - "9000:9000"   # S3 API
+      - "9001:9001"   # Web console
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    volumes:
+      - minio-data:/data
+
+  clickhouse:
+    image: clickhouse/clickhouse-server
+    environment:
+      CLICKHOUSE_DB: testnet
+      CLICKHOUSE_USER: user
+      CLICKHOUSE_PASSWORD: password
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1
+    ports:
+      - "8123:8123"
+      - "9002:9002" 
+    volumes:
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+
+  job_1:
+    build:
+      dockerfile: Dockerfile
+    environment:
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_SECRET_ACCESS_KEY: minioadmin
+      AWS_REGION: auto
+      AWS_S3_ENDPOINT: http://minio:9000
+      CLICKHOUSE_URL: clickhouse
+      CLICKHOUSE_USER: user
+      CLICKHOUSE_PASSWORD: password
+      CLICKHOUSE_DATABASE: testnet
+      LOCAL_TEST: true
+      SHARD_COUNT: 2
+      SHARD_INDEX: 0
+      BATCH_SIZE: 2
+    depends_on:
+      - clickhouse
+      - minio
+
+  job_2:
+    build:
+      dockerfile: Dockerfile
+    environment:
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_SECRET_ACCESS_KEY: minioadmin
+      AWS_REGION: auto
+      AWS_S3_ENDPOINT: http://minio:9000
+      LOCAL_TEST: true
+      CLICKHOUSE_URL: clickhouse
+      CLICKHOUSE_USER: user
+      CLICKHOUSE_PASSWORD: password
+      CLICKHOUSE_DATABASE: testnet
+      SHARD_COUNT: 2
+      SHARD_INDEX: 1
+      BATCH_SIZE: 2
+    depends_on:
+      - clickhouse
+      - minio
+      
+volumes:
+  minio-data:
+  clickhouse:
