@@ -13,7 +13,7 @@ FROM python:3.14-slim
 WORKDIR /app
 
 COPY --from=builder /wheels /wheels
-COPY requirements.txt .
+COPY scripts/row_counts/requirements.txt .
 RUN pip install --no-cache-dir --no-index --find-links=/wheels -r requirements.txt
-COPY row_counts_fill.py .
+COPY scripts/row_counts/row_counts_fill.py .
 CMD ["python", "-u", "row_counts_fill.py"]
