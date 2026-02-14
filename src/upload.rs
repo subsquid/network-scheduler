@@ -10,7 +10,7 @@ use tracing::instrument;
 
 use crate::{
     cli,
-    types::{SchedulingStatus, SchedulingStatusConfig, Worker},
+    types::{Dataset, SchedulingStatus, SchedulingStatusConfig, Worker},
 };
 
 pub struct Uploader {
@@ -122,7 +122,11 @@ impl Uploader {
     }
 
     #[instrument(skip_all)]
-    pub async fn upload_status(&self, workers: Vec<Worker>) -> anyhow::Result<()> {
+    pub async fn upload_status(
+        &self,
+        workers: Vec<Worker>,
+        datasets: Vec<Dataset>,
+    ) -> anyhow::Result<()> {
         let status = SchedulingStatus {
             config: SchedulingStatusConfig {
                 supported_worker_versions: format!(
@@ -136,6 +140,7 @@ impl Uploader {
             },
             assignment_timestamp_sec: self.time.timestamp() as u64,
             workers,
+            datasets,
         };
         let contents = serde_json::to_vec(&status)?;
         self.client
