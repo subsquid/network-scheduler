@@ -207,7 +207,7 @@ impl WithChunks {
 
             let height = chunks.last().map(|c| *c.blocks.end());
             datasets.push(types::Dataset {
-                name: dataset_name.to_string(),
+                id: dataset_name.to_string(),
                 height,
             });
 

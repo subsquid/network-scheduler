@@ -1,5 +1,5 @@
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Dataset {
-    pub name: String,
+    pub id: String,
     pub height: Option<u64>,
 }
