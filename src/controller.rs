@@ -198,16 +198,21 @@ impl WithChunks {
     pub fn weight_chunks(self) -> WithWeightedChunks {
         let datasets_num = self.chunks.len();
 
-        let flat_chunks = self
-            .chunks
-            .into_iter()
-            .flat_map(|(_, chunks)| {
-                // Chunks order should be deterministic.
-                // Here they are sorted by the dataset+chunk_id pair
-                debug_assert!(chunks.is_sorted_by_key(|c| &c.id));
-                chunks.into_iter()
-            })
-            .collect_vec();
+        let mut datasets = Vec::with_capacity(datasets_num);
+        let mut flat_chunks = Vec::new();
+        for (dataset_name, mut chunks) in self.chunks {
+            // Chunks order should be deterministic.
+            // Here they are sorted by the dataset+chunk_id pair
+            debug_assert!(chunks.is_sorted_by_key(|c| &c.id));
+
+            let height = chunks.last().map(|c| *c.blocks.end());
+            datasets.push(types::Dataset {
+                id: dataset_name.to_string(),
+                height,
+            });
+
+            flat_chunks.append(&mut chunks);
+        }
 
         tracing::info!(
             "Loaded {} datasets with {} chunks in total",
@@ -221,6 +226,7 @@ impl WithChunks {
         WithWeightedChunks {
             config: self.config,
             workers: self.workers,
+            datasets,
             chunks: filtered_chunks,
             weighted_chunks,
         }
@@ -230,6 +236,7 @@ impl WithChunks {
 pub struct WithWeightedChunks {
     config: cli::Config,
     workers: Vec<types::Worker>,
+    datasets: Vec<types::Dataset>,
     chunks: Vec<types::Chunk>,
     weighted_chunks: Vec<WeightedChunk>,
 }
@@ -253,6 +260,7 @@ impl WithWeightedChunks {
         Ok(WithAssignment {
             config: self.config,
             workers: self.workers,
+            datasets: self.datasets,
             chunks: self.chunks,
             assignment,
         })
@@ -262,6 +270,7 @@ impl WithWeightedChunks {
 pub struct WithAssignment {
     config: cli::Config,
     workers: Vec<types::Worker>,
+    datasets: Vec<types::Dataset>,
     chunks: Vec<types::Chunk>,
     assignment: types::Assignment,
 }
@@ -294,7 +303,7 @@ impl WithAssignment {
         metrics: String,
     ) -> anyhow::Result<()> {
         tracing::info!("Uploading metadata");
-        uploader.upload_status(self.workers).await?;
+        uploader.upload_status(self.workers, self.datasets).await?;
 
         uploader
             .upload_metrics(metrics)
