@@ -2,14 +2,15 @@ use std::collections::BTreeMap;
 
 use itertools::Itertools;
 use libp2p_identity::PeerId;
+use semver::Version;
 
 use super::{
-    input::generate_input,
+    input::{generate_chunks, generate_input, generate_workers},
     utils::{Stats, compare_intersection},
 };
 use crate::{
     scheduling::{SchedulingConfig, schedule},
-    types::{Assignment, WorkerIndex, WorkerStatus},
+    types::{Assignment, Worker, WorkerIndex, WorkerStatus},
 };
 
 #[test]
@@ -201,6 +202,267 @@ fn split_by_workers(
             replication_by_weight: assignment.replication_by_weight,
         },
     )
+}
+
+/// Verifies that version-restricted chunks are only assigned to eligible workers.
+/// Scenario: 100 workers, 20% eligible, 99% saturation, ~4% of chunks version-restricted.
+///
+/// Two constraints must hold (both are stressed close to their limits):
+/// 1. R ≤ E: replication factor must not exceed eligible worker count.
+///    R = floor(C * N * s / S) = floor(20 * 0.99) = 19. E = 20 ≥ 19 ✓
+/// 2. R * S_versioned ≤ E * 0.2 * C: total versioned replicas fit in per-worker caps.
+///    19 * 0.04S = 0.76S ≤ 20 * 0.2 * 0.2S = 0.8S (95% utilized) ✓
+/// Regular chunks are unrestricted and spill freely to ineligible workers
+/// when eligible workers' remaining capacity is insufficient.
+#[test]
+fn test_minimum_worker_version_filtering() {
+    let min_version = Version::new(2, 8, 0);
+    const N_WORKERS: WorkerIndex = 100;
+    const N_ELIGIBLE: WorkerIndex = 20;
+    const N_CHUNKS: u32 = 50_000;
+    const N_VERSIONED: u32 = 2_000; // ~4% of chunks
+
+    let mut chunks = generate_chunks(N_CHUNKS, &[1]);
+    for chunk in &mut chunks[..N_VERSIONED as usize] {
+        chunk.minimum_worker_version = Some(min_version.clone());
+    }
+
+    let workers = generate_workers(N_WORKERS)
+        .into_iter()
+        .enumerate()
+        .map(|(i, id)| Worker {
+            id,
+            status: WorkerStatus::Online,
+            version: if (i as WorkerIndex) < N_ELIGIBLE {
+                Some(Version::new(2, 8, 0))
+            } else {
+                Some(Version::new(2, 7, 0))
+            },
+        })
+        .collect_vec();
+
+    let eligible_ids = workers[..N_ELIGIBLE as usize]
+        .iter()
+        .map(|w| w.id)
+        .collect::<std::collections::BTreeSet<_>>();
+
+    let total_size: u64 = chunks.iter().map(|c| c.size as u64).sum();
+    // C * N / S = 20, so R = floor(20 * 0.99) = 19
+    let worker_capacity = 20 * total_size / N_WORKERS as u64;
+
+    let assignment = schedule(
+        &chunks,
+        &workers,
+        SchedulingConfig {
+            worker_capacity,
+            saturation: 0.99,
+            min_replication: 1,
+            ignore_reliability: false,
+        },
+    )
+    .unwrap();
+
+    // Versioned chunks must only be assigned to eligible workers
+    for (worker_id, chunk_indexes) in &assignment.worker_chunks {
+        if !eligible_ids.contains(worker_id) {
+            let has_versioned = chunk_indexes.iter().any(|&i| (i as u32) < N_VERSIONED);
+            assert!(
+                !has_versioned,
+                "Ineligible worker {:?} was assigned version-restricted chunks",
+                worker_id,
+            );
+        }
+    }
+
+    // All eligible workers should have some versioned chunks
+    for worker_id in &eligible_ids {
+        let versioned_count = assignment
+            .worker_chunks
+            .get(worker_id)
+            .map(|idxs| idxs.iter().filter(|&&i| (i as u32) < N_VERSIONED).count())
+            .unwrap_or(0);
+        assert!(
+            versioned_count > 0,
+            "Eligible worker {:?} has no versioned chunks",
+            worker_id
+        );
+    }
+}
+
+/// Measures reassignment impact when workers gradually upgrade.
+/// Scenario: 100 workers, 99% saturation, ~4% versioned chunks,
+/// workers upgrade in batches: 20 -> 35 -> 50 -> 75 -> 100.
+/// R = floor(20 * 0.99) = 19, so we need ≥ 19 eligible workers in each step.
+///
+/// At E=20 (first step), the per-worker versioned cap is 95% utilized
+/// (same stress level as test_minimum_worker_version_filtering).
+/// When the pool grows from 20→35, each original worker loses up to ~43%
+/// of its restricted data. With restricted data at ~19% of capacity,
+/// per-worker reassignment is bounded by 0.43 * 0.19 ≈ 8% of capacity.
+/// We use a 15% threshold to account for hash ring variance.
+#[test]
+fn test_minimum_worker_version_gradual_upgrade() {
+    let min_version = Version::new(2, 8, 0);
+    const N_WORKERS: WorkerIndex = 100;
+    const N_CHUNKS: u32 = 50_000;
+    const N_VERSIONED: u32 = 2_000; // ~4%
+
+    let mut chunks = generate_chunks(N_CHUNKS, &[1]);
+    for chunk in &mut chunks[..N_VERSIONED as usize] {
+        chunk.minimum_worker_version = Some(min_version.clone());
+    }
+
+    let total_size: u64 = chunks.iter().map(|c| c.size as u64).sum();
+    let worker_capacity = 20 * total_size / N_WORKERS as u64;
+    let config = SchedulingConfig {
+        worker_capacity,
+        saturation: 0.99,
+        min_replication: 1,
+        ignore_reliability: false,
+    };
+
+    let worker_ids = generate_workers(N_WORKERS);
+
+    let upgrade_steps: &[WorkerIndex] = &[20, 35, 50, 75, 100];
+    let mut prev_assignment: Option<Assignment> = None;
+
+    for &n_upgraded in upgrade_steps {
+        let workers = worker_ids
+            .iter()
+            .enumerate()
+            .map(|(i, &id)| Worker {
+                id,
+                status: WorkerStatus::Online,
+                version: if (i as WorkerIndex) < n_upgraded {
+                    Some(Version::new(2, 8, 0))
+                } else {
+                    Some(Version::new(2, 7, 0))
+                },
+            })
+            .collect_vec();
+
+        let assignment = schedule(&chunks, &workers, config.clone()).unwrap();
+
+        if let Some(prev) = &prev_assignment {
+            let compare_result = compare_intersection(&chunks, prev, &assignment);
+            let max_removed = *compare_result.removed.values().max().unwrap();
+            println!(
+                "Upgrade to {} workers: max removed per worker: {:.2}% of capacity",
+                n_upgraded,
+                max_removed as f64 / worker_capacity as f64 * 100.0
+            );
+            assert!(
+                compare_result
+                    .removed
+                    .values()
+                    .all(|size| (*size as f64) < 0.15 * worker_capacity as f64),
+                "Too much reassignment when upgrading to {} workers: max removed = {:.2}% of capacity (limit = 15%)",
+                n_upgraded,
+                max_removed as f64 / worker_capacity as f64 * 100.0,
+            );
+        }
+
+        prev_assignment = Some(assignment);
+    }
+}
+
+/// Verifies that scheduling panics when eligible workers can't absorb all
+/// version-restricted replicas. R = floor(6 * 0.9) = 5, but only 3
+/// eligible workers — each versioned chunk needs 5 distinct workers
+/// but can only use 3. Panics on the first versioned chunk.
+#[test]
+#[should_panic(expected = "No worker found for chunk")]
+fn test_minimum_worker_version_insufficient_capacity() {
+    let min_version = Version::new(2, 8, 0);
+    const N_WORKERS: WorkerIndex = 100;
+    const N_ELIGIBLE: WorkerIndex = 3;
+
+    let mut chunks = generate_chunks(50_000, &[1]);
+    for chunk in &mut chunks {
+        chunk.minimum_worker_version = Some(min_version.clone());
+    }
+
+    let total_size: u64 = chunks.iter().map(|c| c.size as u64).sum();
+    let worker_capacity = 6 * total_size / N_WORKERS as u64;
+
+    let workers = generate_workers(N_WORKERS)
+        .into_iter()
+        .enumerate()
+        .map(|(i, id)| Worker {
+            id,
+            status: WorkerStatus::Online,
+            version: if (i as WorkerIndex) < N_ELIGIBLE {
+                Some(Version::new(2, 8, 0))
+            } else {
+                Some(Version::new(2, 7, 0))
+            },
+        })
+        .collect_vec();
+
+    let _ = schedule(
+        &chunks,
+        &workers,
+        SchedulingConfig {
+            worker_capacity,
+            saturation: 0.9,
+            min_replication: 1,
+            ignore_reliability: false,
+        },
+    );
+}
+
+/// Verifies that scheduling panics when versioned data exceeds the per-worker
+/// version-restricted cap (even though R ≤ E and total eligible capacity
+/// would suffice without the cap).
+/// Scenario: 100 workers, 20 eligible, 99% saturation, 5% versioned chunks.
+/// Same framework as test_minimum_worker_version_filtering (M=20, R=19, E=20)
+/// but with versioned fraction just above the ~4.2% threshold.
+///
+/// R = floor(20 * 0.99) = 19 ≤ 20.
+/// Per-worker versioned cap = 0.2 * C = 0.2 * 0.2S = 0.04S.
+/// Total capped versioned capacity = 20 * 0.04S = 0.8S.
+/// Required: R * S_versioned = 19 * 0.05S = 0.95S > 0.8S (~19% over cap). Panics.
+#[test]
+#[should_panic(expected = "No worker found for chunk")]
+fn test_minimum_worker_version_eligible_capacity_exceeded() {
+    let min_version = Version::new(2, 8, 0);
+    const N_WORKERS: WorkerIndex = 100;
+    const N_ELIGIBLE: WorkerIndex = 20;
+    const N_CHUNKS: u32 = 50_000;
+    const N_VERSIONED: u32 = 2_500; // 5% of chunks, just above the ~4.2% threshold
+
+    let mut chunks = generate_chunks(N_CHUNKS, &[1]);
+    for chunk in &mut chunks[..N_VERSIONED as usize] {
+        chunk.minimum_worker_version = Some(min_version.clone());
+    }
+
+    let total_size: u64 = chunks.iter().map(|c| c.size as u64).sum();
+    let worker_capacity = 20 * total_size / N_WORKERS as u64;
+
+    let workers = generate_workers(N_WORKERS)
+        .into_iter()
+        .enumerate()
+        .map(|(i, id)| Worker {
+            id,
+            status: WorkerStatus::Online,
+            version: if (i as WorkerIndex) < N_ELIGIBLE {
+                Some(Version::new(2, 8, 0))
+            } else {
+                Some(Version::new(2, 7, 0))
+            },
+        })
+        .collect_vec();
+
+    let _ = schedule(
+        &chunks,
+        &workers,
+        SchedulingConfig {
+            worker_capacity,
+            saturation: 0.99,
+            min_replication: 1,
+            ignore_reliability: false,
+        },
+    );
 }
 
 fn ring_iter<'l, T: Ord>(v: &'l [T], from: &T) -> impl Iterator<Item = &'l T> {

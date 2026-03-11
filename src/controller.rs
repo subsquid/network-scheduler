@@ -5,7 +5,7 @@ use itertools::Itertools;
 
 use crate::{
     cli, clickhouse,
-    scheduling::{self, WeightedChunk},
+    scheduling::{self, ScheduledChunk},
     storage,
     types::{self, FbVersion},
     upload, weight,
@@ -195,7 +195,7 @@ impl WithChunks {
         Ok(self)
     }
 
-    pub fn weight_chunks(self) -> WithWeightedChunks {
+    pub fn prepare_chunks(self) -> WithScheduledChunks {
         let datasets_num = self.chunks.len();
 
         let mut datasets = Vec::with_capacity(datasets_num);
@@ -220,31 +220,31 @@ impl WithChunks {
             flat_chunks.len()
         );
 
-        let (weighted_chunks, filtered_chunks) =
-            weight::weight_chunks(flat_chunks, &self.config.datasets);
+        let (scheduled_chunks, filtered_chunks) =
+            weight::prepare_chunks(flat_chunks, &self.config.datasets);
 
-        WithWeightedChunks {
+        WithScheduledChunks {
             config: self.config,
             workers: self.workers,
             datasets,
             chunks: filtered_chunks,
-            weighted_chunks,
+            scheduled_chunks,
         }
     }
 }
 
-pub struct WithWeightedChunks {
+pub struct WithScheduledChunks {
     config: cli::Config,
     workers: Vec<types::Worker>,
     datasets: Vec<types::Dataset>,
     chunks: Vec<types::Chunk>,
-    weighted_chunks: Vec<WeightedChunk>,
+    scheduled_chunks: Vec<ScheduledChunk>,
 }
 
-impl WithWeightedChunks {
+impl WithScheduledChunks {
     pub fn schedule(self) -> anyhow::Result<WithAssignment> {
         let assignment = scheduling::schedule(
-            &self.weighted_chunks,
+            &self.scheduled_chunks,
             &self.workers,
             scheduling::SchedulingConfig {
                 worker_capacity: self.config.worker_storage_bytes,

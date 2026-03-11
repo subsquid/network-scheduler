@@ -8,6 +8,8 @@ use rayon::iter::{
 use seahash::hash;
 use tracing::instrument;
 
+use semver::Version;
+
 use crate::{
     replication::{ReplicationError, calc_replication_factors},
     types::{Assignment, ChunkIndex, Worker, WorkerIndex},
@@ -16,6 +18,13 @@ use crate::{
 type RingIndex = u16;
 
 const N_RINGS: usize = 6000;
+
+/// Maximum fraction of a worker's capacity that can be used for
+/// version-restricted chunks. This prevents eligible workers from being
+/// overloaded with restricted data, which would cause large reassignments
+/// when more workers upgrade. At 0.2, the worst-case reassignment when
+/// the eligible pool doubles is 10% of worker capacity.
+const MAX_VERSION_RESTRICTED_RATIO: f64 = 0.2;
 
 #[derive(Debug, Clone)]
 pub struct SchedulingConfig {
@@ -26,22 +35,23 @@ pub struct SchedulingConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub struct WeightedChunk {
+pub struct ScheduledChunk {
     pub id: String,
     pub size: u32,
     pub weight: u16,
+    pub minimum_worker_version: Option<Version>,
 }
 
 pub fn schedule(
-    chunks: &[WeightedChunk],
+    chunks: &[ScheduledChunk],
     workers: &[Worker],
     config: SchedulingConfig,
 ) -> Result<Assignment, ReplicationError> {
     let _timer = crate::metrics::Timer::new("schedule");
-    let mut worker_ids = Vec::with_capacity(workers.len());
-    worker_ids.extend(workers.iter().filter(|w| w.reliable()).map(|w| w.id));
-    let reliable_workers = worker_ids.len();
-    worker_ids.extend(workers.iter().filter(|w| !w.reliable()).map(|w| w.id));
+    let mut sorted_workers = Vec::with_capacity(workers.len());
+    sorted_workers.extend(workers.iter().filter(|w| w.reliable()));
+    let reliable_workers = sorted_workers.len();
+    sorted_workers.extend(workers.iter().filter(|w| !w.reliable()));
 
     if config.ignore_reliability {
         tracing::info!(
@@ -49,7 +59,7 @@ pub fn schedule(
             chunks.len(),
             workers.len(),
         );
-        return schedule_to_workers(chunks, &worker_ids, &config);
+        return schedule_to_workers(chunks, &sorted_workers, &config);
     }
 
     tracing::info!(
@@ -57,7 +67,8 @@ pub fn schedule(
         chunks.len(),
         reliable_workers
     );
-    let mut reliable = schedule_to_workers(chunks, &worker_ids[..reliable_workers], &config)?;
+    let mut reliable =
+        schedule_to_workers(chunks, &sorted_workers[..reliable_workers], &config)?;
 
     if reliable_workers == workers.len() {
         return Ok(reliable);
@@ -68,7 +79,7 @@ pub fn schedule(
         chunks.len(),
         workers.len()
     );
-    let all = schedule_to_workers(chunks, &worker_ids, &config)?;
+    let all = schedule_to_workers(chunks, &sorted_workers, &config)?;
 
     // Use assignment from `reliable` for reliable workers and from `all` for unreliable workers
     for (worker_id, chunk_indexes) in all.worker_chunks {
@@ -81,8 +92,8 @@ pub fn schedule(
 }
 
 fn schedule_to_workers(
-    chunks: &[WeightedChunk],
-    workers: &[PeerId],
+    chunks: &[ScheduledChunk],
+    workers: &[&Worker],
     config: &SchedulingConfig,
 ) -> Result<Assignment, ReplicationError> {
     let size_by_weight = chunks
@@ -109,6 +120,7 @@ fn schedule_to_workers(
             id: Cow::Borrowed(&c.id),
             replication: mapping[&c.weight],
             size: c.size,
+            minimum_worker_version: c.minimum_worker_version.as_ref(),
         })
         .collect_vec();
 
@@ -126,33 +138,43 @@ fn schedule_to_workers(
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct ReplicatedChunk<'id> {
-    id: Cow<'id, str>,
+struct ReplicatedChunk<'a> {
+    id: Cow<'a, str>,
     size: u32,
     replication: u16,
+    minimum_worker_version: Option<&'a Version>,
 }
 
 #[instrument(skip_all)]
 fn distribute(
     chunks: &[ReplicatedChunk],
-    workers: &[PeerId],
+    workers: &[&Worker],
     worker_capacity: u64,
 ) -> BTreeMap<PeerId, Vec<ChunkIndex>> {
     let _timer = crate::metrics::Timer::new("schedule:distribute");
-    let rings = hash_workers(workers);
-    let orderings = hash_chunks(chunks, &rings);
+    let worker_ids = workers.iter().map(|w| w.id).collect_vec();
+    let rings = hash_workers(&worker_ids);
+    let mut orderings = hash_chunks(chunks, &rings);
+    // Assign version-restricted chunks first so they get priority on eligible
+    // workers' capacity before unrestricted chunks fill it. Without this,
+    // the non-deterministic ordering from parallel collection could cause
+    // restricted chunks to arrive after eligible workers are full, leading
+    // to a panic even when total capacity would suffice.
+    orderings.sort_by_key(|(chunk_index, _, _)| {
+        chunks[*chunk_index as usize].minimum_worker_version.is_none()
+    });
     assign_chunks(orderings, chunks, workers, rings, worker_capacity)
 }
 
 #[instrument(skip_all)]
-fn hash_workers(workers: &[PeerId]) -> Vec<Vec<(u64, WorkerIndex)>> {
+fn hash_workers(worker_ids: &[PeerId]) -> Vec<Vec<(u64, WorkerIndex)>> {
     tracing::info!("Hashing workers");
     let _timer = crate::metrics::Timer::new("schedule:distribute:hash_workers");
 
     (0..N_RINGS as RingIndex)
         .into_par_iter()
         .map(|ring_index| {
-            let mut vec = workers
+            let mut vec = worker_ids
                 .iter()
                 .enumerate()
                 .map(|(worker_index, worker_id)| {
@@ -203,7 +225,7 @@ fn hash_chunks(
 fn assign_chunks(
     orderings: Vec<(ChunkIndex, RingIndex, WorkerIndex)>,
     chunks: &[ReplicatedChunk],
-    worker_ids: &[PeerId],
+    workers: &[&Worker],
     rings: Vec<Vec<(u64, WorkerIndex)>>,
     worker_capacity: u64,
 ) -> BTreeMap<PeerId, Vec<ChunkIndex>> {
@@ -213,13 +235,17 @@ fn assign_chunks(
     struct WorkerAssignment {
         chunks: Vec<ChunkIndex>,
         allocated: u64,
+        version_restricted_allocated: u64,
     }
 
-    let mut workers: Vec<WorkerAssignment> = worker_ids
+    let max_version_restricted = (MAX_VERSION_RESTRICTED_RATIO * worker_capacity as f64) as u64;
+
+    let mut assignments: Vec<WorkerAssignment> = workers
         .iter()
         .map(|_| WorkerAssignment {
             chunks: Vec::new(),
             allocated: 0,
+            version_restricted_allocated: 0,
         })
         .collect();
     orderings
@@ -228,25 +254,47 @@ fn assign_chunks(
             let chunk = &chunks[chunk_index as usize];
             let ring = &rings[ring_index as usize];
             let first = first as usize;
+            let is_version_restricted = chunk.minimum_worker_version.is_some();
             let candidates = ring[first..].iter().chain(ring[..first].iter());
             for &(_, worker_index) in candidates {
-                let worker = &mut workers[worker_index as usize];
+                // Check if this chunk requires a minimum worker version
+                if let Some(min_ver) = chunk.minimum_worker_version {
+                    let worker_ver = &workers[worker_index as usize].version;
+                    if !worker_ver.as_ref().is_some_and(|v| v >= min_ver) {
+                        continue;
+                    }
+                }
 
-                if worker.allocated + chunk.size as u64 <= worker_capacity
-                    // indexes are added in increasing order, so it's enough to check the last one for duplicates
-                    && worker.chunks.last() != Some(&chunk_index)
+                let assignment = &mut assignments[worker_index as usize];
+
+                // Cap version-restricted data per worker to limit reassignment churn
+                if is_version_restricted
+                    && assignment.version_restricted_allocated + chunk.size as u64
+                        > max_version_restricted
                 {
-                    worker.allocated += chunk.size as u64;
-                    worker.chunks.push(chunk_index);
+                    continue;
+                }
+
+                if assignment.allocated + chunk.size as u64 <= worker_capacity
+                    // Replicas of the same chunk stay adjacent after the stable sort
+                    // (they share the same minimum_worker_version key), so checking
+                    // the last assigned index is sufficient to prevent duplicates.
+                    && assignment.chunks.last() != Some(&chunk_index)
+                {
+                    assignment.allocated += chunk.size as u64;
+                    if is_version_restricted {
+                        assignment.version_restricted_allocated += chunk.size as u64;
+                    }
+                    assignment.chunks.push(chunk_index);
                     return;
                 }
             }
             panic!("No worker found for chunk {}", chunk.id);
         });
 
-    workers
+    assignments
         .into_iter()
         .enumerate()
-        .map(|(index, worker)| (worker_ids[index], worker.chunks))
+        .map(|(index, a)| (workers[index].id, a.chunks))
         .collect()
 }

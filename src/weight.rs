@@ -1,16 +1,18 @@
 use itertools::Itertools;
 
+use semver::Version;
+
 use crate::cli::{DatasetSegmentConfig, DatasetsConfig};
 use crate::metrics::{self, DatasetSegmentStats};
-use crate::scheduling::WeightedChunk;
+use crate::scheduling::ScheduledChunk;
 use crate::types::{Chunk, ChunkWeight};
 
 // TODO: add unit tests
-pub fn weight_chunks(
+pub fn prepare_chunks(
     chunks: Vec<Chunk>,
     config: &DatasetsConfig,
-) -> (Vec<WeightedChunk>, Vec<Chunk>) {
-    let mut weighted_chunks = Vec::with_capacity(chunks.len());
+) -> (Vec<ScheduledChunk>, Vec<Chunk>) {
+    let mut scheduled_chunks = Vec::with_capacity(chunks.len());
     let mut filtered_chunks = Vec::with_capacity(chunks.len());
     for (dataset, chunks) in &chunks.into_iter().chunk_by(|chunk| chunk.dataset.clone()) {
         let chunks = chunks.collect_vec();
@@ -38,10 +40,11 @@ pub fn weight_chunks(
             if chunk.blocks.start() >= &segments[cur].from {
                 segment_chunks += 1;
                 segment_size += chunk.size as u64;
-                weighted_chunks.push(WeightedChunk {
+                scheduled_chunks.push(ScheduledChunk {
                     id: format!("{}/{}", dataset, chunk.id),
                     size: chunk.size,
                     weight: segments[cur].weight,
+                    minimum_worker_version: segments[cur].minimum_worker_version.clone(),
                 });
                 filtered_chunks.push(chunk);
             }
@@ -53,13 +56,14 @@ pub fn weight_chunks(
         });
         metrics::report_chunks(&dataset, &stats);
     }
-    (weighted_chunks, filtered_chunks)
+    (scheduled_chunks, filtered_chunks)
 }
 
 struct Segment {
     from: u64,
     original_from: i64,
     weight: ChunkWeight,
+    minimum_worker_version: Option<Version>,
 }
 
 fn to_absolute_blocks(segments: &[DatasetSegmentConfig], last_block: u64) -> Vec<Segment> {
@@ -79,6 +83,7 @@ fn to_absolute_blocks(segments: &[DatasetSegmentConfig], last_block: u64) -> Vec
                 from,
                 original_from: seg.from,
                 weight: seg.weight,
+                minimum_worker_version: seg.minimum_worker_version.clone(),
             }
         })
         .collect()

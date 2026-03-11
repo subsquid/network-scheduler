@@ -1,4 +1,5 @@
 use libp2p_identity::PeerId;
+use semver::Version;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -25,6 +26,8 @@ pub struct Worker {
     #[serde(rename = "peer_id")]
     pub id: PeerId,
     pub status: WorkerStatus,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub version: Option<Version>,
 }
 
 impl Worker {
