@@ -70,8 +70,7 @@ pub fn schedule(
         chunks.len(),
         reliable_workers
     );
-    let mut reliable =
-        schedule_to_workers(chunks, &sorted_workers[..reliable_workers], &config)?;
+    let mut reliable = schedule_to_workers(chunks, &sorted_workers[..reliable_workers], &config)?;
 
     if reliable_workers == workers.len() {
         return Ok(reliable);
@@ -160,11 +159,13 @@ fn distribute(
     let mut orderings = hash_chunks(chunks, &rings);
     // Assign version-restricted chunks first so they get priority on eligible
     // workers' capacity before unrestricted chunks fill it. Without this,
-    // the non-deterministic ordering from parallel collection could cause
-    // restricted chunks to arrive after eligible workers are full, leading
-    // to a panic even when total capacity would suffice.
+    // unrestricted chunks (ordered by hash ring position only) could fill
+    // eligible workers' capacity before restricted chunks are processed,
+    // causing a panic even when total capacity would suffice.
     orderings.sort_by_key(|(chunk_index, _, _)| {
-        chunks[*chunk_index as usize].minimum_worker_version.is_none()
+        chunks[*chunk_index as usize]
+            .minimum_worker_version
+            .is_none()
     });
     assign_chunks(orderings, chunks, workers, rings, worker_capacity)
 }

@@ -365,24 +365,29 @@ fn test_minimum_worker_version_gradual_upgrade() {
     }
 }
 
-/// Verifies that scheduling panics when eligible workers can't absorb all
-/// version-restricted replicas. R = floor(6 * 0.9) = 5, but only 3
-/// eligible workers — each versioned chunk needs 5 distinct workers
-/// but can only use 3. Panics on the first versioned chunk.
+/// Verifies that scheduling panics when R > E (replication factor exceeds
+/// eligible worker count), even though the per-worker capacity constraint
+/// is satisfied.
+/// Scenario: 100 workers, 18 eligible, 99% saturation, 2% versioned chunks.
+///
+/// R = floor(20 * 0.99) = 19 > E = 18. Panics (can't place 19 replicas on 18 workers).
+/// f = 0.02 ≤ 0.2 * 18 / (100 * 0.99) = 0.036 ✓ (capacity would suffice).
 #[test]
 #[should_panic(expected = "No worker found for chunk")]
-fn test_minimum_worker_version_insufficient_capacity() {
+fn test_minimum_worker_version_insufficient_eligible_workers() {
     let min_version = Version::new(2, 8, 0);
     const N_WORKERS: WorkerIndex = 100;
-    const N_ELIGIBLE: WorkerIndex = 3;
+    const N_ELIGIBLE: WorkerIndex = 18;
+    const N_CHUNKS: u32 = 50_000;
+    const N_VERSIONED: u32 = 1_000; // 2% of chunks
 
-    let mut chunks = generate_chunks(50_000, &[1]);
-    for chunk in &mut chunks {
+    let mut chunks = generate_chunks(N_CHUNKS, &[1]);
+    for chunk in &mut chunks[..N_VERSIONED as usize] {
         chunk.minimum_worker_version = Some(min_version.clone());
     }
 
     let total_size: u64 = chunks.iter().map(|c| c.size as u64).sum();
-    let worker_capacity = 6 * total_size / N_WORKERS as u64;
+    let worker_capacity = 20 * total_size / N_WORKERS as u64;
 
     let workers = generate_workers(N_WORKERS)
         .into_iter()
@@ -403,7 +408,7 @@ fn test_minimum_worker_version_insufficient_capacity() {
         &workers,
         SchedulingConfig {
             worker_capacity,
-            saturation: 0.9,
+            saturation: 0.99,
             min_replication: 1,
             ignore_reliability: false,
         },
@@ -414,8 +419,8 @@ fn test_minimum_worker_version_insufficient_capacity() {
 /// version-restricted cap (even though R ≤ E and total eligible capacity
 /// would suffice without the cap).
 /// Scenario: 100 workers, 20 eligible, 99% saturation, 5% versioned chunks.
-/// Same framework as test_minimum_worker_version_filtering (M=20, R=19, E=20)
-/// but with versioned fraction just above the threshold.
+/// Same framework as test_minimum_worker_version_filtering but with versioned
+/// fraction just above the threshold.
 ///
 /// R = floor(20 * 0.99) = 19 ≤ 20 ✓
 /// f = 0.05 > 0.2 * 20 / (100 * 0.99) = 0.0404 (~24% over limit). Panics.
