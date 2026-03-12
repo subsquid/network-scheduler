@@ -210,8 +210,8 @@ fn split_by_workers(
 /// Two constraints must hold (both are stressed close to their limits):
 /// 1. R ≤ E: replication factor must not exceed eligible worker count.
 ///    R = floor(C * N * s / S) = floor(20 * 0.99) = 19. E = 20 ≥ 19 ✓
-/// 2. R * S_versioned ≤ E * 0.2 * C: total versioned replicas fit in per-worker caps.
-///    19 * 0.04S = 0.76S ≤ 20 * 0.2 * 0.2S = 0.8S (95% utilized) ✓
+/// 2. f ≤ 0.2 * E / (N * s): versioned fraction fits in per-worker caps.
+///    f = 0.04 ≤ 0.2 * 20 / (100 * 0.99) = 0.0404 (99% utilized) ✓
 /// Regular chunks are unrestricted and spill freely to ineligible workers
 /// when eligible workers' remaining capacity is insufficient.
 #[test]
@@ -294,8 +294,7 @@ fn test_minimum_worker_version_filtering() {
 /// workers upgrade in batches: 20 -> 35 -> 50 -> 75 -> 100.
 /// R = floor(20 * 0.99) = 19, so we need ≥ 19 eligible workers in each step.
 ///
-/// At E=20 (first step), the per-worker versioned cap is 95% utilized
-/// (same stress level as test_minimum_worker_version_filtering).
+/// At E=20 (first step), f = 0.04 ≈ 0.2 * 20 / (100 * 0.99) = 0.0404 (99% of limit).
 /// When the pool grows from 20→35, each original worker loses up to ~43%
 /// of its restricted data. With restricted data at ~19% of capacity,
 /// per-worker reassignment is bounded by 0.43 * 0.19 ≈ 8% of capacity.
@@ -416,12 +415,10 @@ fn test_minimum_worker_version_insufficient_capacity() {
 /// would suffice without the cap).
 /// Scenario: 100 workers, 20 eligible, 99% saturation, 5% versioned chunks.
 /// Same framework as test_minimum_worker_version_filtering (M=20, R=19, E=20)
-/// but with versioned fraction just above the ~4.2% threshold.
+/// but with versioned fraction just above the threshold.
 ///
-/// R = floor(20 * 0.99) = 19 ≤ 20.
-/// Per-worker versioned cap = 0.2 * C = 0.2 * 0.2S = 0.04S.
-/// Total capped versioned capacity = 20 * 0.04S = 0.8S.
-/// Required: R * S_versioned = 19 * 0.05S = 0.95S > 0.8S (~19% over cap). Panics.
+/// R = floor(20 * 0.99) = 19 ≤ 20 ✓
+/// f = 0.05 > 0.2 * 20 / (100 * 0.99) = 0.0404 (~24% over limit). Panics.
 #[test]
 #[should_panic(expected = "No worker found for chunk")]
 fn test_minimum_worker_version_eligible_capacity_exceeded() {

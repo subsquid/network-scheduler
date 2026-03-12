@@ -24,6 +24,9 @@ const N_RINGS: usize = 6000;
 /// overloaded with restricted data, which would cause large reassignments
 /// when more workers upgrade. At 0.2, the worst-case reassignment when
 /// the eligible pool doubles is 10% of worker capacity.
+///
+/// The versioned data fraction must satisfy: f ≤ 0.2 * E / (N * s),
+/// where E = eligible workers, N = total workers, s = saturation.
 const MAX_VERSION_RESTRICTED_RATIO: f64 = 0.2;
 
 #[derive(Debug, Clone)]
