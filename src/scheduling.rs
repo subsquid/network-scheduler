@@ -19,16 +19,6 @@ type RingIndex = u16;
 
 const N_RINGS: usize = 6000;
 
-/// Maximum fraction of a worker's capacity that can be used for
-/// version-restricted chunks. This prevents eligible workers from being
-/// overloaded with restricted data, which would cause large reassignments
-/// when more workers upgrade. At 0.2, the worst-case reassignment when
-/// the eligible pool doubles is 10% of worker capacity.
-///
-/// The versioned data fraction must satisfy: f ≤ 0.2 * E / (N * s),
-/// where E = eligible workers, N = total workers, s = saturation.
-const MAX_VERSION_RESTRICTED_RATIO: f64 = 0.2;
-
 #[derive(Debug, Clone)]
 pub struct SchedulingConfig {
     pub worker_capacity: u64,
@@ -116,6 +106,8 @@ fn schedule_to_workers(
         workers.len() as u16,
     )?;
 
+    validate_version_restrictions(chunks, workers, config, &mapping);
+
     let chunks = chunks
         .iter()
         .map(|c| ReplicatedChunk {
@@ -137,6 +129,82 @@ fn schedule_to_workers(
         worker_chunks,
         replication_by_weight: mapping,
     })
+}
+
+/// Validates that version-restricted data can be scheduled within the
+/// saturation headroom. Only a single non-null `minimum_worker_version` value
+/// is allowed across all chunks. Two checks:
+/// 1. R ≤ E: replication factor must not exceed eligible worker count.
+/// 2. f ≤ (1-s) × E / (s × (N-E)): the extra load on eligible workers
+///    from restricted chunks must fit within the unused capacity fraction.
+fn validate_version_restrictions(
+    chunks: &[ScheduledChunk],
+    workers: &[&Worker],
+    config: &SchedulingConfig,
+    replication_by_weight: &BTreeMap<u16, u16>,
+) {
+    let total_size: u64 = chunks.iter().map(|c| c.size as u64).sum();
+    if total_size == 0 {
+        return;
+    }
+
+    // Collect the single allowed minimum_worker_version
+    let mut min_ver: Option<&Version> = None;
+    let mut s_restricted: u64 = 0;
+    let mut max_replication: u16 = 0;
+
+    for chunk in chunks {
+        if let Some(ref v) = chunk.minimum_worker_version {
+            if let Some(existing) = min_ver {
+                assert!(
+                    existing == v,
+                    "Multiple minimum_worker_version values found ({} and {}). \
+                     Only a single version restriction is supported.",
+                    existing,
+                    v,
+                );
+            } else {
+                min_ver = Some(v);
+            }
+            s_restricted += chunk.size as u64;
+            max_replication = max_replication.max(replication_by_weight[&chunk.weight]);
+        }
+    }
+
+    let Some(min_ver) = min_ver else { return };
+
+    let n = workers.len();
+    let s = config.saturation;
+    let e = workers
+        .iter()
+        .filter(|w| w.version.as_ref().is_some_and(|v| v >= min_ver))
+        .count();
+
+    assert!(
+        max_replication as usize <= e,
+        "Not enough eligible workers for version >= {}: \
+         replication factor {} exceeds {} eligible workers (need at least {})",
+        min_ver,
+        max_replication,
+        e,
+        max_replication,
+    );
+
+    if e < n {
+        let f = s_restricted as f64 / total_size as f64;
+        let threshold = (1.0 - s) * e as f64 / (s * (n - e) as f64);
+        assert!(
+            f <= threshold,
+            "Version-restricted data (>= {}) exceeds saturation headroom: \
+             f = {:.4} > {:.4} (E={}, N={}, s={})",
+            min_ver,
+            f,
+            threshold,
+            e,
+            n,
+            s,
+        );
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -239,17 +307,13 @@ fn assign_chunks(
     struct WorkerAssignment {
         chunks: Vec<ChunkIndex>,
         allocated: u64,
-        version_restricted_allocated: u64,
     }
-
-    let max_version_restricted = (MAX_VERSION_RESTRICTED_RATIO * worker_capacity as f64) as u64;
 
     let mut assignments: Vec<WorkerAssignment> = workers
         .iter()
         .map(|_| WorkerAssignment {
             chunks: Vec::new(),
             allocated: 0,
-            version_restricted_allocated: 0,
         })
         .collect();
     orderings
@@ -258,10 +322,8 @@ fn assign_chunks(
             let chunk = &chunks[chunk_index as usize];
             let ring = &rings[ring_index as usize];
             let first = first as usize;
-            let is_version_restricted = chunk.minimum_worker_version.is_some();
             let candidates = ring[first..].iter().chain(ring[..first].iter());
             for &(_, worker_index) in candidates {
-                // Check if this chunk requires a minimum worker version
                 if let Some(min_ver) = chunk.minimum_worker_version {
                     let worker_ver = &workers[worker_index as usize].version;
                     if !worker_ver.as_ref().is_some_and(|v| v >= min_ver) {
@@ -271,14 +333,6 @@ fn assign_chunks(
 
                 let assignment = &mut assignments[worker_index as usize];
 
-                // Cap version-restricted data per worker to limit reassignment churn
-                if is_version_restricted
-                    && assignment.version_restricted_allocated + chunk.size as u64
-                        > max_version_restricted
-                {
-                    continue;
-                }
-
                 if assignment.allocated + chunk.size as u64 <= worker_capacity
                     // Replicas of the same chunk stay adjacent after the stable sort
                     // (they share the same minimum_worker_version key), so checking
@@ -286,9 +340,6 @@ fn assign_chunks(
                     && assignment.chunks.last() != Some(&chunk_index)
                 {
                     assignment.allocated += chunk.size as u64;
-                    if is_version_restricted {
-                        assignment.version_restricted_allocated += chunk.size as u64;
-                    }
                     assignment.chunks.push(chunk_index);
                     return;
                 }
