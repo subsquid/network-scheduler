@@ -149,7 +149,7 @@ pub struct Config {
     /// This option can be used purely for local development to create http schemes
     /// with subdomain moved to the path-based routing
     #[serde(default)]
-    pub storage_allow_insecure_scheme: bool 
+    pub storage_allow_insecure_scheme: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -159,6 +159,11 @@ pub struct DatasetSegmentConfig {
 
     #[serde(default = "default_weight")]
     pub weight: ChunkWeight,
+
+    /// Minimum worker version required to serve chunks in this segment.
+    /// Workers with a version lower than this will not be assigned chunks from this segment.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub minimum_worker_version: Option<Version>,
 }
 
 impl Config {
@@ -177,6 +182,7 @@ impl Config {
                 ds.push(DatasetSegmentConfig {
                     from: 0,
                     weight: default_weight(),
+                    minimum_worker_version: None,
                 });
             }
         }

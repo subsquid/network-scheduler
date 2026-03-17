@@ -4,7 +4,7 @@ use itertools::Itertools;
 use libp2p_identity::PeerId;
 
 use crate::{
-    scheduling::WeightedChunk,
+    scheduling::ScheduledChunk,
     types::{Assignment, ChunkIndex},
 };
 
@@ -70,7 +70,7 @@ impl CompareResult {
 }
 
 pub fn compare_intersection(
-    chunks: &[WeightedChunk],
+    chunks: &[ScheduledChunk],
     assignment1: &Assignment,
     assignment2: &Assignment,
 ) -> CompareResult {
@@ -97,7 +97,7 @@ pub fn compare_intersection(
     result
 }
 
-fn calculate_size(chunks: &[WeightedChunk], indexes: impl Iterator<Item = ChunkIndex>) -> u64 {
+fn calculate_size(chunks: &[ScheduledChunk], indexes: impl Iterator<Item = ChunkIndex>) -> u64 {
     indexes
         .map(|chunk_index| chunks[chunk_index as usize].size as u64)
         .sum()

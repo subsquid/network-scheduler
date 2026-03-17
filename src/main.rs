@@ -59,7 +59,7 @@ async fn run_prod_mode(args: &cli::Args, config: cli::Config) -> anyhow::Result<
         .await?
         .load_new_chunks(Some(&db), &datasets_storage, CacheAccess::ReadWrite)
         .await?
-        .weight_chunks()
+        .prepare_chunks()
         // blocking the async executor is ok here because no other tasks are running
         .schedule()
 }
@@ -89,7 +89,7 @@ async fn run_cli_mode(args: &cli::Args, config: cli::Config) -> anyhow::Result<W
         .load_known_chunks_from_config(known_chunks)?
         .load_new_chunks(None, &datasets_storage, CacheAccess::_ReadOnly)
         .await?
-        .weight_chunks()
+        .prepare_chunks()
         // blocking the async executor is ok here because no other tasks are running
         .schedule()
 }

@@ -4,7 +4,7 @@ use rand::prelude::*;
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 
 use crate::{
-    scheduling::WeightedChunk,
+    scheduling::ScheduledChunk,
     types::{ChunkIndex, ChunkWeight, Worker, WorkerIndex, WorkerStatus},
 };
 
@@ -13,7 +13,7 @@ pub fn generate_input(
     n_workers: WorkerIndex,
     n_chunks: ChunkIndex,
     weights: &[ChunkWeight],
-) -> (Vec<WeightedChunk>, Vec<Worker>, u64) {
+) -> (Vec<ScheduledChunk>, Vec<Worker>, u64) {
     println!("Generating input");
     let chunks = generate_chunks(n_chunks, weights);
     let workers = generate_workers(n_workers)
@@ -21,6 +21,7 @@ pub fn generate_input(
         .map(|id| Worker {
             id,
             status: WorkerStatus::Online,
+            version: None,
         })
         .collect_vec();
     let total_size: u64 = chunks.iter().map(|chunk| chunk.size as u64).sum();
@@ -34,7 +35,7 @@ pub fn generate_input(
     (chunks, workers, total_size)
 }
 
-pub fn generate_chunks(n: ChunkIndex, weights: &[ChunkWeight]) -> Vec<WeightedChunk> {
+pub fn generate_chunks(n: ChunkIndex, weights: &[ChunkWeight]) -> Vec<ScheduledChunk> {
     const MAX_CHUNK_SIZE: u32 = 200 << 20; // 200MB
 
     (0..n)
@@ -46,10 +47,11 @@ pub fn generate_chunks(n: ChunkIndex, weights: &[ChunkWeight]) -> Vec<WeightedCh
                 i + 1,
                 i
             );
-            WeightedChunk {
+            ScheduledChunk {
                 id,
                 size: rand::rng().random_range(0..MAX_CHUNK_SIZE),
                 weight: *weights.choose(&mut rand::rng()).unwrap(),
+                minimum_worker_version: None,
             }
         })
         .collect()

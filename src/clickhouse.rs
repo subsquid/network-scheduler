@@ -92,11 +92,12 @@ impl ClickhouseClient {
                     continue;
                 }
             };
+            let parsed_version = Version::from_str(&row.version).ok();
             let mut status = WorkerStatus::Online;
             if row.stored_bytes < stale_threshold {
                 status = WorkerStatus::Stale;
             }
-            if !Version::from_str(&row.version).is_ok_and(|ver| ver >= *min_version) {
+            if !parsed_version.as_ref().is_some_and(|ver| ver >= min_version) {
                 status = WorkerStatus::UnsupportedVersion;
             }
             if row.timestamp < inactive_threshold {
@@ -105,6 +106,7 @@ impl ClickhouseClient {
             results.push(Worker {
                 id: peer_id,
                 status,
+                version: parsed_version,
             });
         }
 
