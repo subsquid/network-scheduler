@@ -9,6 +9,7 @@ pub struct SchedulingStatus {
     pub workers: Vec<Worker>,
     pub datasets: Vec<Dataset>,
     pub assignment_timestamp_sec: u64,
+    pub effective_from: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]

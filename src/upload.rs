@@ -127,6 +127,11 @@ impl Uploader {
         workers: Vec<Worker>,
         datasets: Vec<Dataset>,
     ) -> anyhow::Result<()> {
+        let system_time = std::time::SystemTime::now();
+        let effective_from = (system_time.duration_since(std::time::UNIX_EPOCH).unwrap()
+            + self.config.assignment_delay)
+            .as_secs();
+
         let status = SchedulingStatus {
             config: SchedulingStatusConfig {
                 supported_worker_versions: format!(
@@ -139,6 +144,7 @@ impl Uploader {
                 ),
             },
             assignment_timestamp_sec: self.time.timestamp() as u64,
+            effective_from,
             workers,
             datasets,
         };
