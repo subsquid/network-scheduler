@@ -97,7 +97,7 @@ impl ClickhouseClient {
             if row.stored_bytes < stale_threshold {
                 status = WorkerStatus::Stale;
             }
-            if !parsed_version.as_ref().is_some_and(|ver| ver >= min_version) {
+            if parsed_version.as_ref().is_none_or(|ver| ver < min_version) {
                 status = WorkerStatus::UnsupportedVersion;
             }
             if row.timestamp < inactive_threshold {
@@ -222,8 +222,8 @@ impl From<Chunk> for ChunkRow {
             id: chunk.id,
             size: chunk.size as u64,
             files: chunk.files.join(","),
-            last_block_hash: last_block_hash,
-            last_block_timestamp: last_block_timestamp,
+            last_block_hash,
+            last_block_timestamp,
         }
     }
 }
@@ -277,7 +277,7 @@ mod test {
             .await
             .expect("Cannot store chunks");
 
-        let datasets = vec![dataset.to_string()];
+        let datasets = [dataset.to_string()];
         let chunks_of_dataset = client
             .get_existing_chunks(datasets.iter().map(|d| d.as_str()))
             .await

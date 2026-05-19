@@ -44,7 +44,7 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("Done");
     Ok(())
 }
-        
+
 async fn run_prod_mode(args: &cli::Args, config: cli::Config) -> anyhow::Result<WithAssignment> {
     let db = clickhouse::ClickhouseClient::new(&args.clickhouse)
         .await
@@ -70,8 +70,8 @@ async fn run_cli_mode(args: &cli::Args, config: cli::Config) -> anyhow::Result<W
         .as_ref()
         .context("CLI state file required for cli mode")?;
 
-    let cli_state = cli_state::CliState::load(state_file)
-        .context("Failed to load CLI state file")?;
+    let cli_state =
+        cli_state::CliState::load(state_file).context("Failed to load CLI state file")?;
 
     let known_chunks = cli_state.to_chunks()?;
     let workers = cli_state.workers;

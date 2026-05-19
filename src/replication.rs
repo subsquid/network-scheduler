@@ -14,15 +14,16 @@ pub fn calc_replication_factors(
     size_by_weight: BTreeMap<ChunkWeight, u64>,
     capacity: u64,
     min_replication: u16,
-    max_replication: u16
+    max_replication: u16,
 ) -> Result<BTreeMap<ChunkWeight, ReplicationFactor>, ReplicationError> {
-    tracing::debug!("{:?} {:?} {:?} {:?}",
-                    size_by_weight.iter().collect::<Vec<_>>(),
-                    capacity,
-                    min_replication,
-                    max_replication
+    tracing::debug!(
+        "{:?} {:?} {:?} {:?}",
+        size_by_weight.iter().collect::<Vec<_>>(),
+        capacity,
+        min_replication,
+        max_replication
     );
-    
+
     let total_size: u64 = size_by_weight.values().sum();
     if total_size * min_replication as u64 > capacity {
         return Err(ReplicationError::NotEnoughCapacity);
@@ -71,7 +72,7 @@ pub enum ReplicationError {
 
 #[test]
 fn test_replication() {
-    // Just setting this temporarily. 
+    // Just setting this temporarily.
     let max_replication_factor = 1200;
     let size_by_weight: BTreeMap<_, _> = [(1, 4), (2, 1), (6, 1), (12, 1)].into_iter().collect();
     assert!(matches!(
@@ -119,7 +120,8 @@ fn test_replication() {
         (2400, [100, 200, 600, 1200]),
     ] {
         let replication_factors =
-            calc_replication_factors(size_by_weight.clone(), capacity, 2, max_replication_factor).unwrap();
+            calc_replication_factors(size_by_weight.clone(), capacity, 2, max_replication_factor)
+                .unwrap();
         assert_eq!(
             replication_factors.values().copied().collect::<Vec<_>>(),
             expected,
