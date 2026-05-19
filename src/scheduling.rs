@@ -326,7 +326,7 @@ fn assign_chunks(
             for &(_, worker_index) in candidates {
                 if let Some(min_ver) = chunk.minimum_worker_version {
                     let worker_ver = &workers[worker_index as usize].version;
-                    if !worker_ver.as_ref().is_some_and(|v| v >= min_ver) {
+                    if worker_ver.as_ref().is_none_or(|v| v < min_ver) {
                         continue;
                     }
                 }

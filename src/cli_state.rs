@@ -26,11 +26,9 @@ pub struct ChunkConfig {
 impl CliState {
     /// Load CLI state from a YAML or JSON file
     pub fn load(path: &Path) -> Result<Self> {
-        let content =
-            std::fs::read_to_string(path).context("Failed to read CLI state file")?;
+        let content = std::fs::read_to_string(path).context("Failed to read CLI state file")?;
 
-        serde_yaml::from_str(&content)
-            .context("Failed to parse CLI state file")
+        serde_yaml::from_str(&content).context("Failed to parse CLI state file")
     }
 
     /// Convert chunk configs to Chunk types grouped by dataset
@@ -42,16 +40,12 @@ impl CliState {
             let chunks: Vec<Chunk> = chunk_configs
                 .iter()
                 .map(|cc| {
-                    Chunk::new(
-                        dataset.clone(),
-                        cc.id.clone(),
-                        cc.size,
-                        cc.files.clone(),
+                    Chunk::new(dataset.clone(), cc.id.clone(), cc.size, cc.files.clone()).map(
+                        |mut chunk| {
+                            chunk.summary = cc.summary.clone();
+                            chunk
+                        },
                     )
-                    .map(|mut chunk| {
-                        chunk.summary = cc.summary.clone();
-                        chunk
-                    })
                 })
                 .collect::<Result<Vec<_>>>()?;
 

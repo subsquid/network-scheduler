@@ -42,10 +42,7 @@ impl Controller {
     }
 
     /// Load workers from a static configuration (CLI mode)
-    pub fn load_workers_from_config(
-        self,
-        workers: Vec<types::Worker>,
-    ) -> WithWorkers {
+    pub fn load_workers_from_config(self, workers: Vec<types::Worker>) -> WithWorkers {
         tracing::info!("Loaded {} workers from config", workers.len());
 
         WithWorkers {

@@ -84,14 +84,14 @@ pub fn compare_intersection(
         let removed_chunks = chunks1.difference(&chunks2).copied().collect_vec();
         let added_chunks = chunks2.difference(&chunks1).copied().collect_vec();
 
-        let removed = calculate_size(&chunks, removed_chunks.iter().copied());
-        let added = calculate_size(&chunks, added_chunks.iter().copied());
-        let before = calculate_size(&chunks, chunks1.iter().copied());
-        let after = calculate_size(&chunks, chunks2.iter().copied());
-        result.removed.insert(worker_id.clone(), removed);
-        result.added.insert(worker_id.clone(), added);
-        result.before.insert(worker_id.clone(), before);
-        result.after.insert(worker_id.clone(), after);
+        let removed = calculate_size(chunks, removed_chunks.iter().copied());
+        let added = calculate_size(chunks, added_chunks.iter().copied());
+        let before = calculate_size(chunks, chunks1.iter().copied());
+        let after = calculate_size(chunks, chunks2.iter().copied());
+        result.removed.insert(*worker_id, removed);
+        result.added.insert(*worker_id, added);
+        result.before.insert(*worker_id, before);
+        result.after.insert(*worker_id, after);
     }
 
     result

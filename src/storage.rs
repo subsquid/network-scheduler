@@ -25,7 +25,7 @@ impl S3Storage {
         let s3_config = aws_sdk_s3::config::Builder::from(sdk_config)
             .force_path_style(true)
             .build();
-        
+
         let client = s3::Client::from_conf(s3_config);
         Self { client }
     }

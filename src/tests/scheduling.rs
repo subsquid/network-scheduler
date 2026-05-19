@@ -70,7 +70,7 @@ fn test_scheduling_uniform() {
     let mut sizes: Vec<u64> = vec![0; workers.len()];
     for (worker_index, chunk_indexes) in assignment.worker_chunks.into_values().enumerate() {
         for chunk_index in chunk_indexes {
-            sizes[worker_index as usize] += chunks[chunk_index as usize].size as u64;
+            sizes[worker_index] += chunks[chunk_index as usize].size as u64;
         }
     }
     let stats = Stats::new(sizes.iter().copied());
@@ -261,7 +261,7 @@ fn test_minimum_worker_version_filtering() {
     // Versioned chunks must only be assigned to eligible workers
     for (worker_id, chunk_indexes) in &assignment.worker_chunks {
         if !eligible_ids.contains(worker_id) {
-            let has_versioned = chunk_indexes.iter().any(|&i| (i as u32) < N_VERSIONED);
+            let has_versioned = chunk_indexes.iter().any(|&i| i < N_VERSIONED);
             assert!(
                 !has_versioned,
                 "Ineligible worker {:?} was assigned version-restricted chunks",
@@ -275,7 +275,7 @@ fn test_minimum_worker_version_filtering() {
         let versioned_count = assignment
             .worker_chunks
             .get(worker_id)
-            .map(|idxs| idxs.iter().filter(|&&i| (i as u32) < N_VERSIONED).count())
+            .map(|idxs| idxs.iter().filter(|&&i| i < N_VERSIONED).count())
             .unwrap_or(0);
         assert!(
             versioned_count > 0,
@@ -347,8 +347,8 @@ fn test_minimum_worker_version_unrestricted_spill() {
         let mut map: BTreeMap<u32, std::collections::BTreeSet<PeerId>> = BTreeMap::new();
         for (&worker_id, chunk_indexes) in &assignment.worker_chunks {
             for &idx in chunk_indexes {
-                if idx as u32 >= N_VERSIONED {
-                    map.entry(idx as u32).or_default().insert(worker_id);
+                if idx >= N_VERSIONED {
+                    map.entry(idx).or_default().insert(worker_id);
                 }
             }
         }
@@ -360,7 +360,7 @@ fn test_minimum_worker_version_unrestricted_spill() {
     let mut changed_replicas: u64 = 0;
     let mut total_replicas: u64 = 0;
     for i in N_VERSIONED..N_CHUNKS {
-        let idx = i as u32;
+        let idx = i;
         let workers_a = restricted_map.get(&idx).cloned().unwrap_or_default();
         let workers_b = baseline_map.get(&idx).cloned().unwrap_or_default();
         let changed = workers_a.symmetric_difference(&workers_b).count() as u64 / 2;
@@ -562,6 +562,7 @@ fn test_minimum_worker_version_eligible_capacity_exceeded() {
 /// all workers have upgraded. Compares:
 /// - Schedule with minimum_worker_version set and all workers eligible
 /// - Schedule with minimum_worker_version removed (None)
+///
 /// With all workers eligible, the version check is a no-op. The only difference
 /// is the sort order, but since s=0.95 leaves ample headroom, no worker hits
 /// capacity — so processing order doesn't affect which worker each chunk lands on.
@@ -610,7 +611,8 @@ fn test_minimum_worker_version_no_reassignment_on_removal() {
         total_removed == 0 && total_added == 0,
         "Expected zero churn when removing restriction with all workers upgraded, \
          but got removed = {}, added = {}",
-        total_removed, total_added,
+        total_removed,
+        total_added,
     );
 }
 

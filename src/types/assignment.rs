@@ -53,13 +53,13 @@ impl Assignment {
             .min();
 
         let min_bytes_per_worker = config.worker_stale_bytes;
-        if let Some(min) = min {
-            if min < min_bytes_per_worker {
-                tracing::warn!(
-                    "Some workers have less than the minimum required storage: {min} < {min_bytes_per_worker}"
-                );
-                crate::metrics::failure("min_assignment");
-            }
+        if let Some(min) = min
+            && min < min_bytes_per_worker
+        {
+            tracing::warn!(
+                "Some workers have less than the minimum required storage: {min} < {min_bytes_per_worker}"
+            );
+            crate::metrics::failure("min_assignment");
         }
 
         crate::metrics::report_replication_factors(config.datasets.iter().map(|(ds, segments)| {
