@@ -1,7 +1,6 @@
 /// A utility program to test the impact of last block hash in the assignment.
 /// To use run:
 /// cargo run -p clear-block-hash -- -c config.yaml input.fb output.fb
-
 use std::{
     collections::BTreeMap,
     io::{Read, Write},
