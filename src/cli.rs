@@ -151,6 +151,7 @@ pub struct Config {
     #[serde(default)]
     pub storage_allow_insecure_scheme: bool,
 
+    /// When provided the hash for the chunk will be set to empty string
     #[serde(default)]
     pub clear_last_block_hash: bool,
 }

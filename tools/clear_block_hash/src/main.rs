@@ -1,3 +1,7 @@
+/// A utility program to test the impact of last block hash in the assignment.
+/// To use run:
+/// cargo run -p clear-block-hash -- -c config.yaml input.fb output.fb
+
 use std::{
     collections::BTreeMap,
     io::{Read, Write},
@@ -25,7 +29,7 @@ pub struct Args {
     pub output: PathBuf,
 
     /// Scheduler config file (same one used to produce the assignment)
-    #[arg(long, short, default_value = "tools/clear_block_hash/config.yaml")]
+    #[arg(long, short)]
     pub config: PathBuf,
 }
 
