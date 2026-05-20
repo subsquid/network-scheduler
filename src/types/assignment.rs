@@ -120,14 +120,10 @@ impl Assignment {
                 .worker_indexes(&worker_ids)
                 .files(&chunk.files);
             if let Some(summary) = chunk.summary.as_ref() {
-                let hash = if config.clear_last_block_hash {
-                    ""
-                } else {
-                    &summary.last_block_hash
-                };
-                builder = builder
-                    .last_block_hash(hash)
-                    .last_block_timestamp(summary.last_block_timestamp);
+                if !config.clear_last_block_hash {
+                    builder = builder.last_block_hash(&summary.last_block_hash);
+                }
+                builder = builder.last_block_timestamp(summary.last_block_timestamp);
             }
             if let Err(e) = builder.finish() {
                 if config.strict_continuity_check {
