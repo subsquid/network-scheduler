@@ -150,6 +150,9 @@ pub struct Config {
     /// with subdomain moved to the path-based routing
     #[serde(default)]
     pub storage_allow_insecure_scheme: bool,
+
+    #[serde(default)]
+    pub clear_last_block_hash: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

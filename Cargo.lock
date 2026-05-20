@@ -970,7 +970,9 @@ version = "0.0.1"
 dependencies = [
  "anyhow",
  "clap",
+ "flate2",
  "libp2p-identity",
+ "network-scheduler",
  "sqd-assignments 0.1.0",
 ]
 

@@ -6,5 +6,7 @@ edition = "2024"
 [dependencies]
 anyhow = "1.0.98"
 clap = { version = "4.5.38", features = ["derive", "env"] }
-sqd-assignments = { git = "https://github.com/subsquid/sqd-network.git", rev = "fa19681", features = ["reader", "builder"] }
+flate2 = "1.1.1"
+network-scheduler = { path = "../.." }
+sqd-assignments = { git = "https://github.com/subsquid/sqd-network.git", rev = "fa19681", features = ["reader"] }
 libp2p-identity = { version = "0.2.10", features = ["peerid"] }

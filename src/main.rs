@@ -1,27 +1,12 @@
 use anyhow::Context;
 use clap::Parser;
 
-use crate::controller::{CacheAccess, Controller, WithAssignment};
-
-mod cli;
-mod cli_state;
-mod clickhouse;
-mod controller;
-mod metrics;
-mod parquet;
-mod pool;
-mod replication;
-mod scheduling;
-mod storage;
-#[cfg(test)]
-mod tests;
-mod types;
-mod upload;
-mod weight;
+use network_scheduler::controller::{CacheAccess, Controller, WithAssignment};
+use network_scheduler::{cli, metrics, storage, upload};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let _timer = crate::metrics::Timer::new("process");
+    let _timer = metrics::Timer::new("process");
 
     dotenv::dotenv().ok();
     let args = cli::Args::parse();
@@ -46,7 +31,7 @@ async fn main() -> anyhow::Result<()> {
 }
 
 async fn run_prod_mode(args: &cli::Args, config: cli::Config) -> anyhow::Result<WithAssignment> {
-    let db = clickhouse::ClickhouseClient::new(&args.clickhouse)
+    let db = network_scheduler::clickhouse::ClickhouseClient::new(&args.clickhouse)
         .await
         .context("Can't connect to ClickHouse")?;
 
@@ -70,8 +55,8 @@ async fn run_cli_mode(args: &cli::Args, config: cli::Config) -> anyhow::Result<W
         .as_ref()
         .context("CLI state file required for cli mode")?;
 
-    let cli_state =
-        cli_state::CliState::load(state_file).context("Failed to load CLI state file")?;
+    let cli_state = network_scheduler::cli_state::CliState::load(state_file)
+        .context("Failed to load CLI state file")?;
 
     let known_chunks = cli_state.to_chunks()?;
     let workers = cli_state.workers;
