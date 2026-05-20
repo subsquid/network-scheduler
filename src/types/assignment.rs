@@ -178,10 +178,36 @@ impl Assignment {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
     use super::*;
     use crate::types::ChunkSummary;
+
+    fn test_config() -> cli::Config {
+        cli::Config {
+            datasets: BTreeMap::new(),
+            worker_inactive_timeout: Duration::from_secs(600),
+            ignore_reliability: false,
+            worker_storage_bytes: 0,
+            worker_stale_bytes: 0,
+            min_replication: 1,
+            saturation: 0.99,
+            network: "test".to_string(),
+            storage_domain: "test.io".to_string(),
+            network_state_name: "test.json".to_string(),
+            network_state_url: "https://test.io".to_string(),
+            scheduler_state_bucket: "test".to_string(),
+            cloudflare_storage_secret: "secret".to_string(),
+            min_supported_worker_version: "2.0.0".parse().unwrap(),
+            min_recommended_worker_version: "2.0.0".parse().unwrap(),
+            assignment_delay: Duration::from_secs(60),
+            assignment_ttl: Duration::from_secs(86400),
+            concurrent_dataset_downloads: 1,
+            strict_continuity_check: false,
+            storage_allow_insecure_scheme: false,
+            clear_last_block_hash: false,
+        }
+    }
 
     fn make_worker() -> PeerId {
         libp2p_identity::Keypair::generate_ed25519()
@@ -240,7 +266,7 @@ mod tests {
         }];
 
         // With clear_last_block_hash: only last chunk per dataset keeps the hash
-        let mut config = crate::tests::test_config();
+        let mut config = test_config();
         config.clear_last_block_hash = true;
         let fb_bytes = assignment.encode_fb(&chunks, &config, &workers, FbVersion::V1);
         let hashes = read_chunk_hashes(&fb_bytes);
@@ -252,7 +278,7 @@ mod tests {
         assert_eq!(hashes[4].1, Some("hash_b2".to_string()));
 
         // Without clear_last_block_hash: all hashes preserved
-        let mut config = crate::tests::test_config();
+        let mut config = test_config();
         config.clear_last_block_hash = false;
         let fb_bytes = assignment.encode_fb(&chunks, &config, &workers, FbVersion::V1);
         let hashes = read_chunk_hashes(&fb_bytes);
