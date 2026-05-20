@@ -189,10 +189,11 @@ mod tests {
             .to_peer_id()
     }
 
-    fn make_chunk(dataset: &str, id: &str, first: u64, last: u64, hash: &str) -> Chunk {
+    fn make_chunk(dataset: &str, first: u64, last: u64, hash: &str) -> Chunk {
+        let id = format!("{first:010}/{first:010}-{last:010}-{:08x}", first as u32);
         Chunk {
             dataset: Arc::new(dataset.to_string()),
-            id: id.to_string(),
+            id,
             size: 1000,
             blocks: first..=last,
             files: Arc::new(vec!["file.parquet".to_string()]),
@@ -221,11 +222,11 @@ mod tests {
     fn clear_last_block_hash_keeps_last_chunk_per_dataset() {
         let worker = make_worker();
         let chunks = vec![
-            make_chunk("s3://dataset-a", "0000000000/0000000000-0000000099-00000000", 0, 99, "hash_a1"),
-            make_chunk("s3://dataset-a", "0000000100/0000000100-0000000199-00000001", 100, 199, "hash_a2"),
-            make_chunk("s3://dataset-a", "0000000200/0000000200-0000000299-00000002", 200, 299, "hash_a3"),
-            make_chunk("s3://dataset-b", "0000000000/0000000000-0000000099-00000000", 0, 99, "hash_b1"),
-            make_chunk("s3://dataset-b", "0000000100/0000000100-0000000199-00000001", 100, 199, "hash_b2"),
+            make_chunk("s3://dataset-a", 0, 99, "hash_a1"),
+            make_chunk("s3://dataset-a", 100, 199, "hash_a2"),
+            make_chunk("s3://dataset-a", 200, 299, "hash_a3"),
+            make_chunk("s3://dataset-b", 0, 99, "hash_b1"),
+            make_chunk("s3://dataset-b", 100, 199, "hash_b2"),
         ];
 
         let assignment = Assignment {
