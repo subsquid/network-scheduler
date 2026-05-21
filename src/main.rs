@@ -12,6 +12,11 @@ async fn main() -> anyhow::Result<()> {
     let args = cli::Args::parse();
     setup_tracing(&args);
     let config = cli::Config::load(&args.config).context("Can't parse config")?;
+    tracing::info!(
+        "Scheduler configuration:\n{}",
+        serde_yaml::to_string(&config)
+            .unwrap_or_else(|e| format!("<failed to serialize config: {e}>"))
+    );
     let metrics_registry = metrics::register_metrics(config.network.clone());
 
     let controller = match args.mode {
