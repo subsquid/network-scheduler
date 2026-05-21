@@ -6,6 +6,7 @@ use std::{
 
 use anyhow::ensure;
 use clap::Parser;
+use secrecy::{ExposeSecret, SecretString};
 use semver::Version;
 use serde::{Deserialize, Serialize};
 use serde_with::{DurationSeconds, serde_as};
@@ -124,7 +125,7 @@ pub struct Config {
     pub scheduler_state_bucket: String,
 
     #[serde(skip_serializing)]
-    pub cloudflare_storage_secret: String,
+    pub cloudflare_storage_secret: CloudflareSecret,
 
     #[serde(default = "default_min_worker_version")]
     pub min_supported_worker_version: Version,
@@ -235,4 +236,27 @@ fn default_weight() -> ChunkWeight {
 
 fn default_concurrent_downloads() -> usize {
     20
+}
+
+/// Newtype to give `SecretString` a `Clone` impl, so `Config` can derive `Clone`.
+#[derive(Debug, Deserialize)]
+#[serde(transparent)]
+pub struct CloudflareSecret(SecretString);
+
+impl Clone for CloudflareSecret {
+    fn clone(&self) -> Self {
+        Self(SecretString::from(self.0.expose_secret().to_owned()))
+    }
+}
+
+impl CloudflareSecret {
+    pub fn expose_secret(&self) -> &str {
+        self.0.expose_secret()
+    }
+}
+
+impl From<String> for CloudflareSecret {
+    fn from(s: String) -> Self {
+        Self(SecretString::from(s))
+    }
 }

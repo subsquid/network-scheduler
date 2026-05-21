@@ -90,9 +90,10 @@ impl Assignment {
             "each chunk must have at least one worker assigned"
         );
 
-        let mut assignment_builder =
-            sqd_assignments::AssignmentBuilder::new(&config.cloudflare_storage_secret)
-                .check_continuity(config.strict_continuity_check);
+        let mut assignment_builder = sqd_assignments::AssignmentBuilder::new(
+            config.cloudflare_storage_secret.expose_secret(),
+        )
+        .check_continuity(config.strict_continuity_check);
 
         let mut prev_dataset = None;
         let mut iter = chunks.iter().zip(assigned_worker_ids).peekable();
@@ -197,7 +198,7 @@ mod tests {
             network_state_name: "test.json".to_string(),
             network_state_url: "https://test.io".to_string(),
             scheduler_state_bucket: "test".to_string(),
-            cloudflare_storage_secret: "secret".to_string(),
+            cloudflare_storage_secret: "secret".to_owned().into(),
             min_supported_worker_version: "2.0.0".parse().unwrap(),
             min_recommended_worker_version: "2.0.0".parse().unwrap(),
             assignment_delay: Duration::from_secs(60),
