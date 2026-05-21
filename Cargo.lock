@@ -965,6 +965,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f46ad14479a25103f283c0f10005961cf086d8dc42205bb44c46ac563475dca6"
 
 [[package]]
+name = "clear-block-hash"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "clap",
+ "flate2",
+ "libp2p-identity",
+ "network-scheduler",
+ "sqd-assignments 0.1.0",
+]
+
+[[package]]
 name = "clickhouse"
 version = "0.13.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3630,6 +3642,7 @@ dependencies = [
  "flatbuffers 25.2.10",
  "hmac",
  "libp2p-identity",
+ "ouroboros",
  "serde",
  "serde_json",
  "sha2",

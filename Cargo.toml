@@ -1,5 +1,5 @@
 [workspace]
-members = ["tools/compare_fb"]
+members = ["tools/compare_fb", "tools/clear_block_hash"]
 
 [package]
 name = "network-scheduler"
@@ -34,7 +34,7 @@ serde_with = "3.12.0"
 serde_yaml = "0.9.34"
 sha2 = "0.10.9"
 sqd-messages = { git = "https://github.com/subsquid/sqd-network.git", rev = "fa19681" }
-sqd-assignments = { git = "https://github.com/subsquid/sqd-network.git", rev = "fa19681", features = ["builder"] }
+sqd-assignments = { git = "https://github.com/subsquid/sqd-network.git", rev = "fa19681", features = ["builder", "reader"] }
 tempfile = "3.20.0"
 thiserror = "2.0.12"
 tokio = { version = "1.45.0", features = ["full"] }

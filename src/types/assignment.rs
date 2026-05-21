@@ -95,7 +95,8 @@ impl Assignment {
                 .check_continuity(config.strict_continuity_check);
 
         let mut prev_dataset = None;
-        for (chunk, worker_ids) in chunks.iter().zip(assigned_worker_ids) {
+        let mut iter = chunks.iter().zip(assigned_worker_ids).peekable();
+        while let Some((chunk, worker_ids)) = iter.next() {
             if prev_dataset
                 .as_ref()
                 .is_some_and(|prev| prev != &chunk.dataset)
@@ -104,6 +105,10 @@ impl Assignment {
                 assignment_builder.finish_dataset();
             }
             prev_dataset = Some(chunk.dataset.clone());
+
+            let is_last_in_dataset = iter
+                .peek()
+                .map_or(true, |(next, _)| next.dataset != chunk.dataset);
 
             let download_url = if config.storage_allow_insecure_scheme {
                 format!("http://{}/{}/", config.storage_domain, chunk.bucket())
@@ -120,9 +125,10 @@ impl Assignment {
                 .worker_indexes(&worker_ids)
                 .files(&chunk.files);
             if let Some(summary) = chunk.summary.as_ref() {
-                builder = builder
-                    .last_block_hash(&summary.last_block_hash)
-                    .last_block_timestamp(summary.last_block_timestamp);
+                if !config.clear_last_block_hash || is_last_in_dataset {
+                    builder = builder.last_block_hash(&summary.last_block_hash);
+                }
+                builder = builder.last_block_timestamp(summary.last_block_timestamp);
             }
             if let Err(e) = builder.finish() {
                 if config.strict_continuity_check {
@@ -167,5 +173,120 @@ impl Assignment {
             }
         }
         result
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{collections::BTreeMap, sync::Arc, time::Duration};
+
+    use super::*;
+    use crate::types::ChunkSummary;
+
+    fn test_config() -> cli::Config {
+        cli::Config {
+            datasets: BTreeMap::new(),
+            worker_inactive_timeout: Duration::from_secs(600),
+            ignore_reliability: false,
+            worker_storage_bytes: 0,
+            worker_stale_bytes: 0,
+            min_replication: 1,
+            saturation: 0.99,
+            network: "test".to_string(),
+            storage_domain: "test.io".to_string(),
+            network_state_name: "test.json".to_string(),
+            network_state_url: "https://test.io".to_string(),
+            scheduler_state_bucket: "test".to_string(),
+            cloudflare_storage_secret: "secret".to_string(),
+            min_supported_worker_version: "2.0.0".parse().unwrap(),
+            min_recommended_worker_version: "2.0.0".parse().unwrap(),
+            assignment_delay: Duration::from_secs(60),
+            assignment_ttl: Duration::from_secs(86400),
+            concurrent_dataset_downloads: 1,
+            strict_continuity_check: false,
+            storage_allow_insecure_scheme: false,
+            clear_last_block_hash: false,
+        }
+    }
+
+    fn make_worker() -> PeerId {
+        libp2p_identity::Keypair::generate_ed25519()
+            .public()
+            .to_peer_id()
+    }
+
+    fn make_chunk(dataset: &str, first: u64, last: u64, hash: &str) -> Chunk {
+        let id = format!("{first:010}/{first:010}-{last:010}-{:08x}", first as u32);
+        Chunk {
+            dataset: Arc::new(dataset.to_string()),
+            id,
+            size: 1000,
+            blocks: first..=last,
+            files: Arc::new(vec!["file.parquet".to_string()]),
+            summary: Some(ChunkSummary {
+                last_block_hash: hash.to_string(),
+                last_block_timestamp: 1000,
+            }),
+        }
+    }
+
+    fn read_chunk_hashes(fb_bytes: &[u8]) -> Vec<(String, Option<String>)> {
+        let fb = sqd_assignments::Assignment::from_owned_unchecked(fb_bytes.to_vec());
+        let mut result = Vec::new();
+        for dataset in fb.datasets() {
+            for chunk in dataset.chunks() {
+                result.push((
+                    chunk.id().to_string(),
+                    chunk.last_block_hash().map(|s| s.to_string()),
+                ));
+            }
+        }
+        result
+    }
+
+    #[test]
+    fn clear_last_block_hash_keeps_last_chunk_per_dataset() {
+        let worker = make_worker();
+        let chunks = vec![
+            make_chunk("s3://dataset-a", 0, 99, "hash_a1"),
+            make_chunk("s3://dataset-a", 100, 199, "hash_a2"),
+            make_chunk("s3://dataset-a", 200, 299, "hash_a3"),
+            make_chunk("s3://dataset-b", 0, 99, "hash_b1"),
+            make_chunk("s3://dataset-b", 100, 199, "hash_b2"),
+        ];
+
+        let assignment = Assignment {
+            worker_chunks: BTreeMap::from([(worker, vec![0, 1, 2, 3, 4])]),
+            replication_by_weight: BTreeMap::new(),
+        };
+        let workers = vec![Worker {
+            id: worker,
+            status: WorkerStatus::Online,
+            version: None,
+        }];
+
+        // With clear_last_block_hash: only last chunk per dataset keeps the hash
+        let mut config = test_config();
+        config.clear_last_block_hash = true;
+        let fb_bytes = assignment.encode_fb(&chunks, &config, &workers, FbVersion::V1);
+        let hashes = read_chunk_hashes(&fb_bytes);
+
+        assert_eq!(hashes[0].1, None);
+        assert_eq!(hashes[1].1, None);
+        assert_eq!(hashes[2].1, Some("hash_a3".to_string()));
+        assert_eq!(hashes[3].1, None);
+        assert_eq!(hashes[4].1, Some("hash_b2".to_string()));
+
+        // Without clear_last_block_hash: all hashes preserved
+        let mut config = test_config();
+        config.clear_last_block_hash = false;
+        let fb_bytes = assignment.encode_fb(&chunks, &config, &workers, FbVersion::V1);
+        let hashes = read_chunk_hashes(&fb_bytes);
+
+        assert_eq!(hashes[0].1, Some("hash_a1".to_string()));
+        assert_eq!(hashes[1].1, Some("hash_a2".to_string()));
+        assert_eq!(hashes[2].1, Some("hash_a3".to_string()));
+        assert_eq!(hashes[3].1, Some("hash_b1".to_string()));
+        assert_eq!(hashes[4].1, Some("hash_b2".to_string()));
     }
 }

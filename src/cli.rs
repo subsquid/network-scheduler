@@ -150,6 +150,10 @@ pub struct Config {
     /// with subdomain moved to the path-based routing
     #[serde(default)]
     pub storage_allow_insecure_scheme: bool,
+
+    /// When provided all the hashes except for the head of the dataset will be set to None
+    #[serde(default)]
+    pub clear_last_block_hash: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
