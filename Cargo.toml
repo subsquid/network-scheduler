@@ -1,5 +1,5 @@
 [workspace]
-members = ["tools/compare_fb", "tools/clear_block_hash"]
+members = ["tools/compare_fb", "tools/clear_block_hash", "tools/reshuffle_sim"]
 
 [package]
 name = "network-scheduler"
