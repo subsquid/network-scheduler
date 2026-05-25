@@ -7,7 +7,7 @@ use super::BlockNumber;
 #[derive(Debug, Clone, PartialEq)]
 pub struct Chunk {
     pub dataset: Arc<String>,
-    pub id: String,
+    pub id: Arc<String>,
     pub size: u32,
     pub blocks: RangeInclusive<BlockNumber>,
     pub files: Arc<Vec<String>>,
@@ -30,7 +30,7 @@ impl Chunk {
         }
         Ok(Self {
             dataset,
-            id,
+            id: Arc::new(id),
             files,
             blocks: chunk.first_block()..=chunk.last_block(),
             size,

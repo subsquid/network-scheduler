@@ -70,7 +70,7 @@ impl CompareResult {
 }
 
 pub fn compare_intersection(
-    chunks: &[ScheduledChunk],
+    chunks: &[ScheduledChunk<'_>],
     assignment1: &Assignment,
     assignment2: &Assignment,
 ) -> CompareResult {
@@ -97,7 +97,7 @@ pub fn compare_intersection(
     result
 }
 
-fn calculate_size(chunks: &[ScheduledChunk], indexes: impl Iterator<Item = ChunkIndex>) -> u64 {
+fn calculate_size(chunks: &[ScheduledChunk<'_>], indexes: impl Iterator<Item = ChunkIndex>) -> u64 {
     indexes
         .map(|chunk_index| chunks[chunk_index as usize].size as u64)
         .sum()

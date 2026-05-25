@@ -118,7 +118,7 @@ impl Assignment {
             };
             let mut builder = assignment_builder
                 .new_chunk()
-                .id(&chunk.id)
+                .id(chunk.id.as_str())
                 .dataset_id(&chunk.dataset)
                 .block_range(chunk.blocks.clone())
                 .size(chunk.size)
@@ -220,7 +220,7 @@ mod tests {
         let id = format!("{first:010}/{first:010}-{last:010}-{:08x}", first as u32);
         Chunk {
             dataset: Arc::new(dataset.to_string()),
-            id,
+            id: Arc::new(id),
             size: 1000,
             blocks: first..=last,
             files: Arc::new(vec!["file.parquet".to_string()]),

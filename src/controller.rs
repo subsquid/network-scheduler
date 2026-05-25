@@ -217,15 +217,13 @@ impl WithChunks {
             flat_chunks.len()
         );
 
-        let (scheduled_chunks, filtered_chunks) =
-            weight::prepare_chunks(flat_chunks, &self.config.datasets);
+        let prepared = weight::prepare_chunks(flat_chunks, &self.config.datasets);
 
         WithScheduledChunks {
             config: self.config,
             workers: self.workers,
             datasets,
-            chunks: filtered_chunks,
-            scheduled_chunks,
+            prepared,
         }
     }
 }
@@ -234,31 +232,46 @@ pub struct WithScheduledChunks {
     config: cli::Config,
     workers: Vec<types::Worker>,
     datasets: Vec<types::Dataset>,
-    chunks: Vec<types::Chunk>,
-    scheduled_chunks: Vec<ScheduledChunk>,
+    prepared: Vec<(types::Chunk, types::ChunkWeight, Option<semver::Version>)>,
 }
 
 impl WithScheduledChunks {
     pub fn schedule(self) -> anyhow::Result<WithAssignment> {
-        let assignment = scheduling::schedule(
-            &self.scheduled_chunks,
-            &self.workers,
-            scheduling::SchedulingConfig {
-                worker_capacity: self.config.worker_storage_bytes,
-                saturation: self.config.saturation,
-                min_replication: self.config.min_replication,
-                ignore_reliability: self.config.ignore_reliability,
-            },
-        )
-        .context("Can't schedule chunks")?;
+        let assignment = {
+            let scheduled_chunks: Vec<ScheduledChunk> = self
+                .prepared
+                .iter()
+                .map(|(chunk, weight, mwv)| ScheduledChunk {
+                    dataset: &chunk.dataset,
+                    chunk_id: &chunk.id,
+                    size: chunk.size,
+                    weight: *weight,
+                    minimum_worker_version: mwv.as_ref(),
+                })
+                .collect();
 
-        assignment.log_stats(&self.chunks, &self.config, &self.workers);
+            scheduling::schedule(
+                &scheduled_chunks,
+                &self.workers,
+                scheduling::SchedulingConfig {
+                    worker_capacity: self.config.worker_storage_bytes,
+                    saturation: self.config.saturation,
+                    min_replication: self.config.min_replication,
+                    ignore_reliability: self.config.ignore_reliability,
+                },
+            )
+            .context("Can't schedule chunks")?
+        };
+
+        let chunks: Vec<types::Chunk> = self.prepared.into_iter().map(|(c, _, _)| c).collect();
+
+        assignment.log_stats(&chunks, &self.config, &self.workers);
 
         Ok(WithAssignment {
             config: self.config,
             workers: self.workers,
             datasets: self.datasets,
-            chunks: self.chunks,
+            chunks,
             assignment,
         })
     }

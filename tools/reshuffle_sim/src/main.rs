@@ -12,7 +12,7 @@ mod simulation;
 mod util;
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet},
     path::PathBuf,
     sync::Arc,
 };
@@ -27,12 +27,8 @@ use rand::prelude::*;
 static ALLOC: dhat::Alloc = dhat::Alloc;
 
 type ChunkId = (Arc<String>, Arc<String>);
-type ChunkIndex = HashMap<ChunkId, ChunkEntry>;
-
-pub struct ChunkEntry {
-    pub owners: HashSet<PeerId>,
-    pub size: u32,
-}
+type ChunkOwners = BTreeMap<ChunkId, BTreeSet<PeerId>>;
+type ChunkSizeIndex = BTreeMap<ChunkId, u32>;
 
 #[derive(Parser, Debug)]
 #[command(about = "Simulate chunk ingestion and measure reshuffling")]
@@ -58,7 +54,7 @@ struct Args {
     seed: u64,
 
     /// Write an HTML report with charts to this path
-    #[arg(long, default_missing_value = "report.html", num_args = 0..=1)]
+    #[arg(long)]
     report: Option<PathBuf>,
 
     /// Enable dhat heap profiling for this run (writes dhat-heap.json on exit).
@@ -84,7 +80,7 @@ fn main() -> anyhow::Result<()> {
 
     let mut rng = StdRng::seed_from_u64(args.seed);
     let mut accumulated_new_chunks: Vec<Chunk> = Vec::new();
-    let mut previous_index = baseline.chunk_index;
+    let mut previous_chunk_owners = baseline.chunk_owners;
     let mut all_metrics = Vec::new();
 
     util::print_header();
@@ -103,8 +99,8 @@ fn main() -> anyhow::Result<()> {
             &scheduling_config,
         )?;
 
-        let (metrics, current_index) = simulation::measure_reshuffle(
-            &previous_index,
+        let (metrics, current_chunk_owners) = simulation::measure_reshuffle(
+            &previous_chunk_owners,
             &filtered_chunks,
             &assignment,
             step,
@@ -116,7 +112,7 @@ fn main() -> anyhow::Result<()> {
         util::print_step(&metrics);
         all_metrics.push(metrics);
 
-        previous_index = current_index;
+        previous_chunk_owners = current_chunk_owners;
     }
 
     if let Some(report_path) = &args.report {

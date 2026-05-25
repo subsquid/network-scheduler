@@ -1,4 +1,4 @@
-use std::{borrow::Cow, collections::BTreeMap};
+use std::collections::BTreeMap;
 
 use itertools::Itertools;
 use libp2p_identity::PeerId;
@@ -28,15 +28,16 @@ pub struct SchedulingConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub struct ScheduledChunk {
-    pub id: String,
+pub struct ScheduledChunk<'a> {
+    pub dataset: &'a str,
+    pub chunk_id: &'a str,
     pub size: u32,
     pub weight: u16,
-    pub minimum_worker_version: Option<Version>,
+    pub minimum_worker_version: Option<&'a Version>,
 }
 
 pub fn schedule(
-    chunks: &[ScheduledChunk],
+    chunks: &[ScheduledChunk<'_>],
     workers: &[Worker],
     config: SchedulingConfig,
 ) -> Result<Assignment, ReplicationError> {
@@ -84,7 +85,7 @@ pub fn schedule(
 }
 
 fn schedule_to_workers(
-    chunks: &[ScheduledChunk],
+    chunks: &[ScheduledChunk<'_>],
     workers: &[&Worker],
     config: &SchedulingConfig,
 ) -> Result<Assignment, ReplicationError> {
@@ -111,10 +112,11 @@ fn schedule_to_workers(
     let chunks = chunks
         .iter()
         .map(|c| ReplicatedChunk {
-            id: Cow::Borrowed(&c.id),
+            dataset: c.dataset,
+            chunk_id: c.chunk_id,
             replication: mapping[&c.weight],
             size: c.size,
-            minimum_worker_version: c.minimum_worker_version.as_ref(),
+            minimum_worker_version: c.minimum_worker_version,
         })
         .collect_vec();
 
@@ -138,7 +140,7 @@ fn schedule_to_workers(
 /// 2. f ≤ (1-s) × E / (s × (N-E)): the extra load on eligible workers
 ///    from restricted chunks must fit within the unused capacity fraction.
 fn validate_version_restrictions(
-    chunks: &[ScheduledChunk],
+    chunks: &[ScheduledChunk<'_>],
     workers: &[&Worker],
     config: &SchedulingConfig,
     replication_by_weight: &BTreeMap<u16, u16>,
@@ -154,7 +156,7 @@ fn validate_version_restrictions(
     let mut max_replication: u16 = 0;
 
     for chunk in chunks {
-        if let Some(ref v) = chunk.minimum_worker_version {
+        if let Some(v) = chunk.minimum_worker_version {
             if let Some(existing) = min_ver {
                 assert!(
                     existing == v,
@@ -207,9 +209,10 @@ fn validate_version_restrictions(
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ReplicatedChunk<'a> {
-    id: Cow<'a, str>,
+    dataset: &'a str,
+    chunk_id: &'a str,
     size: u32,
     replication: u16,
     minimum_worker_version: Option<&'a Version>,
@@ -278,7 +281,14 @@ fn hash_chunks(
         .enumerate()
         .flat_map_iter(|(chunk_index, chunk)| {
             (0..chunk.replication).map(move |tag| {
-                let buffer = [chunk.id.as_bytes(), b":", &tag.to_le_bytes()].concat();
+                let buffer = [
+                    chunk.dataset.as_bytes(),
+                    b"/",
+                    chunk.chunk_id.as_bytes(),
+                    b":",
+                    &tag.to_le_bytes(),
+                ]
+                .concat();
                 let chunk_hash = hash(&buffer);
                 let ring_index = chunk_hash as usize % N_RINGS;
                 let ring = &rings[ring_index];
@@ -344,7 +354,10 @@ fn assign_chunks(
                     return;
                 }
             }
-            panic!("No worker found for chunk {}", chunk.id);
+            panic!(
+                "No worker found for chunk {}/{}",
+                chunk.dataset, chunk.chunk_id
+            );
         });
 
     assignments

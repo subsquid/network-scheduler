@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap},
     io::Read,
     path::PathBuf,
     sync::Arc,
@@ -11,7 +11,7 @@ use network_scheduler::types::{BlockNumber, Chunk, Worker, WorkerStatus};
 use semver::Version;
 use sqd_assignments::Assignment as FbAssignment;
 
-use crate::{ChunkEntry, ChunkIndex};
+use crate::ChunkOwners;
 
 pub struct DatasetInfo {
     pub dataset_id: Arc<String>,
@@ -24,7 +24,7 @@ pub struct DatasetInfo {
 pub struct Baseline {
     pub chunks: Vec<Chunk>,
     pub workers: Vec<Worker>,
-    pub chunk_index: ChunkIndex,
+    pub chunk_owners: ChunkOwners,
     pub datasets: Vec<DatasetInfo>,
 }
 
@@ -41,14 +41,11 @@ fn read_flatbuffer(path: &PathBuf) -> anyhow::Result<Vec<u8>> {
     }
 }
 
-fn extract_peer_ids(fb: &FbAssignment) -> anyhow::Result<Vec<PeerId>> {
-    (0..fb.workers().len())
-        .map(|i| fb.get_worker_id(i as u16))
-        .collect()
-}
-
 fn extract_workers(fb: &FbAssignment, worker_version: &Version) -> anyhow::Result<Vec<Worker>> {
-    let worker_peer_ids = extract_peer_ids(fb)?;
+    let mut worker_peer_ids: Vec<PeerId> = Vec::new();
+    for i in 0..fb.workers().len() {
+        worker_peer_ids.push(fb.get_worker_id(i as u16)?);
+    }
 
     let workers = fb
         .workers()
@@ -78,11 +75,14 @@ fn extract_workers(fb: &FbAssignment, worker_version: &Version) -> anyhow::Resul
 
 /// Reconstructs chunks and their worker ownership from the flatbuffer.
 /// Each chunk's last_block is inferred from the next chunk's first_block within the same dataset.
-fn extract_chunks_and_index(fb: &FbAssignment) -> anyhow::Result<(Vec<Chunk>, ChunkIndex)> {
-    let worker_peer_ids = extract_peer_ids(fb)?;
+fn extract_chunks_and_owners(fb: &FbAssignment) -> anyhow::Result<(Vec<Chunk>, ChunkOwners)> {
+    let mut worker_peer_ids: Vec<PeerId> = Vec::new();
+    for i in 0..fb.workers().len() {
+        worker_peer_ids.push(fb.get_worker_id(i as u16)?);
+    }
 
     let mut chunks = Vec::new();
-    let mut chunk_index = HashMap::new();
+    let mut chunk_owners = BTreeMap::new();
     let mut dataset_pool: HashMap<String, Arc<String>> = HashMap::new();
 
     for dataset in fb.datasets() {
@@ -100,27 +100,26 @@ fn extract_chunks_and_index(fb: &FbAssignment) -> anyhow::Result<(Vec<Chunk>, Ch
                 .or_insert_with_key(|k| Arc::new(k.clone()))
                 .clone();
             let chunk_id_arc = Arc::new(fb_chunk.id().to_owned());
-            let size = fb_chunk.size();
 
             chunks.push(Chunk {
                 dataset: dataset_arc.clone(),
-                id: (*chunk_id_arc).clone(),
-                size,
+                id: chunk_id_arc.clone(),
+                size: fb_chunk.size(),
                 blocks: first_block..=last_block,
                 files: Arc::new(vec![]),
                 summary: None,
             });
 
-            let owners: HashSet<PeerId> = fb_chunk
+            let owners: BTreeSet<PeerId> = fb_chunk
                 .worker_indexes()
                 .iter()
                 .map(|wi| worker_peer_ids[wi as usize])
                 .collect();
-            chunk_index.insert((dataset_arc, chunk_id_arc), ChunkEntry { owners, size });
+            chunk_owners.insert((dataset_arc, chunk_id_arc), owners);
         }
     }
 
-    Ok((chunks, chunk_index))
+    Ok((chunks, chunk_owners))
 }
 
 /// Aggregates per-dataset statistics needed for proportional chunk generation:
@@ -157,7 +156,7 @@ pub fn load_baseline(path: &PathBuf, worker_version: &Version) -> anyhow::Result
     let fb = FbAssignment::from_owned_unchecked(buf);
 
     let workers = extract_workers(&fb, worker_version)?;
-    let (chunks, chunk_index) = extract_chunks_and_index(&fb)?;
+    let (chunks, chunk_owners) = extract_chunks_and_owners(&fb)?;
     let datasets = compute_dataset_stats(&chunks);
 
     eprintln!(
@@ -170,7 +169,7 @@ pub fn load_baseline(path: &PathBuf, worker_version: &Version) -> anyhow::Result
     Ok(Baseline {
         chunks,
         workers,
-        chunk_index,
+        chunk_owners,
         datasets,
     })
 }
