@@ -1,0 +1,16 @@
+[package]
+name = "reshuffle-sim"
+version = "0.0.1"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.98"
+clap = { version = "4.5.38", features = ["derive", "env"] }
+dhat = "0.3"
+flate2 = "1.1.1"
+network-scheduler = { path = "../.." }
+sqd-assignments = { git = "https://github.com/subsquid/sqd-network.git", rev = "fa19681", features = ["reader"] }
+libp2p-identity = { version = "0.2.10", features = ["peerid"] }
+semver = "1.0.26"
+bytesize = "2.3.1"
+rand = "0.9.1"

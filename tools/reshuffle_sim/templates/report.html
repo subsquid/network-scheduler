@@ -1,0 +1,221 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Reshuffle Simulation Report</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
+<style>
+  body { font-family: system-ui, -apple-system, sans-serif; margin: 0; padding: 20px; background: #f5f5f5; }
+  h1 { text-align: center; color: #333; }
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; max-width: 1400px; margin: 0 auto; }
+  .card { background: white; border-radius: 8px; padding: 20px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
+  .card.wide { grid-column: 1 / -1; }
+  canvas { width: 100% !important; }
+  table { border-collapse: collapse; width: 100%; font-size: 13px; }
+  th, td { border: 1px solid #ddd; padding: 6px 10px; text-align: right; }
+  th { background: #f0f0f0; position: sticky; top: 0; }
+  td:first-child, th:first-child { text-align: center; }
+</style>
+</head>
+<body>
+<h1>Reshuffle Simulation Report</h1>
+<div class="grid">
+
+<div class="card">
+  <canvas id="chunksChart"></canvas>
+</div>
+
+<div class="card">
+  <canvas id="dataBreakdownChart"></canvas>
+</div>
+
+<div class="card">
+  <canvas id="shuffledChart"></canvas>
+</div>
+
+<div class="card">
+  <canvas id="replicationChart"></canvas>
+</div>
+
+<div class="card">
+  <canvas id="workersChart"></canvas>
+</div>
+
+<div class="card">
+  <canvas id="shuffledCountChart"></canvas>
+</div>
+
+<div class="card">
+  <canvas id="totalDownloadChart"></canvas>
+</div>
+
+<div class="card">
+  <canvas id="capacityChart"></canvas>
+</div>
+
+<div class="card wide">
+<h3 style="margin-top:0">Raw Data</h3>
+<div style="overflow-x:auto">
+<table>
+<tr>
+  <th>Step</th><th>New chunks</th><th>Total chunks</th><th>Replication factor</th>
+  <th>New chunks download (all replicas)</th><th>Shuffled chunks</th><th>Shuffled chunks download (all replicas)</th>
+  <th>Replication increase download</th><th>Replication decrease freed</th><th>Total S3 download (all replicas)</th>
+  <th>Free capacity</th><th>Used %</th>
+  <th>Workers receiving new</th><th>Workers losing</th><th>Workers receiving shuffled</th>
+</tr>
+__TABLE_ROWS__
+</table>
+</div>
+</div>
+
+</div>
+
+<script type="application/json" id="data">__DATA__</script>
+<script>
+const D = JSON.parse(document.getElementById('data').textContent);
+
+function formatBytes(b) {
+  if (b === 0) return '0 B';
+  const units = ['B','KB','MB','GB','TB'];
+  const i = Math.floor(Math.log(b)/Math.log(1024));
+  return (b/Math.pow(1024,i)).toFixed(1) + ' ' + units[i];
+}
+
+const bytesTooltip = { callbacks: { label: function(ctx) { return ctx.dataset.label + ': ' + formatBytes(ctx.raw); } } };
+const bytesScale = { beginAtZero: true, ticks: { callback: function(v) { return formatBytes(v); } } };
+const stepLabels = D.steps.map(s => 'Step ' + s);
+
+new Chart(document.getElementById('chunksChart'), {
+  type: 'bar',
+  data: {
+    labels: stepLabels,
+    datasets: [
+      { label: 'New chunks', data: D.newChunks, backgroundColor: 'rgba(54,162,235,0.7)' },
+      { label: 'Total chunks', data: D.totalChunks, type: 'line', borderColor: '#ff6384', backgroundColor: 'transparent', yAxisID: 'y1' }
+    ]
+  },
+  options: {
+    plugins: { title: { display: true, text: 'Chunk Counts' } },
+    scales: {
+      y: { beginAtZero: true, title: { display: true, text: 'New per step' } },
+      y1: { position: 'right', title: { display: true, text: 'Total' }, grid: { drawOnChartArea: false } }
+    }
+  }
+});
+
+new Chart(document.getElementById('dataBreakdownChart'), {
+  type: 'bar',
+  data: {
+    labels: stepLabels,
+    datasets: [
+      { label: 'New chunks download (all replicas)', data: D.newChunkBytes, backgroundColor: 'rgba(54,162,235,0.7)' },
+      { label: 'Shuffled chunks download (all replicas)', data: D.shuffledBytes, backgroundColor: 'rgba(255,99,132,0.7)' },
+      { label: 'Replication increase download', data: D.increasedRepl, backgroundColor: 'rgba(255,206,86,0.7)' }
+    ]
+  },
+  options: {
+    plugins: { title: { display: true, text: 'S3 Download Breakdown (chunk size × number of downloading workers)' }, tooltip: bytesTooltip },
+    scales: { y: bytesScale }
+  }
+});
+
+new Chart(document.getElementById('shuffledChart'), {
+  type: 'bar',
+  data: {
+    labels: stepLabels,
+    datasets: [
+      { label: 'Shuffled chunks download (all replicas)', data: D.shuffledBytes, backgroundColor: 'rgba(255,99,132,0.7)' }
+    ]
+  },
+  options: {
+    plugins: { title: { display: true, text: 'Shuffled Chunks Download (all replicas, existing chunks moved to different workers)' }, tooltip: bytesTooltip },
+    scales: { y: bytesScale }
+  }
+});
+
+new Chart(document.getElementById('replicationChart'), {
+  type: 'bar',
+  data: {
+    labels: stepLabels,
+    datasets: [
+      { label: 'Replication increase download', data: D.increasedRepl, backgroundColor: 'rgba(75,192,192,0.7)' },
+      { label: 'Replication decrease freed', data: D.decreasedRepl, backgroundColor: 'rgba(255,159,64,0.7)' }
+    ]
+  },
+  options: {
+    plugins: { title: { display: true, text: 'Replication Changes (download from gained replicas / freed from lost replicas)' }, tooltip: bytesTooltip },
+    scales: { y: bytesScale }
+  }
+});
+
+new Chart(document.getElementById('workersChart'), {
+  type: 'bar',
+  data: {
+    labels: stepLabels,
+    datasets: [
+      { label: 'Receiving new chunks', data: D.workersReceivingNew, backgroundColor: 'rgba(54,162,235,0.7)' },
+      { label: 'Losing chunks', data: D.workersLosing, backgroundColor: 'rgba(255,99,132,0.7)' },
+      { label: 'Receiving shuffled chunks', data: D.workersShuffled, backgroundColor: 'rgba(255,206,86,0.7)' }
+    ]
+  },
+  options: {
+    plugins: { title: { display: true, text: 'Workers Affected by Category' } },
+    scales: { y: { beginAtZero: true } }
+  }
+});
+
+new Chart(document.getElementById('shuffledCountChart'), {
+  type: 'line',
+  data: {
+    labels: stepLabels,
+    datasets: [
+      { label: 'Chunks shuffled', data: D.shuffledCount, borderColor: '#ff6384', backgroundColor: 'rgba(255,99,132,0.1)', fill: true }
+    ]
+  },
+  options: {
+    plugins: { title: { display: true, text: 'Existing Chunks Reshuffled (count)' } },
+    scales: { y: { beginAtZero: true } }
+  }
+});
+
+new Chart(document.getElementById('totalDownloadChart'), {
+  type: 'bar',
+  data: {
+    labels: stepLabels,
+    datasets: [
+      { label: 'Total S3 download (all replicas)', data: D.totalDownload, backgroundColor: 'rgba(153,102,255,0.7)' }
+    ]
+  },
+  options: {
+    plugins: { title: { display: true, text: 'Total S3 Download per Step (all replicas: new + shuffled + replication increase)' }, tooltip: bytesTooltip },
+    scales: { y: bytesScale }
+  }
+});
+
+new Chart(document.getElementById('capacityChart'), {
+  type: 'bar',
+  data: {
+    labels: stepLabels,
+    datasets: [
+      { label: 'Free capacity', data: D.freeCapacity, backgroundColor: 'rgba(75,192,192,0.7)', yAxisID: 'y' },
+      { label: 'Used %', data: D.usedPct, type: 'line', borderColor: '#ff6384', backgroundColor: 'transparent', yAxisID: 'y1' }
+    ]
+  },
+  options: {
+    plugins: { title: { display: true, text: 'Remaining Free Capacity Across All Workers' }, tooltip: {
+      callbacks: { label: function(ctx) {
+        if (ctx.dataset.yAxisID === 'y1') return ctx.dataset.label + ': ' + ctx.raw.toFixed(1) + '%';
+        return ctx.dataset.label + ': ' + formatBytes(ctx.raw);
+      } }
+    } },
+    scales: {
+      y: { ...bytesScale, title: { display: true, text: 'Free capacity' } },
+      y1: { position: 'right', min: 0, max: 100, title: { display: true, text: 'Used %' }, grid: { drawOnChartArea: false }, ticks: { callback: function(v) { return v + '%'; } } }
+    }
+  }
+});
+</script>
+</body>
+</html>
