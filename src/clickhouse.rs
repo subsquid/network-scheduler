@@ -219,7 +219,7 @@ impl From<Chunk> for ChunkRow {
         });
         Self {
             dataset: chunk.dataset.to_string(),
-            id: chunk.id,
+            id: chunk.id.to_string(),
             size: chunk.size as u64,
             files: chunk.files.join(","),
             last_block_hash,
@@ -262,7 +262,7 @@ mod test {
 
         let expected = vec![Chunk {
             dataset: dataset.to_string().into(),
-            id: "0018197829/0018246541-0018248424-c7ed95c9".to_string(),
+            id: Arc::new("0018197829/0018246541-0018248424-c7ed95c9".to_string()),
             size: 1000,
             blocks: std::ops::RangeInclusive::new(18246541, 18248424),
             files: Arc::new(vec!["blocks".to_string(), "transactions".to_string()]),

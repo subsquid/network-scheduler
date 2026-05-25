@@ -4,16 +4,14 @@ use semver::Version;
 
 use crate::cli::{DatasetSegmentConfig, DatasetsConfig};
 use crate::metrics::{self, DatasetSegmentStats};
-use crate::scheduling::ScheduledChunk;
 use crate::types::{Chunk, ChunkWeight};
 
 // TODO: add unit tests
 pub fn prepare_chunks(
     chunks: Vec<Chunk>,
     config: &DatasetsConfig,
-) -> (Vec<ScheduledChunk>, Vec<Chunk>) {
-    let mut scheduled_chunks = Vec::with_capacity(chunks.len());
-    let mut filtered_chunks = Vec::with_capacity(chunks.len());
+) -> Vec<(Chunk, ChunkWeight, Option<Version>)> {
+    let mut prepared = Vec::with_capacity(chunks.len());
     for (dataset, chunks) in &chunks.into_iter().chunk_by(|chunk| chunk.dataset.clone()) {
         let chunks = chunks.collect_vec();
         let bucket = chunks[0].bucket();
@@ -40,13 +38,11 @@ pub fn prepare_chunks(
             if chunk.blocks.start() >= &segments[cur].from {
                 segment_chunks += 1;
                 segment_size += chunk.size as u64;
-                scheduled_chunks.push(ScheduledChunk {
-                    id: format!("{}/{}", dataset, chunk.id),
-                    size: chunk.size,
-                    weight: segments[cur].weight,
-                    minimum_worker_version: segments[cur].minimum_worker_version.clone(),
-                });
-                filtered_chunks.push(chunk);
+                prepared.push((
+                    chunk,
+                    segments[cur].weight,
+                    segments[cur].minimum_worker_version.clone(),
+                ));
             }
         }
         stats.push(DatasetSegmentStats {
@@ -56,7 +52,7 @@ pub fn prepare_chunks(
         });
         metrics::report_chunks(&dataset, &stats);
     }
-    (scheduled_chunks, filtered_chunks)
+    prepared
 }
 
 struct Segment {

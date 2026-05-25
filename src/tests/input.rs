@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use itertools::Itertools;
 use libp2p_identity::PeerId;
 use rand::prelude::*;
@@ -38,21 +40,15 @@ pub fn generate_input(
 pub fn generate_chunks(n: ChunkIndex, weights: &[ChunkWeight]) -> Vec<ScheduledChunk> {
     const MAX_CHUNK_SIZE: u32 = 200 << 20; // 200MB
 
+    let dataset = Arc::new("s3://solana-mainnet-0".to_string());
     (0..n)
         .into_par_iter()
-        .map(|i| {
-            let id = format!(
-                "s3://solana-mainnet-0/0000000000/{:010}-{:010}-{:08x}",
-                i,
-                i + 1,
-                i
-            );
-            ScheduledChunk {
-                id,
-                size: rand::rng().random_range(0..MAX_CHUNK_SIZE),
-                weight: *weights.choose(&mut rand::rng()).unwrap(),
-                minimum_worker_version: None,
-            }
+        .map(|i| ScheduledChunk {
+            dataset: dataset.clone(),
+            chunk_id: Arc::new(format!("0000000000/{:010}-{:010}-{:08x}", i, i + 1, i)),
+            size: rand::rng().random_range(0..MAX_CHUNK_SIZE),
+            weight: *weights.choose(&mut rand::rng()).unwrap(),
+            minimum_worker_version: None,
         })
         .collect()
 }

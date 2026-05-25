@@ -1,18 +1,18 @@
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, BTreeSet},
     sync::Arc,
 };
 
 use anyhow::Context;
 use libp2p_identity::PeerId;
 use network_scheduler::{
-    scheduling::{SchedulingConfig, schedule},
+    scheduling::{ScheduledChunk, SchedulingConfig, schedule},
     types::{Chunk, Worker},
     weight::prepare_chunks,
 };
 use rand::prelude::*;
 
-use crate::{ChunkEntry, ChunkIndex, baseline::DatasetInfo};
+use crate::{ChunkOwners, ChunkSizeIndex, baseline::DatasetInfo};
 
 pub struct ReshuffleMetrics {
     pub step: u32,
@@ -33,35 +33,6 @@ pub struct DataMovement {
     pub workers_receiving_new: usize,
     pub workers_losing: usize,
     pub workers_shuffled: usize,
-}
-
-impl DataMovement {
-    pub fn total_download(&self) -> u64 {
-        self.new_chunk_bytes + self.shuffled_bytes + self.increased_replication_bytes
-    }
-}
-
-impl ReshuffleMetrics {
-    pub fn free_capacity(&self) -> u64 {
-        self.total_capacity_bytes
-            .saturating_sub(self.used_capacity_bytes)
-    }
-
-    pub fn used_pct(&self) -> f64 {
-        if self.total_capacity_bytes > 0 {
-            self.used_capacity_bytes as f64 / self.total_capacity_bytes as f64 * 100.0
-        } else {
-            0.0
-        }
-    }
-
-    pub fn replication_summary(&self) -> String {
-        self.replication_by_weight
-            .iter()
-            .map(|(weight, factor)| format!("{weight}:{factor}"))
-            .collect::<Vec<_>>()
-            .join(", ")
-    }
 }
 
 // --- Chunk generation ---
@@ -111,7 +82,7 @@ pub fn generate_new_chunks(
 
         new_chunks.push(Chunk {
             dataset: dataset.dataset_id.clone(),
-            id: chunk_id,
+            id: Arc::new(chunk_id),
             size: dataset.avg_chunk_size,
             blocks: first_block..=last_block,
             files: Arc::new(vec![]),
@@ -146,49 +117,45 @@ pub fn schedule_combined_chunks(
             .then(a.blocks.start().cmp(b.blocks.start()))
     });
 
-    let (scheduled_chunks, filtered_chunks) = prepare_chunks(combined, datasets_config);
+    let prepared = prepare_chunks(combined, datasets_config);
+
+    let scheduled_chunks: Vec<ScheduledChunk> = prepared
+        .iter()
+        .map(|(chunk, weight, mwv)| ScheduledChunk {
+            dataset: chunk.dataset.clone(),
+            chunk_id: chunk.id.clone(),
+            size: chunk.size,
+            weight: *weight,
+            minimum_worker_version: mwv.clone(),
+        })
+        .collect();
+
     let assignment = schedule(&scheduled_chunks, workers, scheduling_config.clone())
         .context("Scheduling failed")?;
+    drop(scheduled_chunks);
+
+    let filtered_chunks: Vec<Chunk> = prepared.into_iter().map(|(c, _, _)| c).collect();
 
     Ok((filtered_chunks, assignment))
 }
 
 // --- Assignment diffing ---
 
-fn build_chunk_index(
+fn chunk_owners_from_assignment(
     chunks: &[Chunk],
     assignment: &network_scheduler::types::Assignment,
-) -> ChunkIndex {
-    let keys: Vec<(Arc<String>, Arc<String>)> = chunks
-        .iter()
-        .map(|c| (c.dataset.clone(), Arc::new(c.id.clone())))
-        .collect();
-
-    let mut index: ChunkIndex = keys
-        .iter()
-        .enumerate()
-        .map(|(i, key)| {
-            (
-                key.clone(),
-                ChunkEntry {
-                    owners: HashSet::new(),
-                    size: chunks[i].size,
-                },
-            )
-        })
-        .collect();
-
-    for (worker, chunk_indexes) in &assignment.worker_chunks {
-        for &ci in chunk_indexes {
-            index
-                .get_mut(&keys[ci as usize])
-                .unwrap()
-                .owners
+) -> ChunkOwners {
+    let mut owners: ChunkOwners = BTreeMap::new();
+    for (worker, indexes) in &assignment.worker_chunks {
+        for &chunk_index in indexes {
+            let chunk = &chunks[chunk_index as usize];
+            owners
+                .entry((chunk.dataset.clone(), chunk.id.clone()))
+                .or_default()
                 .insert(*worker);
         }
     }
-
-    index
+    owners
 }
 
 /// Classifies data movement between two assignments by cause.
@@ -196,7 +163,11 @@ fn build_chunk_index(
 /// - New chunk (not in previous): all replicas count as new_chunk_bytes.
 /// - Existing chunk: workers gained/lost are classified as shuffle (1:1 swap)
 ///   or replication change (net gain/loss of replicas).
-fn compute_data_movement(previous: &ChunkIndex, current: &ChunkIndex) -> DataMovement {
+fn compute_data_movement(
+    previous: &ChunkOwners,
+    current: &ChunkOwners,
+    chunk_sizes: &ChunkSizeIndex,
+) -> DataMovement {
     let mut result = DataMovement {
         new_chunk_bytes: 0,
         shuffled_bytes: 0,
@@ -208,16 +179,16 @@ fn compute_data_movement(previous: &ChunkIndex, current: &ChunkIndex) -> DataMov
         workers_shuffled: 0,
     };
 
-    let mut workers_receiving_new: HashSet<PeerId> = HashSet::new();
-    let mut workers_losing: HashSet<PeerId> = HashSet::new();
-    let mut workers_shuffled: HashSet<PeerId> = HashSet::new();
+    let mut workers_receiving_new: BTreeSet<PeerId> = BTreeSet::new();
+    let mut workers_losing: BTreeSet<PeerId> = BTreeSet::new();
+    let mut workers_shuffled: BTreeSet<PeerId> = BTreeSet::new();
 
-    for (chunk_id, entry) in current {
-        let size = entry.size as u64;
+    for (chunk_id, current_workers) in current {
+        let size = *chunk_sizes.get(chunk_id).unwrap_or(&0) as u64;
 
-        if let Some(prev_entry) = previous.get(chunk_id) {
-            let gained: usize = entry.owners.difference(&prev_entry.owners).count();
-            let lost: usize = prev_entry.owners.difference(&entry.owners).count();
+        if let Some(previous_workers) = previous.get(chunk_id) {
+            let gained: usize = current_workers.difference(previous_workers).count();
+            let lost: usize = previous_workers.difference(current_workers).count();
 
             let shuffled = gained.min(lost);
             let replication_increase = gained.saturating_sub(lost);
@@ -231,26 +202,26 @@ fn compute_data_movement(previous: &ChunkIndex, current: &ChunkIndex) -> DataMov
             result.decreased_replication_bytes += size * replication_decrease as u64;
 
             if gained > 0 {
-                for w in entry.owners.difference(&prev_entry.owners) {
+                for w in current_workers.difference(previous_workers) {
                     workers_shuffled.insert(*w);
                 }
             }
-            for w in prev_entry.owners.difference(&entry.owners) {
+            for w in previous_workers.difference(current_workers) {
                 workers_losing.insert(*w);
             }
         } else {
-            result.new_chunk_bytes += size * entry.owners.len() as u64;
-            for w in &entry.owners {
+            result.new_chunk_bytes += size * current_workers.len() as u64;
+            for w in current_workers {
                 workers_receiving_new.insert(*w);
             }
         }
     }
 
-    for (chunk_id, prev_entry) in previous {
+    for (chunk_id, previous_workers) in previous {
         if !current.contains_key(chunk_id) {
-            let size = prev_entry.size as u64;
-            result.decreased_replication_bytes += size * prev_entry.owners.len() as u64;
-            for w in &prev_entry.owners {
+            let size = *chunk_sizes.get(chunk_id).unwrap_or(&0) as u64;
+            result.decreased_replication_bytes += size * previous_workers.len() as u64;
+            for w in previous_workers {
                 workers_losing.insert(*w);
             }
         }
@@ -267,17 +238,23 @@ fn compute_data_movement(previous: &ChunkIndex, current: &ChunkIndex) -> DataMov
 /// All comparisons are against the previous step (incremental).
 /// Returns the current chunk owners for use as the next step's previous.
 pub fn measure_reshuffle(
-    previous: &ChunkIndex,
+    previous_chunk_owners: &ChunkOwners,
     chunks: &[Chunk],
     assignment: &network_scheduler::types::Assignment,
     step: u32,
     new_chunks_in_step: u32,
     num_workers: usize,
     worker_capacity: u64,
-) -> (ReshuffleMetrics, ChunkIndex) {
-    let current = build_chunk_index(chunks, assignment);
+) -> (ReshuffleMetrics, ChunkOwners) {
+    let current_chunk_owners = chunk_owners_from_assignment(chunks, assignment);
 
-    let data_movement = compute_data_movement(previous, &current);
+    let chunk_sizes: ChunkSizeIndex = chunks
+        .iter()
+        .map(|c| ((c.dataset.clone(), c.id.clone()), c.size))
+        .collect();
+
+    let data_movement =
+        compute_data_movement(previous_chunk_owners, &current_chunk_owners, &chunk_sizes);
 
     let used_capacity_bytes: u64 = assignment
         .worker_chunks
@@ -298,5 +275,5 @@ pub fn measure_reshuffle(
         used_capacity_bytes,
     };
 
-    (metrics, current)
+    (metrics, current_chunk_owners)
 }

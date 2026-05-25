@@ -217,15 +217,13 @@ impl WithChunks {
             flat_chunks.len()
         );
 
-        let (scheduled_chunks, filtered_chunks) =
-            weight::prepare_chunks(flat_chunks, &self.config.datasets);
+        let prepared = weight::prepare_chunks(flat_chunks, &self.config.datasets);
 
         WithScheduledChunks {
             config: self.config,
             workers: self.workers,
             datasets,
-            chunks: filtered_chunks,
-            scheduled_chunks,
+            prepared,
         }
     }
 }
@@ -234,14 +232,25 @@ pub struct WithScheduledChunks {
     config: cli::Config,
     workers: Vec<types::Worker>,
     datasets: Vec<types::Dataset>,
-    chunks: Vec<types::Chunk>,
-    scheduled_chunks: Vec<ScheduledChunk>,
+    prepared: Vec<(types::Chunk, types::ChunkWeight, Option<semver::Version>)>,
 }
 
 impl WithScheduledChunks {
     pub fn schedule(self) -> anyhow::Result<WithAssignment> {
+        let scheduled_chunks: Vec<ScheduledChunk> = self
+            .prepared
+            .iter()
+            .map(|(chunk, weight, mwv)| ScheduledChunk {
+                dataset: Arc::clone(&chunk.dataset),
+                chunk_id: Arc::clone(&chunk.id),
+                size: chunk.size,
+                weight: *weight,
+                minimum_worker_version: mwv.clone(),
+            })
+            .collect();
+
         let assignment = scheduling::schedule(
-            &self.scheduled_chunks,
+            &scheduled_chunks,
             &self.workers,
             scheduling::SchedulingConfig {
                 worker_capacity: self.config.worker_storage_bytes,
@@ -252,13 +261,15 @@ impl WithScheduledChunks {
         )
         .context("Can't schedule chunks")?;
 
-        assignment.log_stats(&self.chunks, &self.config, &self.workers);
+        let chunks: Vec<types::Chunk> = self.prepared.into_iter().map(|(c, _, _)| c).collect();
+
+        assignment.log_stats(&chunks, &self.config, &self.workers);
 
         Ok(WithAssignment {
             config: self.config,
             workers: self.workers,
             datasets: self.datasets,
-            chunks: self.chunks,
+            chunks,
             assignment,
         })
     }
