@@ -237,29 +237,31 @@ pub struct WithScheduledChunks {
 
 impl WithScheduledChunks {
     pub fn schedule(self) -> anyhow::Result<WithAssignment> {
-        let scheduled_chunks: Vec<ScheduledChunk> = self
-            .prepared
-            .iter()
-            .map(|(chunk, weight, mwv)| ScheduledChunk {
-                dataset: Arc::clone(&chunk.dataset),
-                chunk_id: Arc::clone(&chunk.id),
-                size: chunk.size,
-                weight: *weight,
-                minimum_worker_version: mwv.clone(),
-            })
-            .collect();
+        let assignment = {
+            let scheduled_chunks: Vec<ScheduledChunk> = self
+                .prepared
+                .iter()
+                .map(|(chunk, weight, mwv)| ScheduledChunk {
+                    dataset: &chunk.dataset,
+                    chunk_id: &chunk.id,
+                    size: chunk.size,
+                    weight: *weight,
+                    minimum_worker_version: mwv.as_ref(),
+                })
+                .collect();
 
-        let assignment = scheduling::schedule(
-            &scheduled_chunks,
-            &self.workers,
-            scheduling::SchedulingConfig {
-                worker_capacity: self.config.worker_storage_bytes,
-                saturation: self.config.saturation,
-                min_replication: self.config.min_replication,
-                ignore_reliability: self.config.ignore_reliability,
-            },
-        )
-        .context("Can't schedule chunks")?;
+            scheduling::schedule(
+                &scheduled_chunks,
+                &self.workers,
+                scheduling::SchedulingConfig {
+                    worker_capacity: self.config.worker_storage_bytes,
+                    saturation: self.config.saturation,
+                    min_replication: self.config.min_replication,
+                    ignore_reliability: self.config.ignore_reliability,
+                },
+            )
+            .context("Can't schedule chunks")?
+        };
 
         let chunks: Vec<types::Chunk> = self.prepared.into_iter().map(|(c, _, _)| c).collect();
 

@@ -15,7 +15,8 @@ use crate::{
 
 #[test]
 fn test_scheduling_stable() {
-    let (chunks, mut workers, total_size) = generate_input(100, 100_000, &[1]);
+    let (test_data, mut workers, total_size) = generate_input(100, 100_000, &[1]);
+    let chunks = test_data.as_scheduled();
     let capacity = (total_size as f64 / workers.len() as f64 * 30.) as u64;
     let config = SchedulingConfig {
         worker_capacity: capacity,
@@ -33,7 +34,8 @@ fn test_scheduling_stable() {
 
 #[test]
 fn test_scheduling_sorted() {
-    let (chunks, workers, total_size) = generate_input(100, 100_000, &[1]);
+    let (test_data, workers, total_size) = generate_input(100, 100_000, &[1]);
+    let chunks = test_data.as_scheduled();
     let capacity = (total_size as f64 / workers.len() as f64 * 30.) as u64;
     let assignment = schedule(
         &chunks,
@@ -53,7 +55,8 @@ fn test_scheduling_sorted() {
 
 #[test]
 fn test_scheduling_uniform() {
-    let (chunks, workers, total_size) = generate_input(100, 50_000, &[1]);
+    let (test_data, workers, total_size) = generate_input(100, 50_000, &[1]);
+    let chunks = test_data.as_scheduled();
     let capacity = (total_size as f64 / workers.len() as f64 * 30.) as u64;
     let assignment = schedule(
         &chunks,
@@ -91,7 +94,8 @@ fn test_rescheduling_workers_left_strict() {
     const WORKERS_BEFORE: WorkerIndex = 100;
     const WORKERS_AFTER: WorkerIndex = 90;
 
-    let (chunks, mut workers, total_size) = generate_input(WORKERS_BEFORE, 50_000, &[1]);
+    let (test_data, mut workers, total_size) = generate_input(WORKERS_BEFORE, 50_000, &[1]);
+    let chunks = test_data.as_scheduled();
     let total_capacity = 30 * total_size;
     let assignment1 = schedule(
         &chunks,
@@ -129,7 +133,8 @@ fn test_rescheduling_workers_became_reliable() {
     const WORKERS: WorkerIndex = 100;
     const UNRELIABLE: WorkerIndex = 30;
 
-    let (chunks, workers, total_size) = generate_input(WORKERS, 50_000, &[1]);
+    let (test_data, workers, total_size) = generate_input(WORKERS, 50_000, &[1]);
+    let chunks = test_data.as_scheduled();
     let workers_with_unreliable = {
         let mut workers = workers.clone();
         for i in 0..UNRELIABLE {
@@ -218,10 +223,11 @@ fn test_minimum_worker_version_filtering() {
     const N_CHUNKS: u32 = 50_000;
     const N_VERSIONED: u32 = 2_500; // 5% of chunks (95% of the ~5.26% threshold)
 
-    let mut chunks = generate_chunks(N_CHUNKS, &[1]);
-    for chunk in &mut chunks[..N_VERSIONED as usize] {
-        chunk.minimum_worker_version = Some(min_version.clone());
+    let mut test_data = generate_chunks(N_CHUNKS, &[1]);
+    for entry in &mut test_data.entries[..N_VERSIONED as usize] {
+        entry.minimum_worker_version = Some(min_version.clone());
     }
+    let chunks = test_data.as_scheduled();
 
     let workers = generate_workers(N_WORKERS)
         .into_iter()
@@ -301,10 +307,11 @@ fn test_minimum_worker_version_unrestricted_spill() {
     const N_VERSIONED: u32 = 2_500; // 5% of chunks (95% of the ~5.26% threshold)
     const SATURATION: f64 = 0.95;
 
-    let mut chunks = generate_chunks(N_CHUNKS, &[1]);
-    for chunk in &mut chunks[..N_VERSIONED as usize] {
-        chunk.minimum_worker_version = Some(min_version.clone());
+    let mut test_data = generate_chunks(N_CHUNKS, &[1]);
+    for entry in &mut test_data.entries[..N_VERSIONED as usize] {
+        entry.minimum_worker_version = Some(min_version.clone());
     }
+    let chunks = test_data.as_scheduled();
 
     let workers = generate_workers(N_WORKERS)
         .into_iter()
@@ -332,12 +339,15 @@ fn test_minimum_worker_version_unrestricted_spill() {
     let assignment = schedule(&chunks, &workers, config.clone()).unwrap();
 
     // Baseline: same chunks without version restrictions
-    let unrestricted_chunks: Vec<ScheduledChunk> = chunks
+    let unrestricted_chunks: Vec<ScheduledChunk> = test_data
+        .entries
         .iter()
-        .map(|c| {
-            let mut c = c.clone();
-            c.minimum_worker_version = None;
-            c
+        .map(|e| ScheduledChunk {
+            dataset: &test_data.dataset,
+            chunk_id: &e.chunk_id,
+            size: e.size,
+            weight: e.weight,
+            minimum_worker_version: None,
         })
         .collect();
     let baseline = schedule(&unrestricted_chunks, &workers, config).unwrap();
@@ -397,10 +407,11 @@ fn test_minimum_worker_version_gradual_upgrade() {
     const N_CHUNKS: u32 = 50_000;
     const N_VERSIONED: u32 = 500; // 1%
 
-    let mut chunks = generate_chunks(N_CHUNKS, &[1]);
-    for chunk in &mut chunks[..N_VERSIONED as usize] {
-        chunk.minimum_worker_version = Some(min_version.clone());
+    let mut test_data = generate_chunks(N_CHUNKS, &[1]);
+    for entry in &mut test_data.entries[..N_VERSIONED as usize] {
+        entry.minimum_worker_version = Some(min_version.clone());
     }
+    let chunks = test_data.as_scheduled();
 
     let total_size: u64 = chunks.iter().map(|c| c.size as u64).sum();
     let worker_capacity = 10 * total_size / N_WORKERS as u64;
@@ -473,10 +484,11 @@ fn test_minimum_worker_version_insufficient_eligible_workers() {
     const N_CHUNKS: u32 = 50_000;
     const N_VERSIONED: u32 = 200; // 0.4% of chunks
 
-    let mut chunks = generate_chunks(N_CHUNKS, &[1]);
-    for chunk in &mut chunks[..N_VERSIONED as usize] {
-        chunk.minimum_worker_version = Some(min_version.clone());
+    let mut test_data = generate_chunks(N_CHUNKS, &[1]);
+    for entry in &mut test_data.entries[..N_VERSIONED as usize] {
+        entry.minimum_worker_version = Some(min_version.clone());
     }
+    let chunks = test_data.as_scheduled();
 
     let total_size: u64 = chunks.iter().map(|c| c.size as u64).sum();
     let worker_capacity = 10 * total_size / N_WORKERS as u64;
@@ -524,10 +536,11 @@ fn test_minimum_worker_version_eligible_capacity_exceeded() {
     const N_CHUNKS: u32 = 50_000;
     const N_VERSIONED: u32 = 3_000; // 6% of chunks, just above the ~5.26% threshold
 
-    let mut chunks = generate_chunks(N_CHUNKS, &[1]);
-    for chunk in &mut chunks[..N_VERSIONED as usize] {
-        chunk.minimum_worker_version = Some(min_version.clone());
+    let mut test_data = generate_chunks(N_CHUNKS, &[1]);
+    for entry in &mut test_data.entries[..N_VERSIONED as usize] {
+        entry.minimum_worker_version = Some(min_version.clone());
     }
+    let chunks = test_data.as_scheduled();
 
     let total_size: u64 = chunks.iter().map(|c| c.size as u64).sum();
     let worker_capacity = 10 * total_size / N_WORKERS as u64;
@@ -573,14 +586,23 @@ fn test_minimum_worker_version_no_reassignment_on_removal() {
     const N_CHUNKS: u32 = 50_000;
     const N_VERSIONED: u32 = 500; // 1%
 
-    let mut chunks_with_ver = generate_chunks(N_CHUNKS, &[1]);
-    for chunk in &mut chunks_with_ver[..N_VERSIONED as usize] {
-        chunk.minimum_worker_version = Some(min_version.clone());
+    let mut test_data = generate_chunks(N_CHUNKS, &[1]);
+    for entry in &mut test_data.entries[..N_VERSIONED as usize] {
+        entry.minimum_worker_version = Some(min_version.clone());
     }
-    let mut chunks_without_ver = chunks_with_ver.clone();
-    for chunk in &mut chunks_without_ver[..N_VERSIONED as usize] {
-        chunk.minimum_worker_version = None;
-    }
+    let chunks_with_ver = test_data.as_scheduled();
+
+    let chunks_without_ver: Vec<ScheduledChunk> = test_data
+        .entries
+        .iter()
+        .map(|e| ScheduledChunk {
+            dataset: &test_data.dataset,
+            chunk_id: &e.chunk_id,
+            size: e.size,
+            weight: e.weight,
+            minimum_worker_version: None,
+        })
+        .collect();
 
     // All workers are eligible (fully upgraded)
     let workers = generate_workers(N_WORKERS)

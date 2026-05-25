@@ -122,11 +122,11 @@ pub fn schedule_combined_chunks(
     let scheduled_chunks: Vec<ScheduledChunk> = prepared
         .iter()
         .map(|(chunk, weight, mwv)| ScheduledChunk {
-            dataset: chunk.dataset.clone(),
-            chunk_id: chunk.id.clone(),
+            dataset: &chunk.dataset,
+            chunk_id: &chunk.id,
             size: chunk.size,
             weight: *weight,
-            minimum_worker_version: mwv.clone(),
+            minimum_worker_version: mwv.as_ref(),
         })
         .collect();
 

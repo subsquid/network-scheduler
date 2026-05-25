@@ -1,23 +1,49 @@
-use std::sync::Arc;
-
 use itertools::Itertools;
 use libp2p_identity::PeerId;
 use rand::prelude::*;
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
+use semver::Version;
 
 use crate::{
     scheduling::ScheduledChunk,
     types::{ChunkIndex, ChunkWeight, Worker, WorkerIndex, WorkerStatus},
 };
 
+pub struct TestChunkEntry {
+    pub chunk_id: String,
+    pub size: u32,
+    pub weight: ChunkWeight,
+    pub minimum_worker_version: Option<Version>,
+}
+
+pub struct TestChunks {
+    pub dataset: String,
+    pub entries: Vec<TestChunkEntry>,
+}
+
+impl TestChunks {
+    pub fn as_scheduled(&self) -> Vec<ScheduledChunk<'_>> {
+        self.entries
+            .iter()
+            .map(|e| ScheduledChunk {
+                dataset: &self.dataset,
+                chunk_id: &e.chunk_id,
+                size: e.size,
+                weight: e.weight,
+                minimum_worker_version: e.minimum_worker_version.as_ref(),
+            })
+            .collect()
+    }
+}
+
 #[tracing::instrument(skip_all)]
 pub fn generate_input(
     n_workers: WorkerIndex,
     n_chunks: ChunkIndex,
     weights: &[ChunkWeight],
-) -> (Vec<ScheduledChunk>, Vec<Worker>, u64) {
+) -> (TestChunks, Vec<Worker>, u64) {
     println!("Generating input");
-    let chunks = generate_chunks(n_chunks, weights);
+    let test_chunks = generate_chunks(n_chunks, weights);
     let workers = generate_workers(n_workers)
         .into_iter()
         .map(|id| Worker {
@@ -26,31 +52,33 @@ pub fn generate_input(
             version: None,
         })
         .collect_vec();
-    let total_size: u64 = chunks.iter().map(|chunk| chunk.size as u64).sum();
+    let total_size: u64 = test_chunks.entries.iter().map(|e| e.size as u64).sum();
     let per_worker = total_size / workers.len() as u64;
     println!(
         "Total chunks: {}, total size: {}GB, per worker: {}GB",
-        chunks.len(),
+        test_chunks.entries.len(),
         total_size / (1 << 30),
         per_worker / (1 << 30),
     );
-    (chunks, workers, total_size)
+    (test_chunks, workers, total_size)
 }
 
-pub fn generate_chunks(n: ChunkIndex, weights: &[ChunkWeight]) -> Vec<ScheduledChunk> {
+pub fn generate_chunks(n: ChunkIndex, weights: &[ChunkWeight]) -> TestChunks {
     const MAX_CHUNK_SIZE: u32 = 200 << 20; // 200MB
 
-    let dataset = Arc::new("s3://solana-mainnet-0".to_string());
-    (0..n)
+    let entries = (0..n)
         .into_par_iter()
-        .map(|i| ScheduledChunk {
-            dataset: dataset.clone(),
-            chunk_id: Arc::new(format!("0000000000/{:010}-{:010}-{:08x}", i, i + 1, i)),
+        .map(|i| TestChunkEntry {
+            chunk_id: format!("0000000000/{:010}-{:010}-{:08x}", i, i + 1, i),
             size: rand::rng().random_range(0..MAX_CHUNK_SIZE),
             weight: *weights.choose(&mut rand::rng()).unwrap(),
             minimum_worker_version: None,
         })
-        .collect()
+        .collect();
+    TestChunks {
+        dataset: "s3://solana-mainnet-0".to_string(),
+        entries,
+    }
 }
 
 pub fn generate_workers(n: WorkerIndex) -> Vec<PeerId> {
