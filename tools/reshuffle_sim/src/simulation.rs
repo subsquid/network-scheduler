@@ -265,6 +265,15 @@ pub fn measure_reshuffle(
 
     let total_capacity_bytes = num_workers as u64 * worker_capacity;
 
+    let used_capacity_bytes: u64 = assignment
+        .worker_chunks
+        .values()
+        .flat_map(|indexes| indexes.iter())
+        .map(|&i| scheduled_chunks[i as usize].size as u64)
+        .sum();
+
+    let total_capacity_bytes = num_workers as u64 * worker_capacity;
+
     let metrics = ReshuffleMetrics {
         step,
         new_chunks_in_step,

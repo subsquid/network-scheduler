@@ -1,0 +1,444 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>MVCC Chunks — Postgres Schema Diagram</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    background: #0f1117;
+    color: #e0e0e0;
+    overflow: hidden;
+    height: 100vh;
+  }
+  h1 {
+    position: fixed; top: 16px; left: 50%; transform: translateX(-50%);
+    font-size: 18px; font-weight: 600; color: #a0aec0; z-index: 10;
+    background: #0f1117cc; padding: 6px 18px; border-radius: 8px;
+    backdrop-filter: blur(6px); letter-spacing: 0.3px;
+  }
+  .legend {
+    position: fixed; bottom: 16px; left: 16px; z-index: 10;
+    background: #1a1d28; border: 1px solid #2d3348; border-radius: 8px;
+    padding: 12px 16px; font-size: 12px; line-height: 1.8;
+  }
+  .legend-item { display: flex; align-items: center; gap: 8px; }
+  .legend-swatch {
+    width: 14px; height: 14px; border-radius: 3px; flex-shrink: 0;
+  }
+  svg { width: 100%; height: 100%; }
+
+  .table-group { cursor: grab; }
+  .table-group:active { cursor: grabbing; }
+  .table-group rect.table-bg {
+    rx: 8; ry: 8;
+    stroke-width: 1.5;
+    filter: drop-shadow(0 2px 8px rgba(0,0,0,0.4));
+    transition: filter 0.15s;
+  }
+  .table-group:hover rect.table-bg {
+    filter: drop-shadow(0 4px 16px rgba(0,0,0,0.6));
+  }
+  .table-header {
+    font-size: 13px; font-weight: 700; letter-spacing: 0.4px;
+  }
+  .table-section-label {
+    font-size: 9px; font-weight: 600; letter-spacing: 1px;
+    text-transform: uppercase; opacity: 0.45;
+  }
+  .col-name { font-size: 11.5px; font-family: 'JetBrains Mono', 'Fira Code', monospace; }
+  .col-type { font-size: 10.5px; font-family: 'JetBrains Mono', 'Fira Code', monospace; opacity: 0.5; }
+  .col-pk { fill: #f6c354; }
+  .col-fk { fill: #7eb8f7; }
+  .col-regular { fill: #c8cdd8; }
+
+  .relation-line {
+    fill: none; stroke-width: 1.6; opacity: 0.55;
+    transition: opacity 0.15s;
+  }
+  .relation-line:hover { opacity: 1; stroke-width: 2.2; }
+  .relation-dot { transition: opacity 0.15s; }
+
+  .section-label-bg {
+    rx: 4; ry: 4; opacity: 0.08;
+  }
+</style>
+</head>
+<body>
+
+<h1>MVCC Chunks &mdash; Postgres Schema</h1>
+
+<div class="legend">
+  <div class="legend-item"><div class="legend-swatch" style="background:#f6c354"></div> Primary Key</div>
+  <div class="legend-item"><div class="legend-swatch" style="background:#7eb8f7"></div> Foreign Key</div>
+  <div class="legend-item"><div class="legend-swatch" style="background:#c8cdd8"></div> Column</div>
+  <div class="legend-item"><svg width="14" height="14"><line x1="0" y1="7" x2="14" y2="7" stroke="#f6c354" stroke-width="1.6"/></svg> FK Relationship</div>
+</div>
+
+<svg id="canvas" viewBox="0 0 1400 920">
+  <defs>
+    <marker id="dot-gold" viewBox="0 0 8 8" refX="4" refY="4" markerWidth="6" markerHeight="6">
+      <circle cx="4" cy="4" r="3" fill="#f6c354"/>
+    </marker>
+    <marker id="dot-blue" viewBox="0 0 8 8" refX="4" refY="4" markerWidth="6" markerHeight="6">
+      <circle cx="4" cy="4" r="3" fill="#7eb8f7"/>
+    </marker>
+  </defs>
+
+  <g id="relations"></g>
+  <g id="tables"></g>
+</svg>
+
+<script>
+const TABLES = [
+  {
+    name: 'datasets',
+    section: 'Shared',
+    color: '#4ade80',
+    x: 80, y: 120,
+    columns: [
+      { name: 'id', type: 'SMALLSERIAL', pk: true },
+      { name: 'name', type: 'TEXT NOT NULL UNIQUE' },
+    ]
+  },
+  {
+    name: 'chunks',
+    section: 'Shared',
+    color: '#4ade80',
+    x: 80, y: 320,
+    columns: [
+      { name: 'chunk_pk', type: 'BIGSERIAL', pk: true },
+      { name: 'dataset_id', type: 'SMALLINT NOT NULL', fk: 'datasets.id' },
+      { name: 'chunk_id', type: 'TEXT NOT NULL' },
+      { name: 'size', type: 'INT NOT NULL' },
+      { name: 'files', type: 'TEXT[] NOT NULL' },
+      { name: 'last_block_hash', type: 'TEXT' },
+      { name: 'last_block_timestamp', type: 'BIGINT' },
+      { name: 'registered_at', type: 'TIMESTAMPTZ' },
+    ]
+  },
+  {
+    name: 'sched_assignments',
+    section: 'Scheduler',
+    color: '#818cf8',
+    x: 760, y: 80,
+    columns: [
+      { name: 'id', type: 'BIGSERIAL', pk: true },
+      { name: 'created_at', type: 'TIMESTAMPTZ' },
+      { name: 'scheduler_version', type: 'TEXT' },
+      { name: 'replication_by_weight', type: 'JSONB' },
+    ]
+  },
+  {
+    name: 'sched_chunk_metadata',
+    section: 'Scheduler',
+    color: '#818cf8',
+    x: 390, y: 340,
+    columns: [
+      { name: 'chunk_pk', type: 'BIGINT', pk: true, fk: 'chunks.chunk_pk' },
+      { name: 'applied_at_worker_assignment_id', type: 'BIGINT', fk: 'sched_assignments.id' },
+      { name: 'applied_at_portal_assignment_id', type: 'BIGINT', fk: 'sched_assignments.id' },
+      { name: 'marked_for_removal', type: 'TIMESTAMPTZ' },
+      { name: 'dropped_at_portal_assignment_id', type: 'BIGINT', fk: 'sched_assignments.id' },
+      { name: 'dropped_at_worker_assignment_id', type: 'BIGINT', fk: 'sched_assignments.id' },
+    ]
+  },
+  {
+    name: 'sched_worker_confirmations',
+    section: 'Scheduler',
+    color: '#818cf8',
+    x: 1060, y: 80,
+    columns: [
+      { name: 'assignment_id', type: 'BIGINT', pk: true, fk: 'sched_assignments.id' },
+      { name: 'confirmed_at', type: 'TIMESTAMPTZ' },
+    ]
+  },
+  {
+    name: 'sched_workers',
+    section: 'Scheduler',
+    color: '#818cf8',
+    x: 1100, y: 280,
+    columns: [
+      { name: 'id', type: 'BIGSERIAL', pk: true },
+      { name: 'peer_id', type: 'TEXT NOT NULL UNIQUE' },
+      { name: 'version', type: 'TEXT' },
+      { name: 'inactive_since', type: 'TIMESTAMPTZ' },
+    ]
+  },
+  {
+    name: 'sched_replication_reservations',
+    section: 'Scheduler',
+    color: '#818cf8',
+    x: 810, y: 340,
+    columns: [
+      { name: 'id', type: 'BIGSERIAL', pk: true },
+      { name: 'created_at', type: 'TIMESTAMPTZ' },
+      { name: 'reserved_bytes', type: 'BIGINT NOT NULL' },
+      { name: 'portal_assignment_id', type: 'BIGINT', fk: 'sched_assignments.id' },
+      { name: 'worker_assignment_id', type: 'BIGINT', fk: 'sched_assignments.id' },
+      { name: 'fulfilled_at', type: 'TIMESTAMPTZ' },
+    ]
+  },
+  {
+    name: 'sched_chunk_workers',
+    section: 'Scheduler',
+    color: '#818cf8',
+    x: 150, y: 660,
+    columns: [
+      { name: 'chunk_pk', type: 'BIGINT', pk: true, fk: 'chunks.chunk_pk' },
+      { name: 'worker_ids', type: 'BIGINT[] NOT NULL' },
+    ]
+  },
+  {
+    name: 'sched_stale_mappings',
+    section: 'Scheduler',
+    color: '#818cf8',
+    x: 530, y: 700,
+    columns: [
+      { name: 'chunk_pk', type: 'BIGINT', pk: true, fk: 'chunks.chunk_pk' },
+      { name: 'worker_id', type: 'BIGINT', pk: true, fk: 'sched_workers.id' },
+      { name: 'detected_at', type: 'TIMESTAMPTZ' },
+    ]
+  },
+];
+
+const RELATIONS = [
+  { from: 'chunks', fromCol: 'dataset_id', to: 'datasets', toCol: 'id' },
+  { from: 'sched_chunk_metadata', fromCol: 'chunk_pk', to: 'chunks', toCol: 'chunk_pk' },
+  { from: 'sched_chunk_metadata', fromCol: 'applied_at_worker_assignment_id', to: 'sched_assignments', toCol: 'id' },
+  { from: 'sched_chunk_metadata', fromCol: 'applied_at_portal_assignment_id', to: 'sched_assignments', toCol: 'id' },
+  { from: 'sched_chunk_metadata', fromCol: 'dropped_at_portal_assignment_id', to: 'sched_assignments', toCol: 'id' },
+  { from: 'sched_chunk_metadata', fromCol: 'dropped_at_worker_assignment_id', to: 'sched_assignments', toCol: 'id' },
+  { from: 'sched_worker_confirmations', fromCol: 'assignment_id', to: 'sched_assignments', toCol: 'id' },
+  { from: 'sched_replication_reservations', fromCol: 'portal_assignment_id', to: 'sched_assignments', toCol: 'id' },
+  { from: 'sched_replication_reservations', fromCol: 'worker_assignment_id', to: 'sched_assignments', toCol: 'id' },
+  { from: 'sched_chunk_workers', fromCol: 'chunk_pk', to: 'chunks', toCol: 'chunk_pk' },
+  { from: 'sched_stale_mappings', fromCol: 'chunk_pk', to: 'chunks', toCol: 'chunk_pk' },
+  { from: 'sched_stale_mappings', fromCol: 'worker_id', to: 'sched_workers', toCol: 'id' },
+];
+
+const ROW_H = 22;
+const HEADER_H = 36;
+const PAD_X = 14;
+const PAD_TOP = 8;
+const PAD_BOTTOM = 10;
+const COL_W = 280;
+
+const svgNS = 'http://www.w3.org/2000/svg';
+const tablesG = document.getElementById('tables');
+const relationsG = document.getElementById('relations');
+
+const tableEls = {};
+const colPositions = {};
+
+function buildTable(t) {
+  const g = document.createElementNS(svgNS, 'g');
+  g.classList.add('table-group');
+  g.dataset.name = t.name;
+
+  const h = HEADER_H + PAD_TOP + t.columns.length * ROW_H + PAD_BOTTOM;
+  const w = t.name.startsWith('sched_replication') || t.name === 'sched_chunk_metadata'
+    ? 360 : COL_W;
+
+  const bg = document.createElementNS(svgNS, 'rect');
+  bg.classList.add('table-bg');
+  bg.setAttribute('x', 0); bg.setAttribute('y', 0);
+  bg.setAttribute('width', w); bg.setAttribute('height', h);
+  bg.setAttribute('fill', '#1a1d28');
+  bg.setAttribute('stroke', t.color + '66');
+  g.appendChild(bg);
+
+  const headerBg = document.createElementNS(svgNS, 'rect');
+  headerBg.setAttribute('x', 0); headerBg.setAttribute('y', 0);
+  headerBg.setAttribute('width', w); headerBg.setAttribute('height', HEADER_H);
+  headerBg.setAttribute('rx', 8); headerBg.setAttribute('ry', 8);
+  headerBg.setAttribute('fill', t.color + '18');
+  g.appendChild(headerBg);
+
+  const headerFill = document.createElementNS(svgNS, 'rect');
+  headerFill.setAttribute('x', 0); headerFill.setAttribute('y', 16);
+  headerFill.setAttribute('width', w); headerFill.setAttribute('height', HEADER_H - 16);
+  headerFill.setAttribute('fill', t.color + '18');
+  g.appendChild(headerFill);
+
+  const sectionLabel = document.createElementNS(svgNS, 'text');
+  sectionLabel.classList.add('table-section-label');
+  sectionLabel.setAttribute('x', PAD_X); sectionLabel.setAttribute('y', 14);
+  sectionLabel.setAttribute('fill', t.color);
+  sectionLabel.textContent = t.section;
+  g.appendChild(sectionLabel);
+
+  const header = document.createElementNS(svgNS, 'text');
+  header.classList.add('table-header');
+  header.setAttribute('x', PAD_X); header.setAttribute('y', 30);
+  header.setAttribute('fill', t.color);
+  header.textContent = t.name;
+  g.appendChild(header);
+
+  t.columns.forEach((col, i) => {
+    const y = HEADER_H + PAD_TOP + i * ROW_H + 15;
+    const cls = col.pk ? 'col-pk' : col.fk ? 'col-fk' : 'col-regular';
+
+    const prefix = col.pk && col.fk ? 'PK FK' : col.pk ? 'PK' : col.fk ? 'FK' : '';
+
+    const nameEl = document.createElementNS(svgNS, 'text');
+    nameEl.classList.add('col-name', cls);
+    nameEl.setAttribute('x', PAD_X); nameEl.setAttribute('y', y);
+    if (prefix) {
+      const tspan = document.createElementNS(svgNS, 'tspan');
+      tspan.setAttribute('font-size', '9');
+      tspan.setAttribute('opacity', '0.6');
+      tspan.textContent = prefix + '  ';
+      nameEl.appendChild(tspan);
+    }
+    const nameTspan = document.createElementNS(svgNS, 'tspan');
+    nameTspan.textContent = col.name;
+    nameEl.appendChild(nameTspan);
+    g.appendChild(nameEl);
+
+    const typeEl = document.createElementNS(svgNS, 'text');
+    typeEl.classList.add('col-type');
+    typeEl.setAttribute('x', w - PAD_X); typeEl.setAttribute('y', y);
+    typeEl.setAttribute('text-anchor', 'end');
+    typeEl.setAttribute('fill', '#8892a8');
+    typeEl.textContent = col.type;
+    g.appendChild(typeEl);
+
+    const key = `${t.name}.${col.name}`;
+    colPositions[key] = { tableIdx: t.name, colIdx: i, relY: HEADER_H + PAD_TOP + i * ROW_H + 10 };
+  });
+
+  g.setAttribute('transform', `translate(${t.x}, ${t.y})`);
+  g._data = { x: t.x, y: t.y, w, h };
+
+  // Drag
+  let dragging = false, ox, oy;
+  g.addEventListener('mousedown', e => {
+    dragging = true;
+    const ctm = g.getScreenCTM();
+    ox = e.clientX / ctm.a - g._data.x;
+    oy = e.clientY / ctm.d - g._data.y;
+    e.preventDefault();
+  });
+  document.addEventListener('mousemove', e => {
+    if (!dragging) return;
+    const ctm = g.getScreenCTM();
+    g._data.x = e.clientX / ctm.a - ox;
+    g._data.y = e.clientY / ctm.d - oy;
+    g.setAttribute('transform', `translate(${g._data.x}, ${g._data.y})`);
+    drawRelations();
+  });
+  document.addEventListener('mouseup', () => { dragging = false; });
+
+  tablesG.appendChild(g);
+  tableEls[t.name] = g;
+}
+
+const COLORS = [
+  '#f6c354', '#7eb8f7', '#c084fc', '#fb923c', '#4ade80',
+  '#f472b6', '#67e8f9', '#a3e635', '#fbbf24', '#a78bfa',
+];
+let colorIdx = 0;
+
+function drawRelations() {
+  while (relationsG.firstChild) relationsG.removeChild(relationsG.firstChild);
+
+  RELATIONS.forEach((rel, idx) => {
+    const fromG = tableEls[rel.from];
+    const toG = tableEls[rel.to];
+    if (!fromG || !toG) return;
+
+    const fromPos = colPositions[`${rel.from}.${rel.fromCol}`];
+    const toPos = colPositions[`${rel.to}.${rel.toCol}`];
+    if (!fromPos || !toPos) return;
+
+    const fx = fromG._data.x;
+    const fy = fromG._data.y + fromPos.relY;
+    const fw = fromG._data.w;
+
+    const tx = toG._data.x;
+    const ty = toG._data.y + toPos.relY;
+    const tw = toG._data.w;
+
+    // Decide sides
+    const fromCx = fx + fw / 2;
+    const toCx = tx + tw / 2;
+
+    let x1, y1, x2, y2;
+    if (fromCx < toCx) {
+      x1 = fx + fw; y1 = fy;
+      x2 = tx; y2 = ty;
+    } else {
+      x1 = fx; y1 = fy;
+      x2 = tx + tw; y2 = ty;
+    }
+
+    const dx = Math.abs(x2 - x1);
+    const cpx = Math.max(40, dx * 0.45);
+
+    const path = document.createElementNS(svgNS, 'path');
+    const color = COLORS[idx % COLORS.length];
+    path.setAttribute('d', `M${x1},${y1} C${x1 + (x1 < x2 ? cpx : -cpx)},${y1} ${x2 + (x1 < x2 ? -cpx : cpx)},${y2} ${x2},${y2}`);
+    path.setAttribute('stroke', color);
+    path.classList.add('relation-line');
+
+    const title = document.createElementNS(svgNS, 'title');
+    title.textContent = `${rel.from}.${rel.fromCol} → ${rel.to}.${rel.toCol}`;
+    path.appendChild(title);
+    relationsG.appendChild(path);
+
+    // Dots at endpoints
+    [{ cx: x1, cy: y1 }, { cx: x2, cy: y2 }].forEach(pt => {
+      const c = document.createElementNS(svgNS, 'circle');
+      c.setAttribute('cx', pt.cx); c.setAttribute('cy', pt.cy);
+      c.setAttribute('r', 3.5); c.setAttribute('fill', color);
+      c.classList.add('relation-dot');
+      c.setAttribute('opacity', '0.7');
+      relationsG.appendChild(c);
+    });
+  });
+}
+
+// Build
+TABLES.forEach(buildTable);
+drawRelations();
+
+// Pan & zoom
+const svg = document.getElementById('canvas');
+let vb = { x: 0, y: 0, w: 1400, h: 920 };
+function applyVB() {
+  svg.setAttribute('viewBox', `${vb.x} ${vb.y} ${vb.w} ${vb.h}`);
+}
+svg.addEventListener('wheel', e => {
+  e.preventDefault();
+  const scale = e.deltaY > 0 ? 1.08 : 1 / 1.08;
+  const pt = svg.createSVGPoint();
+  pt.x = e.clientX; pt.y = e.clientY;
+  const svgPt = pt.matrixTransform(svg.getScreenCTM().inverse());
+
+  vb.x = svgPt.x - (svgPt.x - vb.x) * scale;
+  vb.y = svgPt.y - (svgPt.y - vb.y) * scale;
+  vb.w *= scale; vb.h *= scale;
+  applyVB();
+}, { passive: false });
+
+let panning = false, panStart;
+svg.addEventListener('mousedown', e => {
+  if (e.target === svg || e.target.tagName === 'path' || e.target.tagName === 'circle') {
+    panning = true;
+    panStart = { x: e.clientX, y: e.clientY, vbx: vb.x, vby: vb.y };
+  }
+});
+document.addEventListener('mousemove', e => {
+  if (!panning) return;
+  const ctm = svg.getScreenCTM();
+  vb.x = panStart.vbx - (e.clientX - panStart.x) / ctm.a;
+  vb.y = panStart.vby - (e.clientY - panStart.y) / ctm.d;
+  applyVB();
+});
+document.addEventListener('mouseup', () => { panning = false; });
+</script>
+</body>
+</html>

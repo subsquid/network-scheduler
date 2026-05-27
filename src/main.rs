@@ -2,7 +2,7 @@ use anyhow::Context;
 use clap::Parser;
 
 use network_scheduler::controller::{CacheAccess, Controller, WithAssignment};
-use network_scheduler::{cli, metrics, storage, upload};
+use network_scheduler::{cli, dataset_data_storage, metrics, upload};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -40,7 +40,7 @@ async fn run_prod_mode(args: &cli::Args, config: cli::Config) -> anyhow::Result<
         .await
         .context("Can't connect to ClickHouse")?;
 
-    let datasets_storage = storage::S3Storage::new(&args.s3.config().await);
+    let datasets_storage = dataset_data_storage::S3Storage::new(&args.s3.config().await);
 
     Controller::new(config.clone())
         .load_workers(&db)
@@ -72,7 +72,7 @@ async fn run_cli_mode(args: &cli::Args, config: cli::Config) -> anyhow::Result<W
         known_chunks.len()
     );
 
-    let datasets_storage = storage::S3Storage::new(&args.s3.config().await);
+    let datasets_storage = dataset_data_storage::S3Storage::new(&args.s3.config().await);
 
     Controller::new(config.clone())
         .load_workers_from_config(workers)

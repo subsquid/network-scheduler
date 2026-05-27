@@ -47,13 +47,25 @@ pub fn schedule(
     let reliable_workers = sorted_workers.len();
     sorted_workers.extend(workers.iter().filter(|w| !w.reliable()));
 
+    let make_assignments = |workers: &[&Worker]| -> Vec<WorkerAllocations> {
+        workers
+            .iter()
+            .map(|_| WorkerAllocations {
+                chunks: Vec::new(),
+                allocated: 0,
+                capacity: config.worker_capacity,
+            })
+            .collect()
+    };
+
     if config.ignore_reliability {
         tracing::info!(
             "Scheduling {} chunks to {} workers",
             chunks.len(),
             workers.len(),
         );
-        return schedule_to_workers(chunks, &sorted_workers, &config);
+        let assignments = make_assignments(&sorted_workers);
+        return schedule_to_workers(chunks, &sorted_workers, &config, assignments);
     }
 
     tracing::info!(
@@ -61,7 +73,13 @@ pub fn schedule(
         chunks.len(),
         reliable_workers
     );
-    let mut reliable = schedule_to_workers(chunks, &sorted_workers[..reliable_workers], &config)?;
+    let assignments = make_assignments(&sorted_workers[..reliable_workers]);
+    let mut reliable = schedule_to_workers(
+        chunks,
+        &sorted_workers[..reliable_workers],
+        &config,
+        assignments,
+    )?;
 
     if reliable_workers == workers.len() {
         return Ok(reliable);
@@ -72,7 +90,8 @@ pub fn schedule(
         chunks.len(),
         workers.len()
     );
-    let all = schedule_to_workers(chunks, &sorted_workers, &config)?;
+    let assignments = make_assignments(&sorted_workers);
+    let all = schedule_to_workers(chunks, &sorted_workers, &config, assignments)?;
 
     // Use assignment from `reliable` for reliable workers and from `all` for unreliable workers
     for (worker_id, chunk_indexes) in all.worker_chunks {
@@ -84,10 +103,41 @@ pub fn schedule(
     Ok(reliable)
 }
 
+pub fn schedule_with_per_worker_allocations(
+    chunks: &[ScheduledChunk<'_>],
+    workers: &[Worker],
+    config: SchedulingConfig,
+    worker_allocations: &BTreeMap<PeerId, u64>,
+) -> Result<Assignment, ReplicationError> {
+    let _timer = crate::metrics::Timer::new("schedule_with_per_worker_allocations");
+    let sorted_workers: Vec<&Worker> = workers.iter().collect();
+
+    tracing::info!(
+        "Scheduling {} chunks to {} workers (per-worker allocations)",
+        chunks.len(),
+        workers.len(),
+    );
+
+    let assignments: Vec<WorkerAllocations> = sorted_workers
+        .iter()
+        .map(|w| {
+            let allocated = worker_allocations.get(&w.id).copied().unwrap_or(0);
+            WorkerAllocations {
+                chunks: Vec::new(),
+                allocated: 0,
+                capacity: config.worker_capacity.saturating_sub(allocated),
+            }
+        })
+        .collect();
+
+    schedule_to_workers(chunks, &sorted_workers, &config, assignments)
+}
+
 fn schedule_to_workers(
     chunks: &[ScheduledChunk<'_>],
     workers: &[&Worker],
     config: &SchedulingConfig,
+    assignments: Vec<WorkerAllocations>,
 ) -> Result<Assignment, ReplicationError> {
     let size_by_weight = chunks
         .iter()
@@ -98,7 +148,7 @@ fn schedule_to_workers(
         .collect();
 
     let total_capacity =
-        (config.worker_capacity as f64 * workers.len() as f64 * config.saturation) as u64;
+        (assignments.iter().map(|a| a.capacity).sum::<u64>() as f64 * config.saturation) as u64;
 
     let mapping = calc_replication_factors(
         size_by_weight,
@@ -126,7 +176,7 @@ fn schedule_to_workers(
         chunks.iter().map(|c| c.replication as u64).sum::<u64>()
     );
 
-    let worker_chunks = distribute(&chunks, workers, config.worker_capacity);
+    let worker_chunks = distribute(&chunks, workers, assignments);
     Ok(Assignment {
         worker_chunks,
         replication_by_weight: mapping,
@@ -222,7 +272,7 @@ struct ReplicatedChunk<'a> {
 fn distribute(
     chunks: &[ReplicatedChunk],
     workers: &[&Worker],
-    worker_capacity: u64,
+    assignments: Vec<WorkerAllocations>,
 ) -> BTreeMap<PeerId, Vec<ChunkIndex>> {
     let _timer = crate::metrics::Timer::new("schedule:distribute");
     let worker_ids = workers.iter().map(|w| w.id).collect_vec();
@@ -238,7 +288,7 @@ fn distribute(
             .minimum_worker_version
             .is_none()
     });
-    assign_chunks(orderings, chunks, workers, rings, worker_capacity)
+    assign_chunks(orderings, chunks, workers, rings, assignments)
 }
 
 #[instrument(skip_all)]
@@ -303,29 +353,23 @@ fn hash_chunks(
         .collect()
 }
 
+struct WorkerAllocations {
+    chunks: Vec<ChunkIndex>,
+    allocated: u64,
+    capacity: u64,
+}
+
 #[instrument(skip_all)]
 fn assign_chunks(
     orderings: Vec<(ChunkIndex, RingIndex, WorkerIndex)>,
     chunks: &[ReplicatedChunk],
     workers: &[&Worker],
     rings: Vec<Vec<(u64, WorkerIndex)>>,
-    worker_capacity: u64,
+    mut worker_allocations: Vec<WorkerAllocations>,
 ) -> BTreeMap<PeerId, Vec<ChunkIndex>> {
     tracing::info!("Assigning chunks");
     let _timer = crate::metrics::Timer::new("schedule:distribute:assign_chunks");
 
-    struct WorkerAssignment {
-        chunks: Vec<ChunkIndex>,
-        allocated: u64,
-    }
-
-    let mut assignments: Vec<WorkerAssignment> = workers
-        .iter()
-        .map(|_| WorkerAssignment {
-            chunks: Vec::new(),
-            allocated: 0,
-        })
-        .collect();
     orderings
         .into_iter()
         .for_each(|(chunk_index, ring_index, first)| {
@@ -341,9 +385,9 @@ fn assign_chunks(
                     }
                 }
 
-                let assignment = &mut assignments[worker_index as usize];
+                let assignment = &mut worker_allocations[worker_index as usize];
 
-                if assignment.allocated + chunk.size as u64 <= worker_capacity
+                if assignment.allocated + chunk.size as u64 <= assignment.capacity
                     // Replicas of the same chunk stay adjacent after the stable sort
                     // (they share the same minimum_worker_version key), so checking
                     // the last assigned index is sufficient to prevent duplicates.
@@ -360,7 +404,7 @@ fn assign_chunks(
             );
         });
 
-    assignments
+    worker_allocations
         .into_iter()
         .enumerate()
         .map(|(index, a)| (workers[index].id, a.chunks))
