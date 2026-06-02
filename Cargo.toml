@@ -43,6 +43,4 @@ tracing-subscriber = { version = "0.3.19", features = ["env-filter", "parking_lo
 secrecy = { version = "0.10.3", features = ["serde"] }
 
 [dev-dependencies]
-claims = "0.8"
-maplit = "1.0.2"
 proptest = "1.11"

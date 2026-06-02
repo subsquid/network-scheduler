@@ -9,6 +9,7 @@ use super::{
     utils::{Stats, compare_intersection},
 };
 use crate::{
+    replication::ReplicationError,
     scheduling::{ScheduledChunk, SchedulingConfig, schedule},
     types::{Assignment, Worker, WorkerIndex, WorkerStatus},
 };
@@ -291,6 +292,88 @@ fn test_minimum_worker_version_filtering() {
     }
 }
 
+/// `schedule` must give every version-restricted chunk at least
+/// `min_replication` replicas, all on eligible workers — even when eligible workers
+/// are scarce and unrestricted chunks compete for their capacity. The multi-step
+/// ordering places the restricted minimum *first*, so unrestricted data can't starve
+/// it (the failure mode a per-round interleaving would have).
+///
+/// Scenario: 100 workers, only 20 eligible, 10% of chunks restricted, min_replication 3.
+#[test]
+fn test_restricted_chunks_reach_min_replication() {
+    let min_version = Version::new(2, 8, 0);
+    const N_WORKERS: WorkerIndex = 100;
+    const N_ELIGIBLE: WorkerIndex = 20;
+    const N_CHUNKS: u32 = 10_000;
+    const N_VERSIONED: u32 = 1_000; // 10% restricted
+    const MIN_REPLICATION: u16 = 3;
+
+    let mut test_data = generate_chunks(N_CHUNKS, &[1]);
+    for entry in &mut test_data.entries[..N_VERSIONED as usize] {
+        entry.minimum_worker_version = Some(min_version.clone());
+    }
+    let chunks = test_data.as_scheduled();
+
+    let workers = generate_workers(N_WORKERS)
+        .into_iter()
+        .enumerate()
+        .map(|(i, id)| Worker {
+            id,
+            status: WorkerStatus::Online,
+            version: Some(if (i as WorkerIndex) < N_ELIGIBLE {
+                Version::new(2, 8, 0)
+            } else {
+                Version::new(2, 7, 0)
+            }),
+        })
+        .collect_vec();
+
+    let eligible_ids = workers[..N_ELIGIBLE as usize]
+        .iter()
+        .map(|w| w.id)
+        .collect::<std::collections::BTreeSet<_>>();
+
+    // Capacity tuned so the byte-budget factor is small while eligible workers can
+    // comfortably hold the restricted minimum alongside some unrestricted data.
+    let total_size: u64 = chunks.iter().map(|c| c.size as u64).sum();
+    let worker_capacity = total_size / N_ELIGIBLE as u64;
+
+    let assignment = schedule(
+        &chunks,
+        &workers,
+        SchedulingConfig {
+            worker_capacity,
+            saturation: 0.9,
+            min_replication: MIN_REPLICATION,
+            ignore_reliability: false,
+        },
+    )
+    .unwrap();
+
+    // Restricted chunks are indices 0..N_VERSIONED; count their replicas and make sure
+    // each one only landed on eligible workers.
+    let mut replicas = vec![0u16; N_VERSIONED as usize];
+    for (worker_id, chunk_indexes) in &assignment.worker_chunks {
+        let eligible = eligible_ids.contains(worker_id);
+        for &i in chunk_indexes {
+            if i < N_VERSIONED {
+                assert!(
+                    eligible,
+                    "restricted chunk {i} placed on ineligible worker {worker_id:?}",
+                );
+                replicas[i as usize] += 1;
+            }
+        }
+    }
+
+    for (i, &count) in replicas.iter().enumerate() {
+        assert!(
+            count >= MIN_REPLICATION,
+            "restricted chunk {i} got only {count} replicas, expected >= {MIN_REPLICATION}",
+        );
+    }
+}
+
 /// Verifies that version restrictions cause no (or negligible) spill of
 /// unrestricted chunks compared to a baseline without restrictions.
 /// Uses the same scenario as test_minimum_worker_version_filtering.
@@ -468,21 +551,19 @@ fn test_minimum_worker_version_gradual_upgrade() {
     }
 }
 
-/// Verifies that scheduling panics up-front when R > E (replication factor
-/// exceeds eligible worker count), even though the capacity constraint
-/// is satisfied.
-/// Scenario: 100 workers, 8 eligible, 95% saturation, 0.4% versioned chunks.
-///
-/// R = floor(10 * 0.95) = 9 > E = 8. Panics (can't place 9 replicas on 8 workers).
-/// f = 0.004 ≤ (0.05 * 8) / (0.95 * 92) = 0.0046 ✓ (capacity would suffice).
+/// With fewer eligible workers than the required `min_replication`, a
+/// version-restricted chunk's minimum replicas can't all be placed (a worker holds at
+/// most one replica of a chunk). Scheduling reports `NotEnoughCapacity` instead of
+/// over-replicating onto fewer workers or panicking.
+/// Scenario: 100 workers, 8 eligible, `min_replication = 9`, 0.4% versioned chunks.
 #[test]
-#[should_panic(expected = "Not enough eligible workers")]
 fn test_minimum_worker_version_insufficient_eligible_workers() {
     let min_version = Version::new(2, 8, 0);
     const N_WORKERS: WorkerIndex = 100;
     const N_ELIGIBLE: WorkerIndex = 8;
     const N_CHUNKS: u32 = 50_000;
     const N_VERSIONED: u32 = 200; // 0.4% of chunks
+    const MIN_REPLICATION: u16 = 9; // one more than the 8 eligible workers
 
     let mut test_data = generate_chunks(N_CHUNKS, &[1]);
     for entry in &mut test_data.entries[..N_VERSIONED as usize] {
@@ -507,34 +588,35 @@ fn test_minimum_worker_version_insufficient_eligible_workers() {
         })
         .collect_vec();
 
-    let _ = schedule(
+    let result = schedule(
         &chunks,
         &workers,
         SchedulingConfig {
             worker_capacity,
             saturation: 0.95,
-            min_replication: 1,
+            min_replication: MIN_REPLICATION,
             ignore_reliability: false,
         },
     );
+    assert!(
+        matches!(result, Err(ReplicationError::NotEnoughCapacity)),
+        "expected NotEnoughCapacity (can't place {MIN_REPLICATION} replicas on {N_ELIGIBLE} \
+         eligible workers), got {result:?}",
+    );
 }
 
-/// Verifies that scheduling panics up-front when the restricted data
-/// fraction exceeds the saturation headroom (even though R ≤ E).
+/// A dense restricted fraction (6%) that the old scheduler rejected up front as
+/// "exceeds saturation headroom" is now simply placed: there's enough hard capacity on
+/// the eligible workers, so `schedule` succeeds and every restricted chunk lands only on
+/// eligible workers.
 /// Scenario: 100 workers, 50 eligible, 95% saturation, 6% versioned chunks.
-/// Same framework as test_minimum_worker_version_filtering but f slightly
-/// above the threshold.
-///
-/// R = floor(10 * 0.95) = 9 ≤ E = 50 ✓
-/// f = 0.06 > (0.05 * 50) / (0.95 * 50) = 0.0526 (~14% over limit). Panics.
 #[test]
-#[should_panic(expected = "exceeds saturation headroom")]
-fn test_minimum_worker_version_eligible_capacity_exceeded() {
+fn test_minimum_worker_version_dense_restricted_data_is_placed() {
     let min_version = Version::new(2, 8, 0);
     const N_WORKERS: WorkerIndex = 100;
     const N_ELIGIBLE: WorkerIndex = 50;
     const N_CHUNKS: u32 = 50_000;
-    const N_VERSIONED: u32 = 3_000; // 6% of chunks, just above the ~5.26% threshold
+    const N_VERSIONED: u32 = 3_000; // 6% of chunks — above the old headroom threshold
 
     let mut test_data = generate_chunks(N_CHUNKS, &[1]);
     for entry in &mut test_data.entries[..N_VERSIONED as usize] {
@@ -559,7 +641,7 @@ fn test_minimum_worker_version_eligible_capacity_exceeded() {
         })
         .collect_vec();
 
-    let _ = schedule(
+    let assignment = schedule(
         &chunks,
         &workers,
         SchedulingConfig {
@@ -568,7 +650,21 @@ fn test_minimum_worker_version_eligible_capacity_exceeded() {
             min_replication: 1,
             ignore_reliability: false,
         },
-    );
+    )
+    .expect("multi-step scheduler should place the dense restricted data");
+
+    let eligible = workers[..N_ELIGIBLE as usize]
+        .iter()
+        .map(|w| w.id)
+        .collect::<std::collections::BTreeSet<_>>();
+    for (worker_id, chunk_indexes) in &assignment.worker_chunks {
+        if !eligible.contains(worker_id) {
+            assert!(
+                chunk_indexes.iter().all(|&i| i >= N_VERSIONED),
+                "restricted chunk placed on ineligible worker {worker_id:?}",
+            );
+        }
+    }
 }
 
 /// Verifies zero reassignment when version restriction is removed after

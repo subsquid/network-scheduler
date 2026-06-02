@@ -4,13 +4,13 @@ use libp2p_identity::PeerId;
 
 use crate::{cli, types::WorkerIndex};
 
-use super::{Chunk, ChunkIndex, Worker, WorkerStatus};
+use super::{Chunk, ChunkIndex, ChunkWeight, ReplicationFactor, Worker, WorkerStatus};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Assignment {
     // chunk indexes are sorted
     pub worker_chunks: BTreeMap<PeerId, Vec<ChunkIndex>>,
-    pub replication_by_weight: BTreeMap<u16, u16>,
+    pub replication_by_weight: BTreeMap<ChunkWeight, ReplicationFactor>,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
