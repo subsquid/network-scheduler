@@ -109,7 +109,7 @@ impl Assignment {
 
             let is_last_in_dataset = iter
                 .peek()
-                .map_or(true, |(next, _)| next.dataset != chunk.dataset);
+                .is_none_or(|(next, _)| next.dataset != chunk.dataset);
 
             let download_url = if config.storage_allow_insecure_scheme {
                 format!("http://{}/{}/", config.storage_domain, chunk.bucket())

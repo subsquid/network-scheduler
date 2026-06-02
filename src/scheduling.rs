@@ -210,16 +210,16 @@ fn validate_version_restrictions(
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct ReplicatedChunk<'a> {
-    dataset: &'a str,
-    chunk_id: &'a str,
-    size: u32,
-    replication: u16,
-    minimum_worker_version: Option<&'a Version>,
+pub(crate) struct ReplicatedChunk<'a> {
+    pub(crate) dataset: &'a str,
+    pub(crate) chunk_id: &'a str,
+    pub(crate) size: u32,
+    pub(crate) replication: u16,
+    pub(crate) minimum_worker_version: Option<&'a Version>,
 }
 
 #[instrument(skip_all)]
-fn distribute(
+pub(crate) fn distribute(
     chunks: &[ReplicatedChunk],
     workers: &[&Worker],
     worker_capacity: u64,
