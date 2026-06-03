@@ -2,7 +2,7 @@ use std::path::Path;
 
 use bytesize::ByteSize;
 
-use crate::simulation::ReshuffleMetrics;
+use crate::metrics::ReshuffleMetrics;
 
 pub fn generate_html(metrics: &[ReshuffleMetrics], path: &Path) -> anyhow::Result<()> {
     let steps: Vec<u32> = metrics.iter().map(|m| m.step).collect();
@@ -62,6 +62,15 @@ pub fn generate_html(metrics: &[ReshuffleMetrics], path: &Path) -> anyhow::Resul
         .iter()
         .map(|m| m.data_movement.workers_shuffled)
         .collect();
+    let eligible_workers: Vec<usize> = metrics.iter().map(|m| m.eligible_workers).collect();
+    let scheduled_flags: Vec<u8> = metrics.iter().map(|m| m.scheduled as u8).collect();
+    let restricted_download_raw: Vec<u64> = metrics
+        .iter()
+        .map(|m| {
+            let r = &m.restricted_movement;
+            r.new_chunk_bytes + r.shuffled_bytes + r.increased_replication_bytes
+        })
+        .collect();
 
     let new_chunk_bytes_fmt: Vec<String> = new_chunk_bytes_raw
         .iter()
@@ -100,6 +109,25 @@ pub fn generate_html(metrics: &[ReshuffleMetrics], path: &Path) -> anyhow::Resul
         })
         .collect();
 
+    // If the run stopped because scheduling failed, show the recorded reason.
+    let stop_banner = metrics
+        .iter()
+        .find(|m| !m.scheduled)
+        .map(|m| {
+            let reason = m
+                .failure_reason
+                .as_deref()
+                .unwrap_or("scheduling failed")
+                .replace('&', "&amp;")
+                .replace('<', "&lt;")
+                .replace('>', "&gt;");
+            format!(
+                r#"<div class="stop-banner"><strong>Simulation stopped at step {}:</strong> {}</div>"#,
+                m.step, reason
+            )
+        })
+        .unwrap_or_default();
+
     let html = format!(
         r##"<!DOCTYPE html>
 <html lang="en">
@@ -117,12 +145,14 @@ pub fn generate_html(metrics: &[ReshuffleMetrics], path: &Path) -> anyhow::Resul
   canvas {{ width: 100% !important; }}
   table {{ border-collapse: collapse; width: 100%; font-size: 13px; }}
   th, td {{ border: 1px solid #ddd; padding: 6px 10px; text-align: right; }}
+  .stop-banner {{ max-width: 1400px; margin: 0 auto 16px; padding: 12px 16px; background: #ffe5e5; border: 1px solid #ffb3b3; border-radius: 8px; color: #900; }}
   th {{ background: #f0f0f0; position: sticky; top: 0; }}
   td:first-child, th:first-child {{ text-align: center; }}
 </style>
 </head>
 <body>
 <h1>Reshuffle Simulation Report</h1>
+{stop_banner}
 <div class="grid">
 
 <div class="card">
@@ -157,16 +187,25 @@ pub fn generate_html(metrics: &[ReshuffleMetrics], path: &Path) -> anyhow::Resul
   <canvas id="capacityChart"></canvas>
 </div>
 
+<div class="card">
+  <canvas id="eligibleWorkersChart"></canvas>
+</div>
+
+<div class="card">
+  <canvas id="restrictedDownloadChart"></canvas>
+</div>
+
 <div class="card wide">
 <h3 style="margin-top:0">Raw Data</h3>
 <div style="overflow-x:auto">
 <table>
 <tr>
-  <th>Step</th><th>New chunks</th><th>Total chunks</th><th>Replication factor</th>
+  <th>Step</th><th>New chunks</th><th>New restricted</th><th>Total chunks</th><th>Total restricted</th><th>Replication factor</th>
   <th>New chunks download (all replicas)</th><th>Shuffled chunks</th><th>Shuffled chunks download (all replicas)</th>
   <th>Replication increase download</th><th>Replication decrease freed</th><th>Total S3 download (all replicas)</th>
   <th>Free capacity</th><th>Used %</th>
   <th>Workers receiving new</th><th>Workers losing</th><th>Workers receiving shuffled</th>
+  <th>Eligible workers</th><th>Scheduled</th><th>Restricted download (all replicas)</th>
 </tr>
 {table_rows}
 </table>
@@ -190,6 +229,9 @@ const usedPct = {used_pct:?};
 const workersReceivingNew = {workers_receiving_new:?};
 const workersLosing = {workers_losing:?};
 const workersShuffled = {workers_shuffled:?};
+const eligibleWorkers = {eligible_workers:?};
+const scheduledFlags = {scheduled_flags:?};
+const restrictedDownload = {restricted_download_raw:?};
 
 function formatBytes(b) {{
   if (b === 0) return '0 B';
@@ -331,6 +373,38 @@ new Chart(document.getElementById('capacityChart'), {{
     }}
   }}
 }});
+
+new Chart(document.getElementById('eligibleWorkersChart'), {{
+  type: 'line',
+  data: {{
+    labels: stepLabels,
+    datasets: [
+      {{ label: 'Workers on new version', data: eligibleWorkers, borderColor: '#36a2eb', backgroundColor: 'rgba(54,162,235,0.1)', fill: true }}
+    ]
+  }},
+  options: {{
+    plugins: {{ title: {{ display: true, text: 'Worker Version Upgrade Progress (eligible workers)' }} }},
+    scales: {{ y: {{ beginAtZero: true }} }}
+  }}
+}});
+
+new Chart(document.getElementById('restrictedDownloadChart'), {{
+  type: 'bar',
+  data: {{
+    labels: stepLabels,
+    datasets: [
+      {{
+        label: 'Restricted chunk download (all replicas)',
+        data: restrictedDownload,
+        backgroundColor: scheduledFlags.map(f => f ? 'rgba(153,102,255,0.7)' : 'rgba(255,99,132,0.9)')
+      }}
+    ]
+  }},
+  options: {{
+    plugins: {{ title: {{ display: true, text: 'Version-Restricted Download per Step (red = scheduling failed)' }}, tooltip: bytesTooltip }},
+    scales: {{ y: bytesScale }}
+  }}
+}});
 </script>
 </body>
 </html>"##,
@@ -368,11 +442,16 @@ fn build_table_rows(
         .enumerate()
         .map(|(i, m)| {
             let dm = &m.data_movement;
+            let r = &m.restricted_movement;
+            let restricted_dl = r.new_chunk_bytes + r.shuffled_bytes + r.increased_replication_bytes;
+            let scheduled = if m.scheduled { "yes" } else { "NO" };
             format!(
-                "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+                "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
                 m.step,
                 m.new_chunks_in_step,
+                m.new_restricted_in_step,
                 m.total_chunks,
+                m.total_restricted_chunks,
                 replication_labels[i],
                 new_chunk_bytes[i],
                 dm.shuffled_count,
@@ -385,6 +464,9 @@ fn build_table_rows(
                 dm.workers_receiving_new,
                 dm.workers_losing,
                 dm.workers_shuffled,
+                m.eligible_workers,
+                scheduled,
+                ByteSize(restricted_dl),
             )
         })
         .collect::<Vec<_>>()

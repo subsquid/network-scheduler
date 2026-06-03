@@ -1,279 +1,215 @@
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    sync::Arc,
-};
+//! Drives the simulation: advances chunk ingestion and worker upgrades step by
+//! step, schedules each step, and collects reshuffle metrics.
 
-use anyhow::Context;
-use libp2p_identity::PeerId;
+use std::collections::HashSet;
+
 use network_scheduler::{
-    scheduling::{ScheduledChunk, SchedulingConfig, schedule},
+    cli::DatasetsConfig,
+    scheduling::SchedulingConfig,
     types::{Chunk, Worker},
-    weight::prepare_chunks,
 };
-use rand::prelude::*;
+use rand::rngs::StdRng;
+use semver::Version;
 
-use crate::{ChunkOwners, ChunkSizeIndex, baseline::DatasetInfo};
+use crate::baseline::{Baseline, DatasetInfo};
+use crate::metrics::{ReshuffleMetrics, StepStats};
+use crate::rate::ChunkRate;
+use crate::upgrade::{self, UpgradeSchedule, WorkerVersionState};
+use crate::{ChunkId, ChunkOwners, chunks, metrics, scheduler};
 
-pub struct ReshuffleMetrics {
-    pub step: u32,
-    pub new_chunks_in_step: u32,
-    pub total_chunks: usize,
-    pub replication_by_weight: BTreeMap<u16, u16>,
-    pub data_movement: DataMovement,
-    pub total_capacity_bytes: u64,
-    pub used_capacity_bytes: u64,
+/// CLI-derived knobs controlling a run.
+pub struct SimulationParams {
+    pub steps: u32,
+    pub chunk_rate: ChunkRate,
+    pub chunk_size: Option<u32>,
+    pub restricted_fraction: f64,
+    pub initial_new_fraction: f64,
+    pub upgrade_schedule: UpgradeSchedule,
+    pub lift_restriction_at_step: Option<u32>,
 }
 
-pub struct DataMovement {
-    pub new_chunk_bytes: u64,
-    pub shuffled_bytes: u64,
-    pub shuffled_count: u32,
-    pub increased_replication_bytes: u64,
-    pub decreased_replication_bytes: u64,
-    pub workers_receiving_new: usize,
-    pub workers_losing: usize,
-    pub workers_shuffled: usize,
+/// End-of-run totals.
+pub struct Summary {
+    pub total_chunks_added: usize,
+    pub restricted_chunks: usize,
+    pub upgraded_workers: usize,
+    pub total_workers: usize,
+    pub new_worker_version: Version,
 }
 
-// --- Chunk generation ---
+pub struct Simulation {
+    params: SimulationParams,
+    datasets_config: DatasetsConfig,
+    scheduling_config: SchedulingConfig,
+    new_worker_version: Version,
 
-fn build_cumulative_distribution(datasets: &[DatasetInfo]) -> Vec<(usize, f64)> {
-    let total: f64 = datasets.iter().map(|d| d.chunk_count as f64).sum();
-    let mut cumulative = Vec::with_capacity(datasets.len());
-    let mut acc = 0.0;
-    for (i, ds) in datasets.iter().enumerate() {
-        acc += ds.chunk_count as f64 / total;
-        cumulative.push((i, acc));
-    }
-    cumulative
+    datasets: Vec<DatasetInfo>,
+    workers: Vec<Worker>,
+    baseline_chunks: Vec<Chunk>,
+    accumulated_new_chunks: Vec<Chunk>,
+    restricted_ids: HashSet<ChunkId>,
+    previous_owners: ChunkOwners,
+    version_state: WorkerVersionState,
+    rng: StdRng,
 }
 
-fn sample_dataset_index(cumulative: &[(usize, f64)], rng: &mut impl Rng) -> usize {
-    let r: f64 = rng.random();
-    cumulative
-        .iter()
-        .find(|(_, threshold)| r <= *threshold)
-        .map(|(i, _)| *i)
-        .unwrap_or(cumulative.len() - 1)
-}
-
-/// Creates synthetic chunks at the head (latest blocks) of each dataset.
-/// Datasets are sampled proportionally to their existing chunk counts —
-/// a dataset with 60% of total chunks receives ~60% of new chunks.
-/// Each generated chunk extends the dataset's block range using its average block span and size.
-pub fn generate_new_chunks(
-    datasets: &mut Vec<DatasetInfo>,
-    chunks_to_generate: u32,
-    rng: &mut impl Rng,
-) -> Vec<Chunk> {
-    let cumulative_distribution = build_cumulative_distribution(datasets);
-    let mut new_chunks = Vec::with_capacity(chunks_to_generate as usize);
-
-    for _ in 0..chunks_to_generate {
-        let dataset_index = sample_dataset_index(&cumulative_distribution, rng);
-        let dataset = &mut datasets[dataset_index];
-
-        let first_block = dataset.last_block + 1;
-        let last_block = first_block + dataset.avg_block_span - 1;
-        let chunk_id = format!(
-            "{:010}/{:010}-{:010}-{:08x}",
-            first_block, first_block, last_block, first_block as u32
+impl Simulation {
+    pub fn new(
+        baseline: Baseline,
+        datasets_config: DatasetsConfig,
+        scheduling_config: SchedulingConfig,
+        params: SimulationParams,
+        mut rng: StdRng,
+    ) -> Self {
+        let new_worker_version = upgrade::new_version();
+        let version_state = WorkerVersionState::new(
+            baseline.workers.len(),
+            params.initial_new_fraction,
+            &mut rng,
         );
 
-        new_chunks.push(Chunk {
-            dataset: dataset.dataset_id.clone(),
-            id: Arc::new(chunk_id),
-            size: dataset.avg_chunk_size,
-            blocks: first_block..=last_block,
-            files: Arc::new(vec![]),
-            summary: None,
-        });
+        let mut workers = baseline.workers;
+        version_state.apply(&mut workers, &new_worker_version);
 
-        dataset.last_block = last_block;
-        dataset.chunk_count += 1;
-    }
-
-    new_chunks
-}
-
-// --- Scheduling ---
-
-/// Merges existing and new chunks, assigns weights via the config's dataset segments,
-/// and runs the full scheduling algorithm. Chunks are sorted by dataset then block number
-/// so that `prepare_chunks` can resolve relative segment boundaries (e.g. `from: -10000000`)
-/// against the updated last_block of each dataset.
-pub fn schedule_combined_chunks(
-    existing_chunks: &[Chunk],
-    new_chunks: &[Chunk],
-    workers: &[Worker],
-    datasets_config: &network_scheduler::cli::DatasetsConfig,
-    scheduling_config: &SchedulingConfig,
-) -> anyhow::Result<(Vec<Chunk>, network_scheduler::types::Assignment)> {
-    let mut combined: Vec<Chunk> = existing_chunks.to_vec();
-    combined.extend_from_slice(new_chunks);
-    combined.sort_by(|a, b| {
-        a.dataset
-            .cmp(&b.dataset)
-            .then(a.blocks.start().cmp(b.blocks.start()))
-    });
-
-    let prepared = prepare_chunks(combined, datasets_config);
-
-    let scheduled_chunks: Vec<ScheduledChunk> = prepared
-        .iter()
-        .map(|(chunk, weight, mwv)| ScheduledChunk {
-            dataset: &chunk.dataset,
-            chunk_id: &chunk.id,
-            size: chunk.size,
-            weight: *weight,
-            minimum_worker_version: mwv.as_ref(),
-        })
-        .collect();
-
-    let assignment = schedule(&scheduled_chunks, workers, scheduling_config.clone())
-        .context("Scheduling failed")?;
-    drop(scheduled_chunks);
-
-    let filtered_chunks: Vec<Chunk> = prepared.into_iter().map(|(c, _, _)| c).collect();
-
-    Ok((filtered_chunks, assignment))
-}
-
-// --- Assignment diffing ---
-
-fn chunk_owners_from_assignment(
-    chunks: &[Chunk],
-    assignment: &network_scheduler::types::Assignment,
-) -> ChunkOwners {
-    let mut owners: ChunkOwners = BTreeMap::new();
-    for (worker, indexes) in &assignment.worker_chunks {
-        for &chunk_index in indexes {
-            let chunk = &chunks[chunk_index as usize];
-            owners
-                .entry((chunk.dataset.clone(), chunk.id.clone()))
-                .or_default()
-                .insert(*worker);
+        Self {
+            params,
+            datasets_config,
+            scheduling_config,
+            new_worker_version,
+            datasets: baseline.datasets,
+            workers,
+            baseline_chunks: baseline.chunks,
+            accumulated_new_chunks: Vec::new(),
+            restricted_ids: HashSet::new(),
+            previous_owners: baseline.chunk_owners,
+            version_state,
+            rng,
         }
     }
-    owners
-}
 
-/// Classifies data movement between two assignments by cause.
-/// For each chunk in the current assignment:
-/// - New chunk (not in previous): all replicas count as new_chunk_bytes.
-/// - Existing chunk: workers gained/lost are classified as shuffle (1:1 swap)
-///   or replication change (net gain/loss of replicas).
-fn compute_data_movement(
-    previous: &ChunkOwners,
-    current: &ChunkOwners,
-    chunk_sizes: &ChunkSizeIndex,
-) -> DataMovement {
-    let mut result = DataMovement {
-        new_chunk_bytes: 0,
-        shuffled_bytes: 0,
-        shuffled_count: 0,
-        increased_replication_bytes: 0,
-        decreased_replication_bytes: 0,
-        workers_receiving_new: 0,
-        workers_losing: 0,
-        workers_shuffled: 0,
-    };
+    /// The worker fleet, reflecting the current version distribution.
+    pub fn workers(&self) -> &[Worker] {
+        &self.workers
+    }
 
-    let mut workers_receiving_new: BTreeSet<PeerId> = BTreeSet::new();
-    let mut workers_losing: BTreeSet<PeerId> = BTreeSet::new();
-    let mut workers_shuffled: BTreeSet<PeerId> = BTreeSet::new();
-
-    for (chunk_id, current_workers) in current {
-        let size = *chunk_sizes.get(chunk_id).unwrap_or(&0) as u64;
-
-        if let Some(previous_workers) = previous.get(chunk_id) {
-            let gained: usize = current_workers.difference(previous_workers).count();
-            let lost: usize = previous_workers.difference(current_workers).count();
-
-            let shuffled = gained.min(lost);
-            let replication_increase = gained.saturating_sub(lost);
-            let replication_decrease = lost.saturating_sub(gained);
-
-            if shuffled > 0 {
-                result.shuffled_count += 1;
-                result.shuffled_bytes += size * shuffled as u64;
+    /// Runs every step, invoking `on_step` with the metrics collected so far
+    /// after each one. Stops early if a step fails to schedule. Returns the
+    /// full metrics series.
+    pub fn run(&mut self, mut on_step: impl FnMut(&[ReshuffleMetrics])) -> Vec<ReshuffleMetrics> {
+        let mut all_metrics = Vec::new();
+        for step in 1..=self.params.steps {
+            let metrics = self.run_step(step);
+            let stop = !metrics.scheduled;
+            all_metrics.push(metrics);
+            on_step(&all_metrics);
+            if stop {
+                break;
             }
-            result.increased_replication_bytes += size * replication_increase as u64;
-            result.decreased_replication_bytes += size * replication_decrease as u64;
+        }
+        all_metrics
+    }
 
-            if gained > 0 {
-                for w in current_workers.difference(previous_workers) {
-                    workers_shuffled.insert(*w);
-                }
+    pub fn summary(&self) -> Summary {
+        Summary {
+            total_chunks_added: self.accumulated_new_chunks.len(),
+            restricted_chunks: self.restricted_ids.len(),
+            upgraded_workers: self.version_state.eligible_count(),
+            total_workers: self.workers.len(),
+            new_worker_version: self.new_worker_version.clone(),
+        }
+    }
+
+    fn run_step(&mut self, step: u32) -> ReshuffleMetrics {
+        self.lift_restrictions_if_due(step);
+
+        let restricted_fraction = self.restricted_fraction(step);
+        let chunks_to_generate = self.params.chunk_rate.count_at(step, self.params.steps);
+        let (new_chunks, restricted) = chunks::generate_new_chunks(
+            &mut self.datasets,
+            chunks_to_generate,
+            restricted_fraction,
+            self.params.chunk_size,
+            &mut self.rng,
+        );
+        let new_chunks_count = new_chunks.len() as u32;
+        let new_restricted_count = restricted.len() as u32;
+        self.accumulated_new_chunks.extend(new_chunks);
+        self.restricted_ids.extend(restricted);
+
+        self.version_state
+            .advance(&self.params.upgrade_schedule, step);
+        self.version_state
+            .apply(&mut self.workers, &self.new_worker_version);
+
+        let stats = StepStats {
+            step,
+            new_chunks: new_chunks_count,
+            new_restricted: new_restricted_count,
+            eligible_workers: self.version_state.eligible_count(),
+        };
+
+        let (chunks, schedule_result) = scheduler::schedule_combined_chunks(
+            &self.baseline_chunks,
+            &self.accumulated_new_chunks,
+            &self.workers,
+            &self.datasets_config,
+            &self.scheduling_config,
+            &self.restricted_ids,
+            &self.new_worker_version,
+        );
+
+        let total_capacity = self.total_capacity_bytes();
+        match schedule_result {
+            Ok(assignment) => {
+                let (metrics, owners) = metrics::measure_reshuffle(
+                    &self.previous_owners,
+                    &chunks,
+                    &assignment,
+                    &self.restricted_ids,
+                    stats,
+                    total_capacity,
+                );
+                self.previous_owners = owners;
+                metrics
             }
-            for w in previous_workers.difference(current_workers) {
-                workers_losing.insert(*w);
+            Err(reason) => {
+                eprintln!("Scheduling failed at step {step}: {reason}. Stopping simulation.");
+                metrics::failed_step_metrics(
+                    stats,
+                    chunks.len(),
+                    self.restricted_ids.len(),
+                    total_capacity,
+                    reason,
+                )
             }
+        }
+    }
+
+    /// At the lift step, remove the previously-restricted chunks; afterwards no
+    /// new chunks are tagged (see [`Self::restricted_fraction`]).
+    fn lift_restrictions_if_due(&mut self, step: u32) {
+        if self.params.lift_restriction_at_step != Some(step) {
+            return;
+        }
+        let restricted = &self.restricted_ids;
+        self.accumulated_new_chunks
+            .retain(|c| !restricted.contains(&(c.dataset.clone(), c.id.clone())));
+        self.restricted_ids.clear();
+    }
+
+    fn restricted_fraction(&self, step: u32) -> f64 {
+        let lifted = self
+            .params
+            .lift_restriction_at_step
+            .is_some_and(|n| step >= n);
+        if lifted {
+            0.0
         } else {
-            result.new_chunk_bytes += size * current_workers.len() as u64;
-            for w in current_workers {
-                workers_receiving_new.insert(*w);
-            }
+            self.params.restricted_fraction
         }
     }
 
-    for (chunk_id, previous_workers) in previous {
-        if !current.contains_key(chunk_id) {
-            let size = *chunk_sizes.get(chunk_id).unwrap_or(&0) as u64;
-            result.decreased_replication_bytes += size * previous_workers.len() as u64;
-            for w in previous_workers {
-                workers_losing.insert(*w);
-            }
-        }
+    fn total_capacity_bytes(&self) -> u64 {
+        self.workers.len() as u64 * self.scheduling_config.worker_capacity
     }
-
-    result.workers_receiving_new = workers_receiving_new.len();
-    result.workers_losing = workers_losing.len();
-    result.workers_shuffled = workers_shuffled.len();
-
-    result
-}
-
-/// Computes all reshuffle metrics for a single simulation step.
-/// All comparisons are against the previous step (incremental).
-/// Returns the current chunk owners for use as the next step's previous.
-pub fn measure_reshuffle(
-    previous_chunk_owners: &ChunkOwners,
-    chunks: &[Chunk],
-    assignment: &network_scheduler::types::Assignment,
-    step: u32,
-    new_chunks_in_step: u32,
-    num_workers: usize,
-    worker_capacity: u64,
-) -> (ReshuffleMetrics, ChunkOwners) {
-    let current_chunk_owners = chunk_owners_from_assignment(chunks, assignment);
-
-    let chunk_sizes: ChunkSizeIndex = chunks
-        .iter()
-        .map(|c| ((c.dataset.clone(), c.id.clone()), c.size))
-        .collect();
-
-    let data_movement =
-        compute_data_movement(previous_chunk_owners, &current_chunk_owners, &chunk_sizes);
-
-    let used_capacity_bytes: u64 = assignment
-        .worker_chunks
-        .values()
-        .flat_map(|indexes| indexes.iter())
-        .map(|&i| chunks[i as usize].size as u64)
-        .sum();
-
-    let total_capacity_bytes = num_workers as u64 * worker_capacity;
-
-    let metrics = ReshuffleMetrics {
-        step,
-        new_chunks_in_step,
-        total_chunks: chunks.len(),
-        replication_by_weight: assignment.replication_by_weight.clone(),
-        data_movement,
-        total_capacity_bytes,
-        used_capacity_bytes,
-    };
-
-    (metrics, current_chunk_owners)
 }
