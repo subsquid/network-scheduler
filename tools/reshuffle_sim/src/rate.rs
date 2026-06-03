@@ -221,13 +221,6 @@ impl Params {
             .map(|(_, v)| v.as_str())
     }
 
-    fn u32(&self, key: &str) -> anyhow::Result<u32> {
-        self.get(key)
-            .with_context(|| format!("missing '{key}'"))?
-            .parse()
-            .with_context(|| format!("invalid '{key}'"))
-    }
-
     fn u32_or(&self, key: &str, default: u32) -> anyhow::Result<u32> {
         match self.get(key) {
             Some(value) => value.parse().with_context(|| format!("invalid '{key}'")),
