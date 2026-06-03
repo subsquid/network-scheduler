@@ -8,7 +8,7 @@ use tabled::builder::Builder;
 use tabled::settings::span::{ColumnSpan, RowSpan};
 use tabled::settings::{Alignment, Modify, Style};
 
-use crate::simulation::ReshuffleMetrics;
+use crate::metrics::ReshuffleMetrics;
 
 /// Counts workers by version (ascending), rendering a missing version as
 /// "none". Example: `"1.0.0:50 2.0.0:17"`.

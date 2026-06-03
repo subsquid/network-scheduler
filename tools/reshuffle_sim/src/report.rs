@@ -2,7 +2,7 @@ use std::path::Path;
 
 use bytesize::ByteSize;
 
-use crate::simulation::ReshuffleMetrics;
+use crate::metrics::ReshuffleMetrics;
 
 pub fn generate_html(metrics: &[ReshuffleMetrics], path: &Path) -> anyhow::Result<()> {
     let steps: Vec<u32> = metrics.iter().map(|m| m.step).collect();
