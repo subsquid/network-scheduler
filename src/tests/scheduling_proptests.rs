@@ -2,6 +2,7 @@
 //! dynamically (placing replicas round by round up to the byte-budget cap), so a
 //! fragmenting placement backs off to a feasible factor instead of panicking.
 
+use std::cell::Cell;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Once;
 
@@ -104,20 +105,36 @@ fn run(scenario: &Scenario) -> Result<Assignment, ReplicationError> {
     schedule(&chunks, &workers, config)
 }
 
-/// Idempotent per-test setup: silence the panic printer (the intentional `catch_unwind`s
-/// would otherwise flood stderr) and route `RUST_LOG` to the test writer.
+thread_local! {
+    /// True while inside `no_panic`, so the hook silences only the expected panic.
+    static SILENCE_PANIC: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Idempotent per-test setup. The panic hook stays quiet inside `no_panic` but
+/// defers to the previous hook otherwise, so genuine panics still print; logs
+/// route to the test writer.
 fn setup() {
     static HOOK: Once = Once::new();
-    HOOK.call_once(|| std::panic::set_hook(Box::new(|_| {})));
+    HOOK.call_once(|| {
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            if !SILENCE_PANIC.with(Cell::get) {
+                prev(info);
+            }
+        }));
+    });
     let _ = tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .with_test_writer()
         .try_init();
 }
 
-/// Run `f`, returning `None` if it panicked.
+/// Run `f`, returning `None` if it panicked, without printing the panic.
 fn no_panic<T>(f: impl FnOnce() -> T) -> Option<T> {
-    catch_unwind(AssertUnwindSafe(f)).ok()
+    SILENCE_PANIC.with(|s| s.set(true));
+    let result = catch_unwind(AssertUnwindSafe(f)).ok();
+    SILENCE_PANIC.with(|s| s.set(false));
+    result
 }
 
 /// Deterministic, distinct worker per index (stable proptest shrinking).

@@ -102,10 +102,11 @@ fn schedule_to_workers(
         config.worker_capacity,
         config.min_replication,
     )?;
-    tracing::info!("Replication caps by weight: {caps:?}");
+    let replication_by_weight = min_replication_by_weight(chunks, &achieved);
+    tracing::info!("Replication by weight: caps {caps:?}, achieved {replication_by_weight:?}");
     Ok(Assignment {
         worker_chunks,
-        replication_by_weight: min_replication_by_weight(chunks, &achieved),
+        replication_by_weight,
     })
 }
 
