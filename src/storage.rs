@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use aws_sdk_s3 as s3;
 use itertools::Itertools;
@@ -34,6 +35,7 @@ impl S3Storage {
         &self,
         datasets: impl IntoIterator<Item = (Arc<String>, Option<&Chunk>)>,
         concurrent_downloads: usize,
+        dataset_load_timeout: Option<Duration>,
     ) -> anyhow::Result<BTreeMap<Arc<String>, Vec<Chunk>>> {
         let _timer = crate::metrics::Timer::new("load_newer_chunks");
         stream::iter(datasets)
@@ -41,7 +43,7 @@ impl S3Storage {
                 let storage = DatasetStorage::new(self.client.clone(), dataset);
                 async move {
                     let chunks = storage
-                        .list_new_chunks(last_chunk, CONCURRENT_CHUNKS)
+                        .list_new_chunks(last_chunk, CONCURRENT_CHUNKS, dataset_load_timeout)
                         .await?;
                     anyhow::Ok((storage.dataset, chunks))
                 }
@@ -56,6 +58,137 @@ impl S3Storage {
 struct DatasetStorage {
     client: s3::Client,
     dataset: Arc<String>,
+}
+
+struct ChunkStream {
+    client: s3::Client,
+    dataset: Arc<String>,
+    bucket: String,
+    last_key: Option<String>,
+    continuation_token: Option<String>,
+    pending_objects: Vec<S3Object>,
+    next_expected_block: Option<u64>,
+    exhausted: bool,
+}
+
+impl ChunkStream {
+    pub fn new(
+        client: s3::Client,
+        dataset: Arc<String>,
+        bucket: String,
+        last_chunk: Option<&Chunk>,
+    ) -> Self {
+        let next_expected_block = last_chunk.as_ref().map(|chunk| chunk.blocks.end() + 1);
+        let last_key =
+            last_chunk.map(|chunk| format!("{}/{}", chunk.id, chunk.files.iter().max().unwrap()));
+
+        Self {
+            client,
+            dataset,
+            bucket,
+            last_key,
+            continuation_token: None,
+            pending_objects: Vec::new(),
+            next_expected_block,
+            exhausted: false,
+        }
+    }
+
+    pub async fn next_batch(&mut self) -> anyhow::Result<Option<Vec<Chunk>>> {
+        if self.exhausted {
+            return Ok(None);
+        }
+
+        let objects = self.list_next_objects().await?;
+
+        let mut batch = Vec::new();
+        for (_, objects) in &objects.into_iter().chunk_by(|obj| obj.prefix.clone()) {
+            let objects: Vec<S3Object> = objects.collect();
+            match self.objects_to_chunk(&objects)? {
+                Some(chunk) => {
+                    self.ensure_chain_continuity(&chunk)?;
+                    batch.push(chunk)
+                }
+                None => {
+                    self.pending_objects = objects;
+                    break;
+                }
+            }
+        }
+
+        if self.continuation_token.is_none() {
+            self.exhausted = true;
+        }
+
+        Ok(Some(batch))
+    }
+
+    pub fn exhausted(&self) -> bool {
+        self.exhausted
+    }
+
+    async fn list_next_objects(&mut self) -> anyhow::Result<Vec<S3Object>> {
+        let output = self
+            .client
+            .list_objects_v2()
+            .bucket(&self.bucket)
+            .set_start_after(self.last_key.take())
+            .set_continuation_token(self.continuation_token.take())
+            .send()
+            .await?;
+        metrics::S3_REQUESTS.inc();
+        metrics::S3_KEYS_LISTED.inc_by(output.key_count().unwrap() as i64);
+        tracing::trace!("Got {} S3 objects", output.key_count().unwrap());
+
+        let mut next_objects = std::mem::take(&mut self.pending_objects);
+        if let Some(objects) = output.contents {
+            for object in objects {
+                next_objects.push(S3Object::try_from(object)?);
+            }
+        }
+        self.continuation_token = output.next_continuation_token;
+
+        Ok(next_objects)
+    }
+
+    fn objects_to_chunk(&self, objs: &[S3Object]) -> anyhow::Result<Option<Chunk>> {
+        const REQUIRED_FILE: &str = "blocks.parquet";
+
+        let mut full_chunk = false;
+        let mut size_bytes = 0;
+        let mut files = Vec::with_capacity(7);
+        let mut id = None;
+        for obj in objs {
+            id = Some(obj.prefix.clone());
+            full_chunk |= obj.file_name == REQUIRED_FILE;
+            files.push(obj.file_name.clone());
+            size_bytes += obj.size;
+        }
+        let id = id.expect("Chunk should be created from at least one object");
+        if !full_chunk {
+            return Ok(None);
+        }
+
+        let chunk = Chunk::new(self.dataset.clone(), id, size_bytes, files)?;
+        tracing::trace!("Downloaded chunk {chunk}");
+
+        Ok(Some(chunk))
+    }
+
+    fn ensure_chain_continuity(&mut self, chunk: &Chunk) -> anyhow::Result<()> {
+        if let Some(next_block) = self.next_expected_block {
+            if *chunk.blocks.start() != next_block {
+                anyhow::bail!(
+                    "Blocks {} to {} missing from {}",
+                    next_block,
+                    chunk.blocks.start() - 1,
+                    self.dataset
+                );
+            }
+        }
+        self.next_expected_block = Some(chunk.blocks.end() + 1);
+        Ok(())
+    }
 }
 
 impl DatasetStorage {
@@ -74,106 +207,48 @@ impl DatasetStorage {
         &self,
         last_chunk: Option<&Chunk>,
         concurrent_downloads: usize,
+        dataset_load_timeout: Option<Duration>,
     ) -> anyhow::Result<Vec<Chunk>> {
         tracing::debug!("Downloading chunks from {}", self.dataset);
-        let mut next_expected_block = last_chunk.as_ref().map(|chunk| chunk.blocks.end() + 1);
-        let last_key =
-            last_chunk.map(|chunk| format!("{}/{}", chunk.id, chunk.files.iter().max().unwrap()));
 
-        let objects = self.list_new_objects(last_key).await?;
-
+        let deadline = dataset_load_timeout.map(|timeout| Instant::now() + timeout);
+        let mut stream = ChunkStream::new(
+            self.client.clone(),
+            self.dataset.clone(),
+            self.bucket().to_string(),
+            last_chunk,
+        );
         let mut chunks = Vec::new();
-        for (_, objects) in &objects.into_iter().chunk_by(|obj| obj.prefix.clone()) {
-            match self.objects_to_chunk(objects)? {
-                Some(chunk) => chunks.push(chunk),
-                None => break,
+
+        while let Some(mut batch) = stream.next_batch().await? {
+            stream::iter(batch.iter_mut())
+                .map(anyhow::Ok)
+                .try_for_each_concurrent(Some(concurrent_downloads), |ch| async move {
+                    self.populate_with_summary(ch).await.map_err(|e| {
+                        e.context(format!("couldn't download chunk summary for {}", ch))
+                    })
+                })
+                .await?;
+
+            chunks.append(&mut batch);
+
+            if let Some(deadline) = deadline {
+                if Instant::now() >= deadline && !stream.exhausted() {
+                    tracing::warn!(
+                        "Dataset {} summary population timed out after {}s. \
+                         {} chunks processed. Remaining chunks will be processed on next run.",
+                        self.dataset,
+                        dataset_load_timeout.unwrap().as_secs(),
+                        chunks.len(),
+                    );
+                    break;
+                }
             }
         }
-
-        // Verify if chunks are continuous
-        for chunk in &chunks {
-            if next_expected_block.is_some_and(|next_block| *chunk.blocks.start() != next_block) {
-                anyhow::bail!(
-                    "Blocks {} to {} missing from {}",
-                    next_expected_block.unwrap(),
-                    chunk.blocks.start() - 1,
-                    self.dataset
-                );
-            }
-            next_expected_block = Some(chunk.blocks.end() + 1);
-        }
-
-        stream::iter(chunks.iter_mut())
-            .map(anyhow::Ok)
-            .try_for_each_concurrent(Some(concurrent_downloads), |ch| async move {
-                self.populate_with_summary(ch)
-                    .await
-                    .map_err(|e| e.context(format!("couldn't download chunk summary for {}", ch)))
-            })
-            .await?;
 
         tracing::debug!("Downloaded {} chunks", chunks.len());
 
         Ok(chunks)
-    }
-
-    async fn list_new_objects(
-        &self,
-        mut last_key: Option<String>,
-    ) -> anyhow::Result<Vec<S3Object>> {
-        let mut result = Vec::new();
-        let mut continuation_token = None;
-        loop {
-            let objects = self
-                .client
-                .list_objects_v2()
-                .bucket(self.bucket())
-                .set_start_after(last_key.take())
-                .set_continuation_token(continuation_token)
-                .send()
-                .await?;
-            metrics::S3_REQUESTS.inc();
-            metrics::S3_KEYS_LISTED.inc_by(objects.key_count().unwrap() as i64);
-            tracing::trace!("Got {} S3 objects", objects.key_count().unwrap());
-
-            for object in objects.contents.into_iter().flatten() {
-                result.push(S3Object::try_from(object)?);
-            }
-            continuation_token = objects.next_continuation_token;
-            if continuation_token.is_none() {
-                break;
-            }
-        }
-        Ok(result)
-    }
-
-    fn objects_to_chunk(
-        &self,
-        objs: impl IntoIterator<Item = S3Object>,
-    ) -> anyhow::Result<Option<Chunk>> {
-        const REQUIRED_FILE: &str = "blocks.parquet";
-
-        let mut full_chunk = false;
-        let mut size_bytes = 0;
-        let mut files = Vec::with_capacity(7);
-        let mut id = None;
-        for obj in objs {
-            id = Some(obj.prefix);
-            full_chunk |= obj.file_name == REQUIRED_FILE;
-            files.push(obj.file_name);
-            size_bytes += obj.size;
-        }
-        let id = id.expect("Chunk should be created from at least one object");
-        if !full_chunk {
-            // block.parquet is always the last file written in a chunk.
-            // So if it is missing, the chunk is not complete yet.
-            return Ok(None);
-        }
-
-        let chunk = Chunk::new(self.dataset.clone(), id, size_bytes, files)?;
-        tracing::trace!("Downloaded chunk {chunk}");
-
-        Ok(Some(chunk))
     }
 
     async fn populate_with_summary(&self, data_chunk: &mut Chunk) -> anyhow::Result<()> {
@@ -292,7 +367,10 @@ mod test {
 
     async fn test_load_chunks(dataset: &str) {
         let ds = make_storage(&format!("s3://{dataset}")).await.unwrap();
-        let chunks = ds.list_new_chunks(None, CONCURRENT_CHUNKS).await.unwrap();
+        let chunks = ds
+            .list_new_chunks(None, CONCURRENT_CHUNKS, None)
+            .await
+            .unwrap();
         let expected = chunks.len();
 
         assert!(expected > 0);
