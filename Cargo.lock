@@ -985,7 +985,7 @@ dependencies = [
  "flate2",
  "libp2p-identity",
  "network-scheduler",
- "sqd-assignments 0.1.0",
+ "sqd-assignments 0.1.0 (git+https://github.com/subsquid/sqd-network.git?rev=fa19681)",
 ]
 
 [[package]]
@@ -1434,7 +1434,6 @@ checksum = "4a3daa8e81a3963a60642bcc1f90a670680bd4a77535faa384e9d1c79d620871"
 dependencies = [
  "curve25519-dalek",
  "ed25519",
- "rand_core 0.6.4",
  "serde",
  "sha2",
  "subtle",
@@ -2327,9 +2326,9 @@ checksum = "f9fbbcab51052fe104eb5e5d351cf728d30a5be1fe14d9be8a3b097481fb97de"
 
 [[package]]
 name = "libp2p-identity"
-version = "0.2.11"
+version = "0.2.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fbb68ea10844211a59ce46230909fd0ea040e8a192454d4cc2ee0d53e12280eb"
+checksum = "f0c7892c221730ba55f7196e98b0b8ba5e04b4155651736036628e9f73ed6fc3"
 dependencies = [
  "bs58",
  "ed25519-dalek",
@@ -3188,7 +3187,7 @@ dependencies = [
  "network-scheduler",
  "rand 0.9.1",
  "semver",
- "sqd-assignments 0.1.0",
+ "sqd-assignments 0.1.0 (git+https://github.com/subsquid/sqd-network.git?rev=fa19681)",
  "tabled",
 ]
 
@@ -3728,7 +3727,6 @@ dependencies = [
 [[package]]
 name = "sqd-assignments"
 version = "0.1.0"
-source = "git+https://github.com/subsquid/sqd-network.git?rev=fa19681#fa19681cb6a8bbd839ac41dbf568ff48ed2fd3b5"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -3743,6 +3741,22 @@ dependencies = [
  "sha2",
  "tracing",
  "url",
+]
+
+[[package]]
+name = "sqd-assignments"
+version = "0.1.0"
+source = "git+https://github.com/subsquid/sqd-network.git?rev=fa19681#fa19681cb6a8bbd839ac41dbf568ff48ed2fd3b5"
+dependencies = [
+ "anyhow",
+ "crypto_box",
+ "flatbuffers 25.2.10",
+ "libp2p-identity",
+ "ouroboros",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tracing",
 ]
 
 [[package]]

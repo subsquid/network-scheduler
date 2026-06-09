@@ -300,6 +300,27 @@ impl WithAssignment {
         SerializedAssignment { fb_v0, fb_v1 }
     }
 
+    #[cfg(feature = "mvcc-chunks")]
+    pub fn serialize_assignments(&self) -> SerializedAssignments {
+        tracing::info!("Serializing split assignments");
+
+        let serialize_one = || {
+            let fb_v0 =
+                self.assignment
+                    .encode_fb(&self.chunks, &self.config, &self.workers, FbVersion::V0);
+            let fb_v1 =
+                self.assignment
+                    .encode_fb(&self.chunks, &self.config, &self.workers, FbVersion::V1);
+            SerializedAssignment { fb_v0, fb_v1 }
+        };
+
+        SerializedAssignments {
+            legacy: serialize_one(),
+            worker: serialize_one(),
+            portal: serialize_one(),
+        }
+    }
+
     pub fn _save_to_file(&self, filename: &str) -> anyhow::Result<()> {
         let serialized =
             self.assignment
@@ -334,6 +355,34 @@ impl SerializedAssignment {
         tracing::info!("Uploading assignment");
         let url: String = uploader.upload_assignment(self.fb_v0, self.fb_v1).await?;
         tracing::info!("Assignment uploaded to {url}");
+        Ok(())
+    }
+}
+
+#[cfg(feature = "mvcc-chunks")]
+pub struct SerializedAssignments {
+    legacy: SerializedAssignment,
+    worker: SerializedAssignment,
+    portal: SerializedAssignment,
+}
+
+#[cfg(feature = "mvcc-chunks")]
+impl SerializedAssignments {
+    pub async fn upload(self, uploader: &upload::Uploader) -> anyhow::Result<()> {
+        tracing::info!("Uploading split assignments");
+        let urls = uploader
+            .upload_assignments(
+                (self.legacy.fb_v0, self.legacy.fb_v1),
+                (self.worker.fb_v0, self.worker.fb_v1),
+                (self.portal.fb_v0, self.portal.fb_v1),
+            )
+            .await?;
+        tracing::info!(
+            "Assignments uploaded: legacy={}, worker={}, portal={}",
+            urls.legacy,
+            urls.worker,
+            urls.portal
+        );
         Ok(())
     }
 }

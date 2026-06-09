@@ -19,6 +19,13 @@ pub struct Uploader {
     time: chrono::DateTime<Utc>,
 }
 
+#[cfg(feature = "mvcc-chunks")]
+pub struct AssignmentUrls {
+    pub legacy: String,
+    pub worker: String,
+    pub portal: String,
+}
+
 impl Uploader {
     pub fn new(config: cli::Config, sdk_config: &aws_config::SdkConfig) -> Self {
         let s3_config = aws_sdk_s3::config::Builder::from(sdk_config)
@@ -41,6 +48,53 @@ impl Uploader {
         fb_assignment_v0: Vec<u8>,
         fb_assignment_v1: Vec<u8>,
     ) -> anyhow::Result<String> {
+        let assignment = self
+            .upload_assignment_artifact(None, fb_assignment_v0, fb_assignment_v1)
+            .await?;
+
+        let network_state = legacy_network_state(self.config.network.clone(), assignment);
+        let fb_url_v1 = network_state.assignment.fb_url_v1.clone().unwrap();
+        self.upload_network_state(network_state).await?;
+
+        Ok(fb_url_v1)
+    }
+
+    #[cfg(feature = "mvcc-chunks")]
+    pub async fn upload_assignments(
+        &self,
+        legacy: (Vec<u8>, Vec<u8>),
+        worker: (Vec<u8>, Vec<u8>),
+        portal: (Vec<u8>, Vec<u8>),
+    ) -> anyhow::Result<AssignmentUrls> {
+        let legacy = self
+            .upload_assignment_artifact(None, legacy.0, legacy.1)
+            .await?;
+        let worker = self
+            .upload_assignment_artifact(Some("worker"), worker.0, worker.1)
+            .await?;
+        let portal = self
+            .upload_assignment_artifact(Some("portal"), portal.0, portal.1)
+            .await?;
+
+        let urls = AssignmentUrls {
+            legacy: legacy.fb_url_v1.clone().unwrap(),
+            worker: worker.fb_url_v1.clone().unwrap(),
+            portal: portal.fb_url_v1.clone().unwrap(),
+        };
+
+        let network_state =
+            split_network_state(self.config.network.clone(), legacy, worker, portal);
+        self.upload_network_state(network_state).await?;
+
+        Ok(urls)
+    }
+
+    async fn upload_assignment_artifact(
+        &self,
+        kind: Option<&str>,
+        fb_assignment_v0: Vec<u8>,
+        fb_assignment_v1: Vec<u8>,
+    ) -> anyhow::Result<NetworkAssignment> {
         tracing::debug!("Compressing assignment");
         let compressed_fb_v0;
         {
@@ -70,8 +124,16 @@ impl Uploader {
         let system_time = std::time::SystemTime::now();
         let timestamp = self.time.format("%FT%T");
         let assignment_id = format!("{timestamp}_{hash:X}");
-        let fb_v0_filename: String = format!("assignments/{network}/{assignment_id}.fb.0.gz");
-        let fb_v1_filename: String = format!("assignments/{network}/{assignment_id}.fb.1.gz");
+        let (fb_v0_filename, fb_v1_filename) = match kind {
+            Some(kind) => (
+                format!("assignments/{network}/{kind}/{assignment_id}.fb.0.gz"),
+                format!("assignments/{network}/{kind}/{assignment_id}.fb.1.gz"),
+            ),
+            None => (
+                format!("assignments/{network}/{assignment_id}.fb.0.gz"),
+                format!("assignments/{network}/{assignment_id}.fb.1.gz"),
+            ),
+        };
         let expiration = s3::primitives::DateTime::from(system_time + self.config.assignment_ttl);
 
         let fb_v0_fut = self
@@ -98,16 +160,16 @@ impl Uploader {
 
         let fb_url_v0 = format!("{}/{fb_v0_filename}", self.config.network_state_url);
         let fb_url_v1 = format!("{}/{fb_v1_filename}", self.config.network_state_url);
-        let network_state = NetworkState {
-            network,
-            assignment: NetworkAssignment {
-                url: Some(String::new()),
-                fb_url: Some(fb_url_v0),
-                fb_url_v1: Some(fb_url_v1.clone()),
-                id: assignment_id,
-                effective_from,
-            },
-        };
+        Ok(NetworkAssignment {
+            url: Some(String::new()),
+            fb_url: Some(fb_url_v0),
+            fb_url_v1: Some(fb_url_v1),
+            id: assignment_id,
+            effective_from,
+        })
+    }
+
+    async fn upload_network_state(&self, network_state: NetworkState) -> anyhow::Result<()> {
         let contents = serde_json::to_vec(&network_state).unwrap();
         self.client
             .put_object()
@@ -117,8 +179,7 @@ impl Uploader {
             .send()
             .await
             .context("Can't save link to the assignment")?;
-
-        Ok(fb_url_v1)
+        Ok(())
     }
 
     #[instrument(skip_all)]
@@ -174,5 +235,73 @@ impl Uploader {
             .await
             .context("Can't upload metrics")?;
         Ok(())
+    }
+}
+
+fn legacy_network_state(network: String, assignment: NetworkAssignment) -> NetworkState {
+    NetworkState {
+        network,
+        assignment,
+        #[cfg(feature = "mvcc-chunks")]
+        worker_assignment: None,
+        #[cfg(feature = "mvcc-chunks")]
+        portal_assignment: None,
+    }
+}
+
+#[cfg(feature = "mvcc-chunks")]
+fn split_network_state(
+    network: String,
+    legacy: NetworkAssignment,
+    worker: NetworkAssignment,
+    portal: NetworkAssignment,
+) -> NetworkState {
+    NetworkState {
+        network,
+        assignment: legacy,
+        worker_assignment: Some(worker),
+        portal_assignment: Some(portal),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn assignment(id: &str) -> NetworkAssignment {
+        NetworkAssignment {
+            url: Some(String::new()),
+            fb_url: Some(format!("https://example.test/{id}.fb.0.gz")),
+            fb_url_v1: Some(format!("https://example.test/{id}.fb.1.gz")),
+            id: id.to_string(),
+            effective_from: 1781000000,
+        }
+    }
+
+    #[test]
+    fn legacy_network_state_has_compatibility_shape() {
+        let state = legacy_network_state("testnet".to_string(), assignment("legacy"));
+        let value = serde_json::to_value(state).unwrap();
+
+        assert_eq!(value["network"], "testnet");
+        assert_eq!(value["assignment"]["id"], "legacy");
+        assert!(value.get("worker_assignment").is_none());
+        assert!(value.get("portal_assignment").is_none());
+    }
+
+    #[cfg(feature = "mvcc-chunks")]
+    #[test]
+    fn split_network_state_has_worker_and_portal_assignments() {
+        let state = split_network_state(
+            "testnet".to_string(),
+            assignment("legacy"),
+            assignment("worker"),
+            assignment("portal"),
+        );
+        let value = serde_json::to_value(state).unwrap();
+
+        assert_eq!(value["assignment"]["id"], "legacy");
+        assert_eq!(value["worker_assignment"]["id"], "worker");
+        assert_eq!(value["portal_assignment"]["id"], "portal");
     }
 }

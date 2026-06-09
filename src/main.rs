@@ -25,7 +25,10 @@ async fn main() -> anyhow::Result<()> {
     };
 
     let uploader = upload::Uploader::new(config, &args.s3.config().await);
+    #[cfg(not(feature = "mvcc-chunks"))]
     controller.serialize_assignment().upload(&uploader).await?;
+    #[cfg(feature = "mvcc-chunks")]
+    controller.serialize_assignments().upload(&uploader).await?;
 
     drop(_timer);
     let metrics = metrics::encode_metrics(&metrics_registry)?;
