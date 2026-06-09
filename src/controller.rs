@@ -314,6 +314,8 @@ impl WithAssignment {
             SerializedAssignment { fb_v0, fb_v1 }
         };
 
+        // This first MVCC step only splits assignment discovery/publication.
+        // NET-683/NET-684 will make portal and worker contents diverge.
         SerializedAssignments {
             legacy: serialize_one(),
             worker: serialize_one(),

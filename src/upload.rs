@@ -53,7 +53,7 @@ impl Uploader {
             .await?;
 
         let network_state = legacy_network_state(self.config.network.clone(), assignment);
-        let fb_url_v1 = network_state.assignment.fb_url_v1.clone().unwrap();
+        let fb_url_v1 = assignment_fb_url_v1(&network_state.assignment)?;
         self.upload_network_state(network_state).await?;
 
         Ok(fb_url_v1)
@@ -77,9 +77,9 @@ impl Uploader {
             .await?;
 
         let urls = AssignmentUrls {
-            legacy: legacy.fb_url_v1.clone().unwrap(),
-            worker: worker.fb_url_v1.clone().unwrap(),
-            portal: portal.fb_url_v1.clone().unwrap(),
+            legacy: assignment_fb_url_v1(&legacy).context("Legacy assignment URL missing")?,
+            worker: assignment_fb_url_v1(&worker).context("Worker assignment URL missing")?,
+            portal: assignment_fb_url_v1(&portal).context("Portal assignment URL missing")?,
         };
 
         let network_state =
@@ -89,6 +89,7 @@ impl Uploader {
         Ok(urls)
     }
 
+    #[allow(deprecated)]
     async fn upload_assignment_artifact(
         &self,
         kind: Option<&str>,
@@ -161,7 +162,10 @@ impl Uploader {
         let fb_url_v0 = format!("{}/{fb_v0_filename}", self.config.network_state_url);
         let fb_url_v1 = format!("{}/{fb_v1_filename}", self.config.network_state_url);
         Ok(NetworkAssignment {
+            #[cfg(not(feature = "mvcc-chunks"))]
             url: Some(String::new()),
+            #[cfg(feature = "mvcc-chunks")]
+            url: None,
             fb_url: Some(fb_url_v0),
             fb_url_v1: Some(fb_url_v1),
             id: assignment_id,
@@ -170,7 +174,8 @@ impl Uploader {
     }
 
     async fn upload_network_state(&self, network_state: NetworkState) -> anyhow::Result<()> {
-        let contents = serde_json::to_vec(&network_state).unwrap();
+        let contents =
+            serde_json::to_vec(&network_state).context("Can't serialize network state")?;
         self.client
             .put_object()
             .bucket(&self.config.scheduler_state_bucket)
@@ -249,6 +254,13 @@ fn legacy_network_state(network: String, assignment: NetworkAssignment) -> Netwo
     }
 }
 
+fn assignment_fb_url_v1(assignment: &NetworkAssignment) -> anyhow::Result<String> {
+    assignment
+        .fb_url_v1
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("fb_url_v1 missing"))
+}
+
 #[cfg(feature = "mvcc-chunks")]
 fn split_network_state(
     network: String,
@@ -268,9 +280,13 @@ fn split_network_state(
 mod tests {
     use super::*;
 
+    #[allow(deprecated)]
     fn assignment(id: &str) -> NetworkAssignment {
         NetworkAssignment {
+            #[cfg(not(feature = "mvcc-chunks"))]
             url: Some(String::new()),
+            #[cfg(feature = "mvcc-chunks")]
+            url: None,
             fb_url: Some(format!("https://example.test/{id}.fb.0.gz")),
             fb_url_v1: Some(format!("https://example.test/{id}.fb.1.gz")),
             id: id.to_string(),
@@ -285,6 +301,10 @@ mod tests {
 
         assert_eq!(value["network"], "testnet");
         assert_eq!(value["assignment"]["id"], "legacy");
+        #[cfg(not(feature = "mvcc-chunks"))]
+        assert_eq!(value["assignment"]["url"], "");
+        #[cfg(feature = "mvcc-chunks")]
+        assert!(value["assignment"].get("url").is_none());
         assert!(value.get("worker_assignment").is_none());
         assert!(value.get("portal_assignment").is_none());
     }
