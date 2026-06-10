@@ -2499,7 +2499,7 @@ dependencies = [
  "serde_with",
  "serde_yaml",
  "sha2",
- "sqd-assignments 0.1.0",
+ "sqd-assignments 0.1.0 (git+https://github.com/subsquid/sqd-network.git?rev=27ba3353)",
  "sqd-messages",
  "tempfile",
  "thiserror 2.0.12",
@@ -3727,6 +3727,7 @@ dependencies = [
 [[package]]
 name = "sqd-assignments"
 version = "0.1.0"
+source = "git+https://github.com/subsquid/sqd-network.git?rev=27ba3353#27ba3353f09bd6dda8e44e9ed4aea1eadc906d19"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
