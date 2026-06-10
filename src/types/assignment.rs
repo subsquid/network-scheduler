@@ -204,6 +204,7 @@ mod tests {
             assignment_delay: Duration::from_secs(60),
             assignment_ttl: Duration::from_secs(86400),
             concurrent_dataset_downloads: 1,
+            dataset_load_timeout: None,
             strict_continuity_check: false,
             storage_allow_insecure_scheme: false,
             clear_last_block_hash: false,

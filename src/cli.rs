@@ -144,6 +144,10 @@ pub struct Config {
     #[serde(skip_serializing, default = "default_concurrent_downloads")]
     pub concurrent_dataset_downloads: usize,
 
+    #[serde_as(as = "Option<DurationSeconds>")]
+    #[serde(rename = "dataset_load_timeout_sec", default)]
+    pub dataset_load_timeout: Option<Duration>,
+
     #[serde(default = "default_true")]
     pub strict_continuity_check: bool,
 
