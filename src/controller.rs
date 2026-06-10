@@ -164,7 +164,11 @@ impl WithChunks {
             .collect::<BTreeMap<_, _>>();
 
         let new_chunks = datasets_storage
-            .load_newer_chunks(last_chunks, self.config.concurrent_dataset_downloads, self.config.dataset_load_timeout)
+            .load_newer_chunks(
+                last_chunks,
+                self.config.concurrent_dataset_downloads,
+                self.config.dataset_load_timeout,
+            )
             .await
             .context("Can't load datasets")?;
 
