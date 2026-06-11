@@ -3,7 +3,6 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use aws_sdk_s3 as s3;
-use itertools::Itertools;
 use tokio::io::AsyncSeekExt;
 use tracing::instrument;
 
@@ -100,18 +99,46 @@ impl ChunkStream {
         }
 
         let objects = self.list_next_objects().await?;
+        let has_more_pages = self.continuation_token.is_some();
 
         let mut batch = Vec::new();
-        for (_, objects) in &objects.into_iter().chunk_by(|obj| obj.prefix.clone()) {
-            let objects: Vec<S3Object> = objects.collect();
-            match self.objects_to_chunk(&objects)? {
-                Some(chunk) => {
-                    self.ensure_chain_continuity(&chunk)?;
-                    batch.push(chunk)
-                }
-                None => {
-                    self.pending_objects = objects;
-                    break;
+        let mut current: Vec<S3Object> = Vec::new();
+        let mut objects = objects.into_iter().peekable();
+
+        while let Some(obj) = objects.next() {
+            let group_closed = objects.peek().is_none_or(|next| next.prefix != obj.prefix);
+            current.push(obj);
+
+            if group_closed {
+                let is_last_on_page = objects.peek().is_none();
+
+                // The trailing group of a truncated page may continue on the next
+                // page, so defer it instead of emitting a possibly-partial chunk.
+                if has_more_pages && is_last_on_page {
+                    self.pending_objects = std::mem::take(&mut current);
+                } else {
+                    match self.objects_to_chunk(&current)? {
+                        Some(chunk) => {
+                            self.ensure_chain_continuity(&chunk)?;
+                            batch.push(chunk);
+                        }
+                        // The very last chunk in the bucket may still be in the
+                        // process of being written (no blocks.parquet yet); that's
+                        // acceptable, so skip it rather than failing.
+                        None if is_last_on_page && !has_more_pages => {
+                            tracing::debug!(
+                                "Skipping incomplete chunk {} (blocks.parquet not yet present)",
+                                current.first().map(|o| o.prefix.as_str()).unwrap_or("?")
+                            );
+                        }
+                        None => {
+                            anyhow::bail!(
+                                "Chunk {} is missing required blocks.parquet",
+                                current.first().map(|o| o.prefix.as_str()).unwrap_or("?")
+                            );
+                        }
+                    }
+                    current.clear();
                 }
             }
         }
@@ -166,6 +193,8 @@ impl ChunkStream {
         }
         let id = id.expect("Chunk should be created from at least one object");
         if !full_chunk {
+            // block.parquet is always the last file written in a chunk.
+            // So if it is missing, the chunk is not complete yet.
             return Ok(None);
         }
 
