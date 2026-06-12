@@ -247,6 +247,7 @@ impl WithScheduledChunks {
                     size: chunk.size,
                     weight: *weight,
                     minimum_worker_version: mwv.as_ref(),
+                    hashes: Vec::new(),
                 })
                 .collect();
 

@@ -35,6 +35,9 @@ pub struct ScheduledChunk<'a> {
     pub size: u32,
     pub weight: ChunkWeight,
     pub minimum_worker_version: Option<&'a Version>,
+    /// Hashes locating each of the chunk's replicas on the ring, indexed by tag.
+    /// Filled by [`schedule`] (see [`hash_chunks`]) — leave empty when constructing.
+    pub hashes: Vec<u64>,
 }
 
 pub fn schedule(
@@ -47,10 +50,16 @@ pub fn schedule(
     // Order workers reliable-first, schedule the reliable subset, then (unless
     // reliability is ignored) overlay a pass over all workers so unreliable workers
     // also get chunks.
-    let mut sorted = Vec::with_capacity(workers.len());
-    sorted.extend(workers.iter().filter(|w| w.reliable()));
-    let reliable = sorted.len();
-    sorted.extend(workers.iter().filter(|w| !w.reliable()));
+    let mut sorted_workers = Vec::with_capacity(workers.len());
+    sorted_workers.extend(workers.iter().filter(|w| w.reliable()));
+    let reliable_workers = sorted_workers.len();
+    sorted_workers.extend(workers.iter().filter(|w| !w.reliable()));
+
+    // Hash every chunk's replica ring positions once up front; both placement passes
+    // share them. The all-workers caps bound the per-pass caps (capacity only grows
+    // with worker count), so the hash vectors are long enough for either pass.
+    let caps = replication_cap(chunks, workers.len(), &config)?;
+    let chunks = hash_chunks(chunks, &caps, config.min_replication);
 
     if config.ignore_reliability {
         tracing::info!(
@@ -58,16 +67,17 @@ pub fn schedule(
             chunks.len(),
             workers.len()
         );
-        return schedule_to_workers(chunks, &sorted, &config);
+        return schedule_to_workers(&chunks, &sorted_workers, &config);
     }
 
     tracing::info!(
         "Scheduling {} chunks to {} reliable workers",
         chunks.len(),
-        reliable
+        reliable_workers
     );
-    let mut assignment = schedule_to_workers(chunks, &sorted[..reliable], &config)?;
-    if reliable == workers.len() {
+    let mut assignment =
+        schedule_to_workers(&chunks, &sorted_workers[..reliable_workers], &config)?;
+    if reliable_workers == workers.len() {
         return Ok(assignment);
     }
 
@@ -76,7 +86,7 @@ pub fn schedule(
         chunks.len(),
         workers.len()
     );
-    let all = schedule_to_workers(chunks, &sorted, &config)?;
+    let all = schedule_to_workers(&chunks, &sorted_workers, &config)?;
     // Reliable workers keep their assignment; unreliable ones take theirs from `all`.
     for (worker_id, chunk_indexes) in all.worker_chunks {
         assignment
@@ -135,9 +145,9 @@ fn replication_cap(
 }
 
 /// Expand `chunks` into `ReplicatedChunk`s, taking each chunk's replication factor from
-/// `replication_by_weight`.
+/// `replication_by_weight` and propagating its precomputed replica hashes.
 fn to_replicated<'a>(
-    chunks: &[ScheduledChunk<'a>],
+    chunks: &'a [ScheduledChunk<'a>],
     replication_by_weight: &BTreeMap<ChunkWeight, ReplicationFactor>,
 ) -> Vec<ReplicatedChunk<'a>> {
     chunks
@@ -148,6 +158,7 @@ fn to_replicated<'a>(
             replication: replication_by_weight[&c.weight],
             size: c.size,
             minimum_worker_version: c.minimum_worker_version,
+            hashes: &c.hashes,
         })
         .collect()
 }
@@ -159,6 +170,8 @@ pub(crate) struct ReplicatedChunk<'a> {
     pub(crate) size: u32,
     pub(crate) replication: ReplicationFactor,
     pub(crate) minimum_worker_version: Option<&'a Version>,
+    /// Replica hashes by tag, borrowed from the [`ScheduledChunk`].
+    pub(crate) hashes: &'a [u64],
 }
 
 #[instrument(skip_all)]
@@ -188,17 +201,41 @@ fn hash_workers(worker_ids: &[PeerId]) -> Vec<Vec<(u64, WorkerIndex)>> {
         .collect()
 }
 
-/// Hash of a chunk's `tag`-th replica, locating it on the ring.
-fn replica_hash(chunk: &ReplicatedChunk, tag: ReplicationFactor) -> u64 {
-    let buffer = [
-        chunk.dataset.as_bytes(),
-        b"/",
-        chunk.chunk_id.as_bytes(),
-        b":",
-        &tag.to_le_bytes(),
-    ]
-    .concat();
-    hash(&buffer)
+/// Clone of `chunks` with every replica hash precomputed: tags
+/// `0..max(min_replication, cap)`, where the cap comes from the chunk's weight.
+#[instrument(skip_all)]
+fn hash_chunks<'a>(
+    chunks: &[ScheduledChunk<'a>],
+    caps: &BTreeMap<ChunkWeight, ReplicationFactor>,
+    min_replication: ReplicationFactor,
+) -> Vec<ScheduledChunk<'a>> {
+    let _timer = crate::metrics::Timer::new("schedule:hash_chunks");
+
+    chunks
+        .into_par_iter()
+        .map(|chunk| {
+            let mut buffer = [
+                chunk.dataset.as_bytes(),
+                b"/",
+                chunk.chunk_id.as_bytes(),
+                b":",
+            ]
+            .concat();
+            let prefix = buffer.len();
+            let tags = min_replication.max(caps[&chunk.weight]);
+            let hashes = (0..tags)
+                .map(|tag| {
+                    buffer.truncate(prefix);
+                    buffer.extend_from_slice(&tag.to_le_bytes());
+                    hash(&buffer)
+                })
+                .collect();
+            ScheduledChunk {
+                hashes,
+                ..chunk.clone()
+            }
+        })
+        .collect()
 }
 
 /// The guaranteed replication per weight: the fewest replicas actually placed among the
@@ -337,7 +374,7 @@ impl<'a> Placement<'a> {
     /// capacity, walking the chunk's hash ring from its home. Returns whether it landed.
     fn place(&mut self, chunk_index: usize, tag: ReplicationFactor) -> bool {
         let chunk = &self.chunks[chunk_index];
-        let chunk_hash = replica_hash(chunk, tag);
+        let chunk_hash = chunk.hashes[tag as usize];
         let ring = &self.rings[chunk_hash as usize % N_RINGS];
         let first = ring.partition_point(|(x, _)| *x < chunk_hash);
 

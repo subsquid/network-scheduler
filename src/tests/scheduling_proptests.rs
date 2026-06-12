@@ -166,6 +166,7 @@ fn chunks_from<'a>(dataset: &'a str, ids: &'a [String], sizes: &[u32]) -> Vec<Sc
             size,
             weight: 1,
             minimum_worker_version: None,
+            hashes: Vec::new(),
         })
         .collect()
 }

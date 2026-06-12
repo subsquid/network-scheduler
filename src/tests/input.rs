@@ -31,6 +31,7 @@ impl TestChunks {
                 size: e.size,
                 weight: e.weight,
                 minimum_worker_version: e.minimum_worker_version.as_ref(),
+                hashes: Vec::new(),
             })
             .collect()
     }

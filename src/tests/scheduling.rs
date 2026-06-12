@@ -431,6 +431,7 @@ fn test_minimum_worker_version_unrestricted_spill() {
             size: e.size,
             weight: e.weight,
             minimum_worker_version: None,
+            hashes: Vec::new(),
         })
         .collect();
     let baseline = schedule(&unrestricted_chunks, &workers, config).unwrap();
@@ -697,6 +698,7 @@ fn test_minimum_worker_version_no_reassignment_on_removal() {
             size: e.size,
             weight: e.weight,
             minimum_worker_version: None,
+            hashes: Vec::new(),
         })
         .collect();
 
