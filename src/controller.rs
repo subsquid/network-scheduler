@@ -292,16 +292,32 @@ pub struct WithAssignment {
 impl WithAssignment {
     pub fn serialize_assignment(&self) -> SerializedAssignment {
         tracing::info!("Serializing assignment");
-        let fb_v0 =
-            self.assignment
-                .encode_fb(&self.chunks, &self.config, &self.workers, FbVersion::V0);
-        let fb_v1 =
+        let fb =
             self.assignment
                 .encode_fb(&self.chunks, &self.config, &self.workers, FbVersion::V1);
-        tracing::info!("Serialized assignment v0 size: {} bytes", fb_v0.len());
-        tracing::info!("Serialized assignment v1 size: {} bytes", fb_v1.len());
+        tracing::info!("Serialized assignment size: {} bytes", fb.len());
 
-        SerializedAssignment { fb_v0, fb_v1 }
+        SerializedAssignment { fb }
+    }
+
+    #[cfg(feature = "mvcc-chunks")]
+    pub fn serialize_assignments(&self) -> SerializedAssignments {
+        tracing::info!("Serializing split assignments");
+
+        let serialize_one = || {
+            let fb =
+                self.assignment
+                    .encode_fb(&self.chunks, &self.config, &self.workers, FbVersion::V1);
+            SerializedAssignment { fb }
+        };
+
+        // This first MVCC step only splits assignment discovery/publication.
+        // NET-683/NET-684 will make portal and worker contents diverge.
+        SerializedAssignments {
+            legacy: serialize_one(),
+            worker: serialize_one(),
+            portal: serialize_one(),
+        }
     }
 
     pub fn _save_to_file(&self, filename: &str) -> anyhow::Result<()> {
@@ -329,15 +345,38 @@ impl WithAssignment {
 }
 
 pub struct SerializedAssignment {
-    fb_v0: Vec<u8>,
-    fb_v1: Vec<u8>,
+    fb: Vec<u8>,
 }
 
 impl SerializedAssignment {
     pub async fn upload(self, uploader: &upload::Uploader) -> anyhow::Result<()> {
         tracing::info!("Uploading assignment");
-        let url: String = uploader.upload_assignment(self.fb_v0, self.fb_v1).await?;
+        let url: String = uploader.upload_assignment(self.fb).await?;
         tracing::info!("Assignment uploaded to {url}");
+        Ok(())
+    }
+}
+
+#[cfg(feature = "mvcc-chunks")]
+pub struct SerializedAssignments {
+    legacy: SerializedAssignment,
+    worker: SerializedAssignment,
+    portal: SerializedAssignment,
+}
+
+#[cfg(feature = "mvcc-chunks")]
+impl SerializedAssignments {
+    pub async fn upload(self, uploader: &upload::Uploader) -> anyhow::Result<()> {
+        tracing::info!("Uploading split assignments");
+        let urls = uploader
+            .upload_assignments(self.legacy.fb, self.worker.fb, self.portal.fb)
+            .await?;
+        tracing::info!(
+            "Assignments uploaded: legacy={}, worker={}, portal={}",
+            urls.legacy,
+            urls.worker,
+            urls.portal
+        );
         Ok(())
     }
 }
