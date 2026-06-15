@@ -43,43 +43,35 @@ impl Uploader {
     }
 
     #[instrument(skip_all)]
-    pub async fn upload_assignment(
-        &self,
-        fb_assignment_v0: Vec<u8>,
-        fb_assignment_v1: Vec<u8>,
-    ) -> anyhow::Result<String> {
-        let assignment = self
-            .upload_assignment_artifact(None, fb_assignment_v0, fb_assignment_v1)
-            .await?;
+    pub async fn upload_assignment(&self, fb_assignment: Vec<u8>) -> anyhow::Result<String> {
+        let assignment = self.upload_assignment_artifact(None, fb_assignment).await?;
 
         let network_state = legacy_network_state(self.config.network.clone(), assignment);
-        let fb_url_v1 = assignment_fb_url_v1(&network_state.assignment)?;
+        let fb_url = assignment_fb_url(&network_state.assignment)?;
         self.upload_network_state(network_state).await?;
 
-        Ok(fb_url_v1)
+        Ok(fb_url)
     }
 
     #[cfg(feature = "mvcc-chunks")]
     pub async fn upload_assignments(
         &self,
-        legacy: (Vec<u8>, Vec<u8>),
-        worker: (Vec<u8>, Vec<u8>),
-        portal: (Vec<u8>, Vec<u8>),
+        legacy: Vec<u8>,
+        worker: Vec<u8>,
+        portal: Vec<u8>,
     ) -> anyhow::Result<AssignmentUrls> {
-        let legacy = self
-            .upload_assignment_artifact(None, legacy.0, legacy.1)
-            .await?;
+        let legacy = self.upload_assignment_artifact(None, legacy).await?;
         let worker = self
-            .upload_assignment_artifact(Some("worker"), worker.0, worker.1)
+            .upload_assignment_artifact(Some("worker"), worker)
             .await?;
         let portal = self
-            .upload_assignment_artifact(Some("portal"), portal.0, portal.1)
+            .upload_assignment_artifact(Some("portal"), portal)
             .await?;
 
         let urls = AssignmentUrls {
-            legacy: assignment_fb_url_v1(&legacy).context("Legacy assignment URL missing")?,
-            worker: assignment_fb_url_v1(&worker).context("Worker assignment URL missing")?,
-            portal: assignment_fb_url_v1(&portal).context("Portal assignment URL missing")?,
+            legacy: assignment_fb_url(&legacy).context("Legacy assignment URL missing")?,
+            worker: assignment_fb_url(&worker).context("Worker assignment URL missing")?,
+            portal: assignment_fb_url(&portal).context("Portal assignment URL missing")?,
         };
 
         let network_state =
@@ -93,30 +85,22 @@ impl Uploader {
     async fn upload_assignment_artifact(
         &self,
         kind: Option<&str>,
-        fb_assignment_v0: Vec<u8>,
-        fb_assignment_v1: Vec<u8>,
+        fb_assignment: Vec<u8>,
     ) -> anyhow::Result<NetworkAssignment> {
         tracing::debug!("Compressing assignment");
-        let compressed_fb_v0;
+        let compressed_fb;
         {
             let _timer = crate::metrics::Timer::new("compress_assignment");
             let mut encoder = GzEncoder::new(Vec::new(), Compression::best());
-            encoder.write_all(&fb_assignment_v0)?;
-            compressed_fb_v0 = encoder.finish()?;
-        }
-        let compressed_fb_v1;
-        {
-            let _timer = crate::metrics::Timer::new("compress_assignment");
-            let mut encoder = GzEncoder::new(Vec::new(), Compression::best());
-            encoder.write_all(&fb_assignment_v1)?;
-            compressed_fb_v1 = encoder.finish()?;
-            crate::metrics::ASSIGNMENT_FB_SIZE.set(fb_assignment_v1.len() as i64);
-            crate::metrics::ASSIGNMENT_COMPRESSED_FB_SIZE.set(compressed_fb_v1.len() as i64);
+            encoder.write_all(&fb_assignment)?;
+            compressed_fb = encoder.finish()?;
+            crate::metrics::ASSIGNMENT_FB_SIZE.set(fb_assignment.len() as i64);
+            crate::metrics::ASSIGNMENT_COMPRESSED_FB_SIZE.set(compressed_fb.len() as i64);
         }
 
         let hash = {
             let _timer = crate::metrics::Timer::new("hash_assignment");
-            Sha256::digest(&compressed_fb_v1)
+            Sha256::digest(&compressed_fb)
         };
 
         tracing::debug!("Saving assignment");
@@ -125,49 +109,34 @@ impl Uploader {
         let system_time = std::time::SystemTime::now();
         let timestamp = self.time.format("%FT%T");
         let assignment_id = format!("{timestamp}_{hash:X}");
-        let (fb_v0_filename, fb_v1_filename) = match kind {
-            Some(kind) => (
-                format!("assignments/{network}/{kind}/{assignment_id}.fb.0.gz"),
-                format!("assignments/{network}/{kind}/{assignment_id}.fb.1.gz"),
-            ),
-            None => (
-                format!("assignments/{network}/{assignment_id}.fb.0.gz"),
-                format!("assignments/{network}/{assignment_id}.fb.1.gz"),
-            ),
+        let fb_filename = match kind {
+            Some(kind) => format!("assignments/{network}/{kind}/{assignment_id}.fb.gz"),
+            None => format!("assignments/{network}/{assignment_id}.fb.gz"),
         };
         let expiration = s3::primitives::DateTime::from(system_time + self.config.assignment_ttl);
 
-        let fb_v0_fut = self
-            .client
+        self.client
             .put_object()
             .bucket(&self.config.scheduler_state_bucket)
-            .key(&fb_v0_filename)
+            .key(&fb_filename)
             .expires(expiration)
-            .body(compressed_fb_v0.into())
-            .send();
-        let fb_v1_fut = self
-            .client
-            .put_object()
-            .bucket(&self.config.scheduler_state_bucket)
-            .key(&fb_v1_filename)
-            .expires(expiration)
-            .body(compressed_fb_v1.into())
-            .send();
-        tokio::try_join!(fb_v0_fut, fb_v1_fut).context("Can't upload assignment")?;
+            .body(compressed_fb.into())
+            .send()
+            .await
+            .context("Can't upload assignment")?;
 
         let effective_from = (system_time.duration_since(std::time::UNIX_EPOCH).unwrap()
             + self.config.assignment_delay)
             .as_secs();
 
-        let fb_url_v0 = format!("{}/{fb_v0_filename}", self.config.network_state_url);
-        let fb_url_v1 = format!("{}/{fb_v1_filename}", self.config.network_state_url);
+        let fb_url = format!("{}/{fb_filename}", self.config.network_state_url);
         Ok(NetworkAssignment {
             #[cfg(not(feature = "mvcc-chunks"))]
             url: Some(String::new()),
             #[cfg(feature = "mvcc-chunks")]
             url: None,
-            fb_url: Some(fb_url_v0),
-            fb_url_v1: Some(fb_url_v1),
+            fb_url: None,
+            fb_url_v1: Some(fb_url),
             id: assignment_id,
             effective_from,
         })
@@ -254,7 +223,7 @@ fn legacy_network_state(network: String, assignment: NetworkAssignment) -> Netwo
     }
 }
 
-fn assignment_fb_url_v1(assignment: &NetworkAssignment) -> anyhow::Result<String> {
+fn assignment_fb_url(assignment: &NetworkAssignment) -> anyhow::Result<String> {
     assignment
         .fb_url_v1
         .clone()
@@ -287,8 +256,8 @@ mod tests {
             url: Some(String::new()),
             #[cfg(feature = "mvcc-chunks")]
             url: None,
-            fb_url: Some(format!("https://example.test/{id}.fb.0.gz")),
-            fb_url_v1: Some(format!("https://example.test/{id}.fb.1.gz")),
+            fb_url: None,
+            fb_url_v1: Some(format!("https://example.test/{id}.fb.gz")),
             id: id.to_string(),
             effective_from: 1781000000,
         }
