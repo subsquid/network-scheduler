@@ -2499,7 +2499,7 @@ dependencies = [
  "serde_with",
  "serde_yaml",
  "sha2",
- "sqd-assignments 0.1.0 (git+https://github.com/subsquid/sqd-network.git?rev=27ba3353)",
+ "sqd-assignments 0.1.0 (git+https://github.com/subsquid/sqd-network.git?rev=d9f4125)",
  "sqd-messages",
  "tempfile",
  "thiserror 2.0.12",
@@ -3727,7 +3727,7 @@ dependencies = [
 [[package]]
 name = "sqd-assignments"
 version = "0.1.0"
-source = "git+https://github.com/subsquid/sqd-network.git?rev=27ba3353#27ba3353f09bd6dda8e44e9ed4aea1eadc906d19"
+source = "git+https://github.com/subsquid/sqd-network.git?rev=d9f4125#d9f4125cac2980e2f514c03486ba1ecc8f115328"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -3763,7 +3763,7 @@ dependencies = [
 [[package]]
 name = "sqd-messages"
 version = "2.1.0"
-source = "git+https://github.com/subsquid/sqd-network.git?rev=fa19681#fa19681cb6a8bbd839ac41dbf568ff48ed2fd3b5"
+source = "git+https://github.com/subsquid/sqd-network.git?rev=d9f4125#d9f4125cac2980e2f514c03486ba1ecc8f115328"
 dependencies = [
  "hex",
  "libp2p-identity",
