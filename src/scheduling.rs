@@ -2,9 +2,7 @@ use std::collections::BTreeMap;
 
 use itertools::Itertools;
 use libp2p_identity::PeerId;
-use rayon::iter::{
-    IndexedParallelIterator, IntoParallelIterator, IntoParallelRefIterator, ParallelIterator,
-};
+use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use seahash::hash;
 use tracing::instrument;
 
@@ -12,18 +10,21 @@ use semver::Version;
 
 use crate::{
     replication::{ReplicationError, calc_replication_factors},
-    types::{Assignment, ChunkIndex, Worker, WorkerIndex},
+    types::{Assignment, ChunkIndex, ChunkWeight, ReplicationFactor, Worker, WorkerIndex},
 };
 
 type RingIndex = u16;
 
 const N_RINGS: usize = 6000;
 
+/// Chunk indices assigned to each worker.
+type WorkerChunks = BTreeMap<PeerId, Vec<ChunkIndex>>;
+
 #[derive(Debug, Clone)]
 pub struct SchedulingConfig {
     pub worker_capacity: u64,
     pub saturation: f64,
-    pub min_replication: u16,
+    pub min_replication: ReplicationFactor,
     pub ignore_reliability: bool,
 }
 
@@ -32,8 +33,11 @@ pub struct ScheduledChunk<'a> {
     pub dataset: &'a str,
     pub chunk_id: &'a str,
     pub size: u32,
-    pub weight: u16,
+    pub weight: ChunkWeight,
     pub minimum_worker_version: Option<&'a Version>,
+    /// Hashes locating each of the chunk's replicas on the ring, indexed by tag.
+    /// Filled by [`schedule`] (see [`hash_chunks`]) — leave empty when constructing.
+    pub hashes: Vec<u64>,
 }
 
 pub fn schedule(
@@ -42,18 +46,28 @@ pub fn schedule(
     config: SchedulingConfig,
 ) -> Result<Assignment, ReplicationError> {
     let _timer = crate::metrics::Timer::new("schedule");
+
+    // Order workers reliable-first, schedule the reliable subset, then (unless
+    // reliability is ignored) overlay a pass over all workers so unreliable workers
+    // also get chunks.
     let mut sorted_workers = Vec::with_capacity(workers.len());
     sorted_workers.extend(workers.iter().filter(|w| w.reliable()));
     let reliable_workers = sorted_workers.len();
     sorted_workers.extend(workers.iter().filter(|w| !w.reliable()));
 
+    // Hash every chunk's replica ring positions once up front; both placement passes
+    // share them. The all-workers caps bound the per-pass caps (capacity only grows
+    // with worker count), so the hash vectors are long enough for either pass.
+    let caps = replication_cap(chunks, workers.len(), &config)?;
+    let chunks = hash_chunks(chunks, &caps, config.min_replication);
+
     if config.ignore_reliability {
         tracing::info!(
             "Scheduling {} chunks to {} workers",
             chunks.len(),
-            workers.len(),
+            workers.len()
         );
-        return schedule_to_workers(chunks, &sorted_workers, &config);
+        return schedule_to_workers(&chunks, &sorted_workers, &config);
     }
 
     tracing::info!(
@@ -61,10 +75,10 @@ pub fn schedule(
         chunks.len(),
         reliable_workers
     );
-    let mut reliable = schedule_to_workers(chunks, &sorted_workers[..reliable_workers], &config)?;
-
+    let mut assignment =
+        schedule_to_workers(&chunks, &sorted_workers[..reliable_workers], &config)?;
     if reliable_workers == workers.len() {
-        return Ok(reliable);
+        return Ok(assignment);
     }
 
     tracing::info!(
@@ -72,16 +86,15 @@ pub fn schedule(
         chunks.len(),
         workers.len()
     );
-    let all = schedule_to_workers(chunks, &sorted_workers, &config)?;
-
-    // Use assignment from `reliable` for reliable workers and from `all` for unreliable workers
+    let all = schedule_to_workers(&chunks, &sorted_workers, &config)?;
+    // Reliable workers keep their assignment; unreliable ones take theirs from `all`.
     for (worker_id, chunk_indexes) in all.worker_chunks {
-        reliable
+        assignment
             .worker_chunks
             .entry(worker_id)
             .or_insert(chunk_indexes);
     }
-    Ok(reliable)
+    Ok(assignment)
 }
 
 fn schedule_to_workers(
@@ -89,6 +102,31 @@ fn schedule_to_workers(
     workers: &[&Worker],
     config: &SchedulingConfig,
 ) -> Result<Assignment, ReplicationError> {
+    // The byte-budget replication is a cap; `distribute` places what fits and reports
+    // the factor actually achieved.
+    let caps = replication_cap(chunks, workers.len(), config)?;
+    let replicated = to_replicated(chunks, &caps);
+    let (worker_chunks, achieved) = distribute(
+        &replicated,
+        workers,
+        config.worker_capacity,
+        config.min_replication,
+    )?;
+    let replication_by_weight = min_replication_by_weight(chunks, &achieved);
+    tracing::info!("Replication by weight: caps {caps:?}, achieved {replication_by_weight:?}");
+    Ok(Assignment {
+        worker_chunks,
+        replication_by_weight,
+    })
+}
+
+/// Per-weight replication derived from the saturated byte budget (always at least
+/// `config.min_replication`).
+fn replication_cap(
+    chunks: &[ScheduledChunk<'_>],
+    n_workers: usize,
+    config: &SchedulingConfig,
+) -> Result<BTreeMap<ChunkWeight, ReplicationFactor>, ReplicationError> {
     let size_by_weight = chunks
         .iter()
         .map(|chunk| (chunk.weight, chunk.size as u64))
@@ -96,149 +134,44 @@ fn schedule_to_workers(
         .sum()
         .into_iter()
         .collect();
-
     let total_capacity =
-        (config.worker_capacity as f64 * workers.len() as f64 * config.saturation) as u64;
-
-    let mapping = calc_replication_factors(
+        (config.worker_capacity as f64 * n_workers as f64 * config.saturation) as u64;
+    calc_replication_factors(
         size_by_weight,
         total_capacity,
         config.min_replication,
-        workers.len() as u16,
-    )?;
+        n_workers as ReplicationFactor,
+    )
+}
 
-    validate_version_restrictions(chunks, workers, config, &mapping);
-
-    let chunks = chunks
+/// Expand `chunks` into `ReplicatedChunk`s, taking each chunk's replication factor from
+/// `replication_by_weight` and propagating its precomputed replica hashes.
+fn to_replicated<'a>(
+    chunks: &'a [ScheduledChunk<'a>],
+    replication_by_weight: &BTreeMap<ChunkWeight, ReplicationFactor>,
+) -> Vec<ReplicatedChunk<'a>> {
+    chunks
         .iter()
         .map(|c| ReplicatedChunk {
             dataset: c.dataset,
             chunk_id: c.chunk_id,
-            replication: mapping[&c.weight],
+            replication: replication_by_weight[&c.weight],
             size: c.size,
             minimum_worker_version: c.minimum_worker_version,
+            hashes: &c.hashes,
         })
-        .collect_vec();
-
-    tracing::info!(
-        "Replication factors by weight: {:?}, total vchunks: {}",
-        mapping,
-        chunks.iter().map(|c| c.replication as u64).sum::<u64>()
-    );
-
-    let worker_chunks = distribute(&chunks, workers, config.worker_capacity);
-    Ok(Assignment {
-        worker_chunks,
-        replication_by_weight: mapping,
-    })
-}
-
-/// Validates that version-restricted data can be scheduled within the
-/// saturation headroom. Only a single non-null `minimum_worker_version` value
-/// is allowed across all chunks. Two checks:
-/// 1. R ≤ E: replication factor must not exceed eligible worker count.
-/// 2. f ≤ (1-s) × E / (s × (N-E)): the extra load on eligible workers
-///    from restricted chunks must fit within the unused capacity fraction.
-fn validate_version_restrictions(
-    chunks: &[ScheduledChunk<'_>],
-    workers: &[&Worker],
-    config: &SchedulingConfig,
-    replication_by_weight: &BTreeMap<u16, u16>,
-) {
-    let total_size: u64 = chunks.iter().map(|c| c.size as u64).sum();
-    if total_size == 0 {
-        return;
-    }
-
-    // Collect the single allowed minimum_worker_version
-    let mut min_ver: Option<&Version> = None;
-    let mut s_restricted: u64 = 0;
-    let mut max_replication: u16 = 0;
-
-    for chunk in chunks {
-        if let Some(v) = chunk.minimum_worker_version {
-            if let Some(existing) = min_ver {
-                assert!(
-                    existing == v,
-                    "Multiple minimum_worker_version values found ({} and {}). \
-                     Only a single version restriction is supported.",
-                    existing,
-                    v,
-                );
-            } else {
-                min_ver = Some(v);
-            }
-            s_restricted += chunk.size as u64;
-            max_replication = max_replication.max(replication_by_weight[&chunk.weight]);
-        }
-    }
-
-    let Some(min_ver) = min_ver else { return };
-
-    let n = workers.len();
-    let s = config.saturation;
-    let e = workers
-        .iter()
-        .filter(|w| w.version.as_ref().is_some_and(|v| v >= min_ver))
-        .count();
-
-    assert!(
-        max_replication as usize <= e,
-        "Not enough eligible workers for version >= {}: \
-         replication factor {} exceeds {} eligible workers (need at least {})",
-        min_ver,
-        max_replication,
-        e,
-        max_replication,
-    );
-
-    if e < n {
-        let f = s_restricted as f64 / total_size as f64;
-        let threshold = (1.0 - s) * e as f64 / (s * (n - e) as f64);
-        assert!(
-            f <= threshold,
-            "Version-restricted data (>= {}) exceeds saturation headroom: \
-             f = {:.4} > {:.4} (E={}, N={}, s={})",
-            min_ver,
-            f,
-            threshold,
-            e,
-            n,
-            s,
-        );
-    }
+        .collect()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct ReplicatedChunk<'a> {
-    dataset: &'a str,
-    chunk_id: &'a str,
-    size: u32,
-    replication: u16,
-    minimum_worker_version: Option<&'a Version>,
-}
-
-#[instrument(skip_all)]
-fn distribute(
-    chunks: &[ReplicatedChunk],
-    workers: &[&Worker],
-    worker_capacity: u64,
-) -> BTreeMap<PeerId, Vec<ChunkIndex>> {
-    let _timer = crate::metrics::Timer::new("schedule:distribute");
-    let worker_ids = workers.iter().map(|w| w.id).collect_vec();
-    let rings = hash_workers(&worker_ids);
-    let mut orderings = hash_chunks(chunks, &rings);
-    // Assign version-restricted chunks first so they get priority on eligible
-    // workers' capacity before unrestricted chunks fill it. Without this,
-    // unrestricted chunks (ordered by hash ring position only) could fill
-    // eligible workers' capacity before restricted chunks are processed,
-    // causing a panic even when total capacity would suffice.
-    orderings.sort_by_key(|(chunk_index, _, _)| {
-        chunks[*chunk_index as usize]
-            .minimum_worker_version
-            .is_none()
-    });
-    assign_chunks(orderings, chunks, workers, rings, worker_capacity)
+pub(crate) struct ReplicatedChunk<'a> {
+    pub(crate) dataset: &'a str,
+    pub(crate) chunk_id: &'a str,
+    pub(crate) size: u32,
+    pub(crate) replication: ReplicationFactor,
+    pub(crate) minimum_worker_version: Option<&'a Version>,
+    /// Replica hashes by tag, borrowed from the [`ScheduledChunk`].
+    pub(crate) hashes: &'a [u64],
 }
 
 #[instrument(skip_all)]
@@ -268,101 +201,224 @@ fn hash_workers(worker_ids: &[PeerId]) -> Vec<Vec<(u64, WorkerIndex)>> {
         .collect()
 }
 
+/// Clone of `chunks` with every replica hash precomputed: tags
+/// `0..max(min_replication, cap)`, where the cap comes from the chunk's weight.
 #[instrument(skip_all)]
-fn hash_chunks(
-    chunks: &[ReplicatedChunk],
-    rings: &[Vec<(u64, u16)>],
-) -> Vec<(ChunkIndex, RingIndex, WorkerIndex)> {
-    tracing::info!("Hashing chunks");
-    let _timer = crate::metrics::Timer::new("schedule:distribute:hash_chunks");
+fn hash_chunks<'a>(
+    chunks: &[ScheduledChunk<'a>],
+    caps: &BTreeMap<ChunkWeight, ReplicationFactor>,
+    min_replication: ReplicationFactor,
+) -> Vec<ScheduledChunk<'a>> {
+    let _timer = crate::metrics::Timer::new("schedule:hash_chunks");
 
     chunks
-        .par_iter()
-        .enumerate()
-        .flat_map_iter(|(chunk_index, chunk)| {
-            (0..chunk.replication).map(move |tag| {
-                let buffer = [
-                    chunk.dataset.as_bytes(),
-                    b"/",
-                    chunk.chunk_id.as_bytes(),
-                    b":",
-                    &tag.to_le_bytes(),
-                ]
-                .concat();
-                let chunk_hash = hash(&buffer);
-                let ring_index = chunk_hash as usize % N_RINGS;
-                let ring = &rings[ring_index];
-                let first = ring.partition_point(|(x, _)| *x < chunk_hash);
-                (
-                    chunk_index as ChunkIndex,
-                    ring_index as RingIndex,
-                    first as WorkerIndex,
-                )
-            })
+        .into_par_iter()
+        .map(|chunk| {
+            let mut buffer = [
+                chunk.dataset.as_bytes(),
+                b"/",
+                chunk.chunk_id.as_bytes(),
+                b":",
+            ]
+            .concat();
+            let prefix = buffer.len();
+            let tags = min_replication.max(caps[&chunk.weight]);
+            let hashes = (0..tags)
+                .map(|tag| {
+                    buffer.truncate(prefix);
+                    buffer.extend_from_slice(&tag.to_le_bytes());
+                    hash(&buffer)
+                })
+                .collect();
+            ScheduledChunk {
+                hashes,
+                ..chunk.clone()
+            }
         })
         .collect()
 }
 
+/// The guaranteed replication per weight: the fewest replicas actually placed among the
+/// chunks of each weight.
+fn min_replication_by_weight(
+    chunks: &[ScheduledChunk<'_>],
+    achieved: &[ReplicationFactor],
+) -> BTreeMap<ChunkWeight, ReplicationFactor> {
+    let mut by_weight: BTreeMap<ChunkWeight, ReplicationFactor> = BTreeMap::new();
+    for (chunk, &got) in chunks.iter().zip(achieved) {
+        by_weight
+            .entry(chunk.weight)
+            .and_modify(|min| *min = (*min).min(got))
+            .or_insert(got);
+    }
+    by_weight
+}
+
+/// Multi-step scatter with a dynamically discovered replication factor. Returns the
+/// placement (`worker -> chunk indices`) and the replication actually achieved for each
+/// chunk (indexed like `chunks`).
+///
+/// `chunks[i].replication` is the cap (upper bound) for chunk `i`. Placement runs in
+/// three phases, each replica walking the chunk's hash ring from its home:
+/// 1. restricted chunks up to `min_replication` — they can only land on eligible
+///    workers, which are scarce, so they claim that capacity first;
+/// 2. unrestricted chunks up to `min_replication`;
+/// 3. both kinds (restricted first) from `min_replication` up to each chunk's cap.
+///
+/// Phases 1 and 2 are mandatory: a replica that can't be placed there means the data
+/// doesn't fit at the required minimum (`NotEnoughCapacity`). Phase 3 is best-effort, so
+/// an unreachable cap just yields a lower achieved factor instead of a panic.
 #[instrument(skip_all)]
-fn assign_chunks(
-    orderings: Vec<(ChunkIndex, RingIndex, WorkerIndex)>,
+pub(crate) fn distribute(
     chunks: &[ReplicatedChunk],
     workers: &[&Worker],
-    rings: Vec<Vec<(u64, WorkerIndex)>>,
     worker_capacity: u64,
-) -> BTreeMap<PeerId, Vec<ChunkIndex>> {
-    tracing::info!("Assigning chunks");
-    let _timer = crate::metrics::Timer::new("schedule:distribute:assign_chunks");
+    min_replication: ReplicationFactor,
+) -> Result<(WorkerChunks, Vec<ReplicationFactor>), ReplicationError> {
+    let _timer = crate::metrics::Timer::new("schedule:distribute");
+    let worker_ids = workers.iter().map(|w| w.id).collect_vec();
+    let rings = hash_workers(&worker_ids);
+    let mut placement = Placement::new(chunks, workers, &rings, worker_capacity);
 
-    struct WorkerAssignment {
-        chunks: Vec<ChunkIndex>,
-        allocated: u64,
+    // `partition` keeps each group in input order, so placement stays deterministic.
+    let (restricted, unrestricted): (Vec<usize>, Vec<usize>) =
+        (0..chunks.len()).partition(|&i| chunks[i].minimum_worker_version.is_some());
+
+    placement.ensure_minimum(&restricted, min_replication)?;
+    placement.ensure_minimum(&unrestricted, min_replication)?;
+
+    let order = restricted.into_iter().chain(unrestricted).collect_vec();
+    placement.fill_to_cap(&order, min_replication);
+
+    let achieved = placement.achieved_replication();
+    Ok((placement.into_worker_chunks(), achieved))
+}
+
+/// Mutable state for [`distribute`].
+struct Placement<'a> {
+    chunks: &'a [ReplicatedChunk<'a>],
+    workers: &'a [&'a Worker],
+    rings: &'a [Vec<(u64, WorkerIndex)>],
+    worker_capacity: u64,
+    /// Bytes assigned to each worker.
+    allocated: Vec<u64>,
+    /// Chunks assigned to each worker — the result.
+    worker_chunks: Vec<Vec<ChunkIndex>>,
+    /// Workers holding each chunk — the inverse of `worker_chunks`, used to keep two
+    /// replicas of a chunk off the same worker.
+    chunk_workers: Vec<Vec<WorkerIndex>>,
+}
+
+impl<'a> Placement<'a> {
+    fn new(
+        chunks: &'a [ReplicatedChunk<'a>],
+        workers: &'a [&'a Worker],
+        rings: &'a [Vec<(u64, WorkerIndex)>],
+        worker_capacity: u64,
+    ) -> Self {
+        Self {
+            chunks,
+            workers,
+            rings,
+            worker_capacity,
+            allocated: vec![0; workers.len()],
+            worker_chunks: vec![Vec::new(); workers.len()],
+            chunk_workers: vec![Vec::new(); chunks.len()],
+        }
     }
 
-    let mut assignments: Vec<WorkerAssignment> = workers
-        .iter()
-        .map(|_| WorkerAssignment {
-            chunks: Vec::new(),
-            allocated: 0,
-        })
-        .collect();
-    orderings
-        .into_iter()
-        .for_each(|(chunk_index, ring_index, first)| {
-            let chunk = &chunks[chunk_index as usize];
-            let ring = &rings[ring_index as usize];
-            let first = first as usize;
-            let candidates = ring[first..].iter().chain(ring[..first].iter());
-            for &(_, worker_index) in candidates {
-                if let Some(min_ver) = chunk.minimum_worker_version {
-                    let worker_ver = &workers[worker_index as usize].version;
-                    if worker_ver.as_ref().is_none_or(|v| v < min_ver) {
-                        continue;
-                    }
-                }
-
-                let assignment = &mut assignments[worker_index as usize];
-
-                if assignment.allocated + chunk.size as u64 <= worker_capacity
-                    // Replicas of the same chunk stay adjacent after the stable sort
-                    // (they share the same minimum_worker_version key), so checking
-                    // the last assigned index is sufficient to prevent duplicates.
-                    && assignment.chunks.last() != Some(&chunk_index)
-                {
-                    assignment.allocated += chunk.size as u64;
-                    assignment.chunks.push(chunk_index);
-                    return;
+    /// Place `min_replication` replicas of every chunk in `subset`, failing if any of
+    /// them can't be placed.
+    fn ensure_minimum(
+        &mut self,
+        subset: &[usize],
+        min_replication: ReplicationFactor,
+    ) -> Result<(), ReplicationError> {
+        for tag in 0..min_replication {
+            for &chunk_index in subset {
+                if !self.place(chunk_index, tag) {
+                    return Err(ReplicationError::NotEnoughCapacity);
                 }
             }
-            panic!(
-                "No worker found for chunk {}/{}",
-                chunk.dataset, chunk.chunk_id
-            );
-        });
+        }
+        Ok(())
+    }
 
-    assignments
-        .into_iter()
-        .enumerate()
-        .map(|(index, a)| (workers[index].id, a.chunks))
-        .collect()
+    /// Add replicas from `from_tag` up to each chunk's cap, in `order`, best-effort. A
+    /// chunk leaves the rounds once it reaches its cap or fails to place — a phase-3
+    /// failure can't succeed at a higher tag (capacity only shrinks, the chunk's worker
+    /// set is fixed), so retrying is pure waste and dropping it keeps the result identical.
+    fn fill_to_cap(&mut self, order: &[usize], from_tag: ReplicationFactor) {
+        let max_cap = order
+            .iter()
+            .map(|&i| self.chunks[i].replication)
+            .max()
+            .unwrap_or(0);
+        // Chunks still below their cap (`cap > tag` holds at each round's start).
+        let mut active: Vec<usize> = order
+            .iter()
+            .copied()
+            .filter(|&i| self.chunks[i].replication > from_tag)
+            .collect();
+        for tag in from_tag..max_cap {
+            active.retain(|&chunk_index| {
+                self.place(chunk_index, tag) && self.chunks[chunk_index].replication > tag + 1
+            });
+            if active.is_empty() {
+                break;
+            }
+        }
+    }
+
+    /// Place the `tag`-th replica of `chunk_index` on the first eligible worker with free
+    /// capacity, walking the chunk's hash ring from its home. Returns whether it landed.
+    fn place(&mut self, chunk_index: usize, tag: ReplicationFactor) -> bool {
+        let chunk = &self.chunks[chunk_index];
+        let chunk_hash = chunk.hashes[tag as usize];
+        let ring = &self.rings[chunk_hash as usize % N_RINGS];
+        let first = ring.partition_point(|(x, _)| *x < chunk_hash);
+
+        for &(_, worker) in ring[first..].iter().chain(&ring[..first]) {
+            let w = worker as usize;
+            let eligible = chunk
+                .minimum_worker_version
+                .is_none_or(|min| self.workers[w].version.as_ref().is_some_and(|v| v >= min));
+            if !eligible || self.chunk_workers[chunk_index].contains(&worker) {
+                continue;
+            }
+            if self.allocated[w] + chunk.size as u64 <= self.worker_capacity {
+                self.allocated[w] += chunk.size as u64;
+                self.worker_chunks[w].push(chunk_index as ChunkIndex);
+                self.chunk_workers[chunk_index].push(worker);
+                return true;
+            }
+        }
+        false
+    }
+
+    /// The replication actually achieved for each chunk (indexed like `chunks`): the
+    /// number of distinct workers it ended up on.
+    fn achieved_replication(&self) -> Vec<ReplicationFactor> {
+        self.chunk_workers
+            .iter()
+            .map(|w| w.len() as ReplicationFactor)
+            .collect()
+    }
+
+    /// Consume the state into the final `worker -> sorted chunk indices` map.
+    fn into_worker_chunks(self) -> WorkerChunks {
+        let Placement {
+            workers,
+            worker_chunks,
+            ..
+        } = self;
+        worker_chunks
+            .into_iter()
+            .enumerate()
+            .map(|(i, mut indices)| {
+                indices.sort_unstable();
+                (workers[i].id, indices)
+            })
+            .collect()
+    }
 }

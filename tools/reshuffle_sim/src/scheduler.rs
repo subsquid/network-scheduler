@@ -82,6 +82,7 @@ fn to_scheduled_chunks<'a>(
                 size: chunk.size,
                 weight: *weight,
                 minimum_worker_version,
+                hashes: Vec::new(),
             }
         })
         .collect()
