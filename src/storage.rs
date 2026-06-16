@@ -15,6 +15,29 @@ use futures::{
 
 const CONCURRENT_CHUNKS: usize = 4;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ContinuityGap {
+    expected_block: u64,
+    actual_block: u64,
+}
+
+/// Returns the next expected block after accepting this chunk.
+fn advance_continuity(
+    next_expected_block: Option<u64>,
+    chunk_start: u64,
+    chunk_end: u64,
+) -> Result<u64, ContinuityGap> {
+    if let Some(expected) = next_expected_block {
+        if chunk_start != expected {
+            return Err(ContinuityGap {
+                expected_block: expected,
+                actual_block: chunk_start,
+            });
+        }
+    }
+    Ok(chunk_end + 1)
+}
+
 #[derive(Clone)]
 pub struct S3Storage {
     client: s3::Client,
@@ -100,7 +123,20 @@ impl ChunkStream {
 
         let objects = self.list_next_objects().await?;
         let has_more_pages = self.continuation_token.is_some();
+        let batch = self.collect_chunks_from_page(objects, has_more_pages)?;
 
+        if self.continuation_token.is_none() {
+            self.exhausted = true;
+        }
+
+        Ok(Some(batch))
+    }
+
+    fn collect_chunks_from_page(
+        &mut self,
+        objects: Vec<S3Object>,
+        has_more_pages: bool,
+    ) -> anyhow::Result<Vec<Chunk>> {
         let mut batch = Vec::new();
         let mut current: Vec<S3Object> = Vec::new();
         let mut objects = objects.into_iter().peekable();
@@ -119,8 +155,29 @@ impl ChunkStream {
                 } else {
                     match self.objects_to_chunk(&current)? {
                         Some(chunk) => {
-                            self.ensure_chain_continuity(&chunk)?;
-                            batch.push(chunk);
+                            match advance_continuity(
+                                self.next_expected_block,
+                                *chunk.blocks.start(),
+                                *chunk.blocks.end(),
+                            ) {
+                                Ok(next) => {
+                                    self.next_expected_block = Some(next);
+                                    batch.push(chunk);
+                                }
+                                Err(gap) => {
+                                    metrics::report_continuity_fallback(&self.dataset);
+                                    tracing::warn!(
+                                        dataset = %self.dataset,
+                                        expected_block = gap.expected_block,
+                                        actual_block = gap.actual_block,
+                                        missing_through = gap.actual_block.saturating_sub(1),
+                                        accepted_in_batch = batch.len(),
+                                        "Continuity gap detected; falling back to last known good chunks for this dataset",
+                                    );
+                                    self.exhausted = true;
+                                    break;
+                                }
+                            }
                         }
                         // The very last chunk in the bucket may still be in the
                         // process of being written (no blocks.parquet yet); that's
@@ -143,11 +200,7 @@ impl ChunkStream {
             }
         }
 
-        if self.continuation_token.is_none() {
-            self.exhausted = true;
-        }
-
-        Ok(Some(batch))
+        Ok(batch)
     }
 
     pub fn exhausted(&self) -> bool {
@@ -202,21 +255,6 @@ impl ChunkStream {
         tracing::trace!("Downloaded chunk {chunk}");
 
         Ok(Some(chunk))
-    }
-
-    fn ensure_chain_continuity(&mut self, chunk: &Chunk) -> anyhow::Result<()> {
-        if let Some(next_block) = self.next_expected_block {
-            if *chunk.blocks.start() != next_block {
-                anyhow::bail!(
-                    "Blocks {} to {} missing from {}",
-                    next_block,
-                    chunk.blocks.start() - 1,
-                    self.dataset
-                );
-            }
-        }
-        self.next_expected_block = Some(chunk.blocks.end() + 1);
-        Ok(())
     }
 }
 
@@ -348,6 +386,113 @@ mod test {
     use super::*;
     use aws_config::BehaviorVersion;
     use std::env;
+
+    #[test]
+    fn continuity_first_chunk_always_accepted() {
+        assert_eq!(advance_continuity(None, 1000, 1099).unwrap(), 1100);
+    }
+
+    #[test]
+    fn continuity_sequential_ok() {
+        assert_eq!(advance_continuity(Some(1100), 1100, 1199).unwrap(), 1200);
+    }
+
+    #[test]
+    fn continuity_gap_detected() {
+        let gap = advance_continuity(Some(1200), 1500, 1599).unwrap_err();
+        assert_eq!(
+            gap,
+            ContinuityGap {
+                expected_block: 1200,
+                actual_block: 1500,
+            }
+        );
+    }
+
+    fn test_dataset() -> Arc<String> {
+        Arc::new("s3://test-dataset".to_string())
+    }
+
+    fn make_test_chunk(first: u64, last: u64) -> Chunk {
+        let id = format!("{first:010}/{first:010}-{last:010}-{:08x}", first as u32);
+        Chunk {
+            dataset: test_dataset(),
+            id: Arc::new(id),
+            size: 1000,
+            blocks: first..=last,
+            files: Arc::new(vec!["blocks.parquet".to_string()]),
+            summary: None,
+        }
+    }
+
+    fn make_chunk_objects(first: u64, last: u64) -> Vec<S3Object> {
+        let prefix = format!("{first:010}/{first:010}-{last:010}-{:08x}", first as u32);
+        vec![S3Object {
+            prefix,
+            file_name: "blocks.parquet".to_string(),
+            size: 100,
+        }]
+    }
+
+    fn make_test_stream(last_chunk: Option<&Chunk>) -> ChunkStream {
+        let config = aws_sdk_s3::config::Builder::new()
+            .behavior_version(aws_config::BehaviorVersion::latest())
+            .build();
+        let client = s3::Client::from_conf(config);
+        ChunkStream::new(
+            client,
+            test_dataset(),
+            "test-dataset".to_string(),
+            last_chunk,
+        )
+    }
+
+    #[test]
+    fn collect_chunks_stops_at_continuity_gap_after_prefix() {
+        let last_chunk = make_test_chunk(0, 199);
+        let mut stream = make_test_stream(Some(&last_chunk));
+
+        let mut objects = make_chunk_objects(200, 299);
+        objects.extend(make_chunk_objects(300, 399));
+        objects.extend(make_chunk_objects(500, 599));
+
+        let batch = stream
+            .collect_chunks_from_page(objects, false)
+            .expect("continuity gap should not error");
+
+        assert_eq!(batch.len(), 2);
+        assert_eq!(*batch[0].blocks.start(), 200);
+        assert_eq!(*batch[1].blocks.end(), 399);
+        assert!(stream.exhausted());
+    }
+
+    #[test]
+    fn collect_chunks_returns_empty_when_first_new_chunk_has_gap() {
+        let last_chunk = make_test_chunk(0, 199);
+        let mut stream = make_test_stream(Some(&last_chunk));
+
+        let objects = make_chunk_objects(500, 599);
+        let batch = stream
+            .collect_chunks_from_page(objects, false)
+            .expect("continuity gap should not error");
+
+        assert!(batch.is_empty());
+        assert!(stream.exhausted());
+    }
+
+    #[tokio::test]
+    async fn next_batch_returns_none_after_continuity_gap() {
+        let last_chunk = make_test_chunk(0, 199);
+        let mut stream = make_test_stream(Some(&last_chunk));
+
+        let objects = make_chunk_objects(500, 599);
+        stream
+            .collect_chunks_from_page(objects, false)
+            .expect("continuity gap should not error");
+
+        assert!(stream.exhausted());
+        assert_eq!(stream.next_batch().await.unwrap(), None);
+    }
 
     async fn make_s3_client() -> anyhow::Result<s3::Client> {
         let endpoint = env::var("AWS_ENDPOINT_URL")?;

@@ -29,6 +29,7 @@ lazy_static::lazy_static! {
     pub static ref ASSIGNMENT_COMPRESSED_FB_SIZE: Gauge = Default::default();
 
     pub static ref FAILURE: Family<Labels, Gauge> = Default::default();
+    pub static ref CONTINUITY_FALLBACK: Family<Labels, Gauge> = Default::default();
     pub static ref EXEC_TIMES: Family<Labels, Gauge<f64, AtomicU64>> = Default::default();
     pub static ref ASSIGNMENT_TIMESTAMP: Gauge = Default::default();
 }
@@ -103,6 +104,13 @@ pub fn failure(target: impl Into<String>) {
     FAILURE
         .get_or_create(&vec![("target", target.into())])
         .set(1);
+}
+
+pub fn report_continuity_fallback(dataset: &str) {
+    CONTINUITY_FALLBACK
+        .get_or_create(&vec![("dataset", dataset.to_string())])
+        .set(1);
+    failure("continuity_fallback");
 }
 
 fn format_segment_label(dataset: &str, from: Option<i64>) -> String {
@@ -194,6 +202,11 @@ pub fn register_metrics(network: String) -> Registry {
         "failure",
         "Failures during the scheduling process",
         FAILURE.clone(),
+    );
+    registry.register(
+        "continuity_fallback",
+        "Dataset fell back to last known good chunks after a continuity gap",
+        CONTINUITY_FALLBACK.clone(),
     );
     registry.register_with_unit(
         "exec_times",
