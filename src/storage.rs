@@ -37,19 +37,48 @@ impl S3Storage {
         dataset_load_timeout: Option<Duration>,
     ) -> anyhow::Result<BTreeMap<Arc<String>, Vec<Chunk>>> {
         let _timer = crate::metrics::Timer::new("load_newer_chunks");
-        stream::iter(datasets)
+        let results: Vec<(Arc<String>, anyhow::Result<Vec<Chunk>>)> = stream::iter(datasets)
             .map(|(dataset, last_chunk)| {
                 let storage = DatasetStorage::new(self.client.clone(), dataset);
                 async move {
                     let chunks = storage
                         .list_new_chunks(last_chunk, CONCURRENT_CHUNKS, dataset_load_timeout)
-                        .await?;
-                    anyhow::Ok((storage.dataset, chunks))
+                        .await;
+                    (storage.dataset, chunks)
                 }
             })
             .buffer_unordered(concurrent_downloads)
-            .try_collect()
-            .await
+            .collect()
+            .await;
+
+        // A single dataset's storage failure (e.g. a deleted/relocated bucket
+        // returning `NoSuchBucket`) must not abort scheduling for the entire
+        // network. Skip the failing dataset, surface it via logs and the
+        // `scheduler_failure{target=...}` metric, and keep the rest schedulable.
+        let total = results.len();
+        let mut failed = 0;
+        let mut chunks = BTreeMap::new();
+        for (dataset, result) in results {
+            match result {
+                Ok(dataset_chunks) => {
+                    chunks.insert(dataset, dataset_chunks);
+                }
+                Err(e) => {
+                    failed += 1;
+                    tracing::warn!("Skipping dataset {dataset}: couldn't load chunks: {e:#}");
+                    crate::metrics::failure(dataset.as_str());
+                }
+            }
+        }
+
+        // Guard against a systemic outage: if every dataset failed, propagate the
+        // error rather than publishing an empty assignment that would wipe worker
+        // allocations. Partial failures (some datasets loaded) proceed normally.
+        if failed > 0 && chunks.is_empty() {
+            anyhow::bail!("Failed to load chunks for all {total} datasets");
+        }
+
+        Ok(chunks)
     }
 }
 
