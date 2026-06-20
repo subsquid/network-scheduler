@@ -37,19 +37,43 @@ impl S3Storage {
         dataset_load_timeout: Option<Duration>,
     ) -> anyhow::Result<BTreeMap<Arc<String>, Vec<Chunk>>> {
         let _timer = crate::metrics::Timer::new("load_newer_chunks");
-        stream::iter(datasets)
+        // Load each dataset independently and DO NOT fail the whole run if a single
+        // dataset can't be loaded (e.g. its bucket is temporarily missing / inaccessible).
+        // A single failing dataset must not abort the assignment: aborting freezes the
+        // global `effective_from` watermark, which stops hot-block retention pruning
+        // fleet-wide and fills the hotblocks disk. Failed datasets are logged and skipped;
+        // they simply contribute no new chunks this run (their previously known chunks are
+        // retained) and recover automatically on a later run once the bucket is reachable.
+        let results: Vec<(Arc<String>, anyhow::Result<Vec<Chunk>>)> = stream::iter(datasets)
             .map(|(dataset, last_chunk)| {
                 let storage = DatasetStorage::new(self.client.clone(), dataset);
                 async move {
                     let chunks = storage
                         .list_new_chunks(last_chunk, CONCURRENT_CHUNKS, dataset_load_timeout)
-                        .await?;
-                    anyhow::Ok((storage.dataset, chunks))
+                        .await;
+                    (storage.dataset, chunks)
                 }
             })
             .buffer_unordered(concurrent_downloads)
-            .try_collect()
-            .await
+            .collect()
+            .await;
+
+        let mut new_chunks = BTreeMap::new();
+        for (dataset, result) in results {
+            match result {
+                Ok(chunks) => {
+                    new_chunks.insert(dataset, chunks);
+                }
+                Err(e) => {
+                    tracing::error!(
+                        dataset = %dataset,
+                        error = ?e,
+                        "Failed to load chunks for dataset; skipping it for this run"
+                    );
+                }
+            }
+        }
+        Ok(new_chunks)
     }
 }
 
