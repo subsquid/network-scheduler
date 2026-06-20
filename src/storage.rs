@@ -37,19 +37,43 @@ impl S3Storage {
         dataset_load_timeout: Option<Duration>,
     ) -> anyhow::Result<BTreeMap<Arc<String>, Vec<Chunk>>> {
         let _timer = crate::metrics::Timer::new("load_newer_chunks");
-        stream::iter(datasets)
+        let loaded = stream::iter(datasets)
             .map(|(dataset, last_chunk)| {
                 let storage = DatasetStorage::new(self.client.clone(), dataset);
                 async move {
-                    let chunks = storage
+                    let result = storage
                         .list_new_chunks(last_chunk, CONCURRENT_CHUNKS, dataset_load_timeout)
-                        .await?;
-                    anyhow::Ok((storage.dataset, chunks))
+                        .await;
+                    (storage.dataset, result)
                 }
             })
             .buffer_unordered(concurrent_downloads)
-            .try_collect()
-            .await
+            .collect::<Vec<_>>()
+            .await;
+
+        // Isolate per-dataset failures instead of aborting the whole load.
+        // A single unreadable dataset (e.g. a missing/renamed S3 bucket
+        // returning NoSuchBucket) must not prevent loading every other dataset:
+        // otherwise the scheduler can't publish any assignment and
+        // `effective_from` freezes network-wide until the bad dataset is removed
+        // by hand. Skip the failing dataset (it keeps its already-known chunks
+        // and is retried on the next run) and keep going.
+        let mut result = BTreeMap::new();
+        for (dataset, chunks) in loaded {
+            match chunks {
+                Ok(chunks) => {
+                    result.insert(dataset, chunks);
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        dataset = %dataset,
+                        error = ?err,
+                        "Failed to load new chunks for dataset, skipping it for this run"
+                    );
+                }
+            }
+        }
+        Ok(result)
     }
 }
 
