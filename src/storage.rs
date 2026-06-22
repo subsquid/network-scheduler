@@ -37,19 +37,35 @@ impl S3Storage {
         dataset_load_timeout: Option<Duration>,
     ) -> anyhow::Result<BTreeMap<Arc<String>, Vec<Chunk>>> {
         let _timer = crate::metrics::Timer::new("load_newer_chunks");
-        stream::iter(datasets)
+        // Log and skip datasets that fail to load instead of aborting: one unreachable bucket
+        // must not freeze updates for all datasets.
+        let result = stream::iter(datasets)
             .map(|(dataset, last_chunk)| {
                 let storage = DatasetStorage::new(self.client.clone(), dataset);
                 async move {
                     let chunks = storage
                         .list_new_chunks(last_chunk, CONCURRENT_CHUNKS, dataset_load_timeout)
-                        .await?;
-                    anyhow::Ok((storage.dataset, chunks))
+                        .await;
+                    (storage.dataset, chunks)
                 }
             })
             .buffer_unordered(concurrent_downloads)
-            .try_collect()
-            .await
+            .filter_map(|(dataset, chunks)| async move {
+                match chunks {
+                    Ok(chunks) => Some((dataset, chunks)),
+                    Err(e) => {
+                        tracing::error!(
+                            dataset = %dataset,
+                            error = ?e,
+                            "Failed to load chunks for dataset; skipping it for this run"
+                        );
+                        None
+                    }
+                }
+            })
+            .collect::<BTreeMap<_, _>>()
+            .await;
+        Ok(result)
     }
 }
 
@@ -205,8 +221,8 @@ impl ChunkStream {
     }
 
     fn ensure_chain_continuity(&mut self, chunk: &Chunk) -> anyhow::Result<()> {
-        if let Some(next_block) = self.next_expected_block {
-            if *chunk.blocks.start() != next_block {
+        if let Some(next_block) = self.next_expected_block
+            && *chunk.blocks.start() != next_block {
                 anyhow::bail!(
                     "Blocks {} to {} missing from {}",
                     next_block,
@@ -214,7 +230,6 @@ impl ChunkStream {
                     self.dataset
                 );
             }
-        }
         self.next_expected_block = Some(chunk.blocks.end() + 1);
         Ok(())
     }
@@ -261,8 +276,8 @@ impl DatasetStorage {
 
             chunks.append(&mut batch);
 
-            if let Some(deadline) = deadline {
-                if Instant::now() >= deadline && !stream.exhausted() {
+            if let Some(deadline) = deadline
+                && Instant::now() >= deadline && !stream.exhausted() {
                     tracing::warn!(
                         "Dataset {} summary population timed out after {}s. \
                          {} chunks processed. Remaining chunks will be processed on next run.",
@@ -272,7 +287,6 @@ impl DatasetStorage {
                     );
                     break;
                 }
-            }
         }
 
         tracing::debug!("Downloaded {} chunks", chunks.len());
