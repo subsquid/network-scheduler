@@ -37,14 +37,9 @@ impl S3Storage {
         dataset_load_timeout: Option<Duration>,
     ) -> anyhow::Result<BTreeMap<Arc<String>, Vec<Chunk>>> {
         let _timer = crate::metrics::Timer::new("load_newer_chunks");
-        // Load each dataset independently and DO NOT fail the whole run if a single
-        // dataset can't be loaded (e.g. its bucket is temporarily missing / inaccessible).
-        // A single failing dataset must not abort the assignment: aborting freezes the
-        // global `effective_from` watermark, which stops hot-block retention pruning
-        // fleet-wide and fills the hotblocks disk. Failed datasets are logged and skipped;
-        // they simply contribute no new chunks this run (their previously known chunks are
-        // retained) and recover automatically on a later run once the bucket is reachable.
-        let results: Vec<(Arc<String>, anyhow::Result<Vec<Chunk>>)> = stream::iter(datasets)
+        // Log and skip datasets that fail to load instead of aborting: one unreachable bucket
+        // must not freeze updates for all datasets.
+        let result = stream::iter(datasets)
             .map(|(dataset, last_chunk)| {
                 let storage = DatasetStorage::new(self.client.clone(), dataset);
                 async move {
@@ -55,25 +50,22 @@ impl S3Storage {
                 }
             })
             .buffer_unordered(concurrent_downloads)
-            .collect()
+            .filter_map(|(dataset, chunks)| async move {
+                match chunks {
+                    Ok(chunks) => Some((dataset, chunks)),
+                    Err(e) => {
+                        tracing::error!(
+                            dataset = %dataset,
+                            error = ?e,
+                            "Failed to load chunks for dataset; skipping it for this run"
+                        );
+                        None
+                    }
+                }
+            })
+            .collect::<BTreeMap<_, _>>()
             .await;
-
-        let mut new_chunks = BTreeMap::new();
-        for (dataset, result) in results {
-            match result {
-                Ok(chunks) => {
-                    new_chunks.insert(dataset, chunks);
-                }
-                Err(e) => {
-                    tracing::error!(
-                        dataset = %dataset,
-                        error = ?e,
-                        "Failed to load chunks for dataset; skipping it for this run"
-                    );
-                }
-            }
-        }
-        Ok(new_chunks)
+        Ok(result)
     }
 }
 
@@ -229,8 +221,8 @@ impl ChunkStream {
     }
 
     fn ensure_chain_continuity(&mut self, chunk: &Chunk) -> anyhow::Result<()> {
-        if let Some(next_block) = self.next_expected_block {
-            if *chunk.blocks.start() != next_block {
+        if let Some(next_block) = self.next_expected_block
+            && *chunk.blocks.start() != next_block {
                 anyhow::bail!(
                     "Blocks {} to {} missing from {}",
                     next_block,
@@ -238,7 +230,6 @@ impl ChunkStream {
                     self.dataset
                 );
             }
-        }
         self.next_expected_block = Some(chunk.blocks.end() + 1);
         Ok(())
     }
@@ -285,8 +276,8 @@ impl DatasetStorage {
 
             chunks.append(&mut batch);
 
-            if let Some(deadline) = deadline {
-                if Instant::now() >= deadline && !stream.exhausted() {
+            if let Some(deadline) = deadline
+                && Instant::now() >= deadline && !stream.exhausted() {
                     tracing::warn!(
                         "Dataset {} summary population timed out after {}s. \
                          {} chunks processed. Remaining chunks will be processed on next run.",
@@ -296,7 +287,6 @@ impl DatasetStorage {
                     );
                     break;
                 }
-            }
         }
 
         tracing::debug!("Downloaded {} chunks", chunks.len());
