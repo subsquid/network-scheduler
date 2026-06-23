@@ -15,6 +15,16 @@ use futures::{
 
 const CONCURRENT_CHUNKS: usize = 4;
 
+/// How many times to attempt downloading a chunk's summary before giving up.
+/// The S3 endpoint occasionally stalls mid-stream (the AWS SDK reports it as
+/// "throughput of 0 B/s was observed"), which is transient and usually clears
+/// on a retry. Without this, a single stall discards the whole run's progress
+/// for the dataset, so a large new dataset can fail to ever finish indexing.
+const SUMMARY_DOWNLOAD_ATTEMPTS: u32 = 5;
+
+/// Base delay for the exponential backoff between summary download attempts.
+const SUMMARY_RETRY_BASE_DELAY: Duration = Duration::from_millis(500);
+
 #[derive(Clone)]
 pub struct S3Storage {
     client: s3::Client,
@@ -298,6 +308,28 @@ impl DatasetStorage {
     }
 
     async fn populate_with_summary(&self, data_chunk: &mut Chunk) -> anyhow::Result<()> {
+        let mut attempt = 1;
+        loop {
+            match self.try_populate_with_summary(data_chunk).await {
+                Ok(()) => return Ok(()),
+                Err(e) if attempt < SUMMARY_DOWNLOAD_ATTEMPTS => {
+                    let delay = SUMMARY_RETRY_BASE_DELAY * 2u32.pow(attempt - 1);
+                    tracing::warn!(
+                        chunk = %data_chunk,
+                        attempt,
+                        error = ?e,
+                        "Failed to download chunk summary; retrying in {delay:?}",
+                    );
+                    metrics::S3_SUMMARY_DOWNLOAD_RETRIES.inc();
+                    tokio::time::sleep(delay).await;
+                    attempt += 1;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    async fn try_populate_with_summary(&self, data_chunk: &mut Chunk) -> anyhow::Result<()> {
         let key = format!("{}/blocks.parquet", data_chunk.id);
         let temp_file = tempfile::tempfile()?;
         let mut tokio_file = tokio::fs::File::from_std(temp_file);
