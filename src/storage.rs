@@ -222,14 +222,15 @@ impl ChunkStream {
 
     fn ensure_chain_continuity(&mut self, chunk: &Chunk) -> anyhow::Result<()> {
         if let Some(next_block) = self.next_expected_block
-            && *chunk.blocks.start() != next_block {
-                anyhow::bail!(
-                    "Blocks {} to {} missing from {}",
-                    next_block,
-                    chunk.blocks.start() - 1,
-                    self.dataset
-                );
-            }
+            && *chunk.blocks.start() != next_block
+        {
+            anyhow::bail!(
+                "Blocks {} to {} missing from {}",
+                next_block,
+                chunk.blocks.start() - 1,
+                self.dataset
+            );
+        }
         self.next_expected_block = Some(chunk.blocks.end() + 1);
         Ok(())
     }
@@ -277,16 +278,18 @@ impl DatasetStorage {
             chunks.append(&mut batch);
 
             if let Some(deadline) = deadline
-                && Instant::now() >= deadline && !stream.exhausted() {
-                    tracing::warn!(
-                        "Dataset {} summary population timed out after {}s. \
+                && Instant::now() >= deadline
+                && !stream.exhausted()
+            {
+                tracing::warn!(
+                    "Dataset {} summary population timed out after {}s. \
                          {} chunks processed. Remaining chunks will be processed on next run.",
-                        self.dataset,
-                        dataset_load_timeout.unwrap().as_secs(),
-                        chunks.len(),
-                    );
-                    break;
-                }
+                    self.dataset,
+                    dataset_load_timeout.unwrap().as_secs(),
+                    chunks.len(),
+                );
+                break;
+            }
         }
 
         tracing::debug!("Downloaded {} chunks", chunks.len());
