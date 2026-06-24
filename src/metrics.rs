@@ -29,6 +29,9 @@ lazy_static::lazy_static! {
     pub static ref ASSIGNMENT_FB_SIZE: Gauge = Default::default();
     pub static ref ASSIGNMENT_COMPRESSED_FB_SIZE: Gauge = Default::default();
 
+    pub static ref PROMOTION_HELD_BACK: Family<Labels, Gauge> = Default::default();
+    pub static ref REGISTRATION_REJECTED: Family<Labels, Gauge> = Default::default();
+
     pub static ref FAILURE: Family<Labels, Gauge> = Default::default();
     pub static ref EXEC_TIMES: Family<Labels, Gauge<f64, AtomicU64>> = Default::default();
     pub static ref ASSIGNMENT_TIMESTAMP: Gauge = Default::default();
@@ -97,6 +100,28 @@ pub fn report_replication_factors(
                 ])
                 .set(factor as i64);
         }
+    }
+}
+
+/// Chunks held back from promotion this cycle for overlapping a visible chunk, by dataset.
+/// Cleared and re-set each cycle.
+pub fn report_promotion_held_back(counts: impl IntoIterator<Item = (String, i64)>) {
+    PROMOTION_HELD_BACK.clear();
+    for (dataset, count) in counts {
+        PROMOTION_HELD_BACK
+            .get_or_create(&vec![("dataset", dataset)])
+            .set(count);
+    }
+}
+
+/// Chunks rejected at registration this cycle for overlapping a live chunk, by dataset.
+/// Cleared and re-set each cycle.
+pub fn report_registration_rejected(counts: impl IntoIterator<Item = (String, i64)>) {
+    REGISTRATION_REJECTED.clear();
+    for (dataset, count) in counts {
+        REGISTRATION_REJECTED
+            .get_or_create(&vec![("dataset", dataset)])
+            .set(count);
     }
 }
 
@@ -197,6 +222,16 @@ pub fn register_metrics(network: String) -> Registry {
         ASSIGNMENT_COMPRESSED_FB_SIZE.clone(),
     );
     registry.register(
+        "promotion_held_back",
+        "Chunks held back from portal promotion due to a block-range overlap, by dataset",
+        PROMOTION_HELD_BACK.clone(),
+    );
+    registry.register(
+        "registration_rejected",
+        "Chunks rejected at registration due to a block-range overlap, by dataset",
+        REGISTRATION_REJECTED.clone(),
+    );
+    registry.register(
         "failure",
         "Failures during the scheduling process",
         FAILURE.clone(),
@@ -244,5 +279,51 @@ impl Drop for Timer {
             .get_or_create(&vec![("name", self.name.to_string())])
             .inc_by(elapsed.as_secs_f64());
         tracing::debug!("{} finished in {:?}", self.name, elapsed);
+    }
+}
+
+/// Times a Postgres storage phase, counting the SQL statements it issues and rows they touch. On
+/// drop it emits one `debug` line on the `pg_timing` target (select with
+/// `RUST_LOG=error,pg_timing=debug`) plus an `EXEC_TIMES` sample. The statement count distinguishes
+/// an N+1 storm (statements ≈ rows) from a single slow query.
+pub struct PhaseTimer {
+    start: std::time::Instant,
+    name: &'static str,
+    statements: u64,
+    rows: u64,
+}
+
+impl PhaseTimer {
+    pub fn new(name: &'static str) -> Self {
+        Self {
+            start: std::time::Instant::now(),
+            name,
+            statements: 0,
+            rows: 0,
+        }
+    }
+
+    /// Record one executed statement that touched `rows` rows. Call once per round-trip — inside a
+    /// per-row loop this is what surfaces the round-trip count.
+    pub fn stmt(&mut self, rows: u64) {
+        self.statements += 1;
+        self.rows += rows;
+    }
+}
+
+impl Drop for PhaseTimer {
+    fn drop(&mut self) {
+        let elapsed = self.start.elapsed();
+        EXEC_TIMES
+            .get_or_create(&vec![("name", self.name.to_string())])
+            .inc_by(elapsed.as_secs_f64());
+        tracing::debug!(
+            target: "pg_timing",
+            phase = self.name,
+            statements = self.statements,
+            rows = self.rows,
+            elapsed_ms = elapsed.as_millis() as u64,
+            "pg phase complete"
+        );
     }
 }

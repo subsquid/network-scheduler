@@ -8,10 +8,16 @@ anyhow = "1.0.98"
 clap = { version = "4.5.38", features = ["derive", "env"] }
 dhat = "0.3"
 flate2 = "1.1.1"
-network-scheduler = { path = "../.." }
+network-scheduler = { path = "../..", features = ["mvcc-chunks"] }
 sqd-assignments = { git = "https://github.com/subsquid/sqd-network.git", rev = "fa19681", features = ["reader"] }
 libp2p-identity = { version = "0.2.10", features = ["peerid"] }
 semver = "1.0.26"
 bytesize = "2.3.1"
 rand = "0.9.1"
+tracing = "0.1.41"
+tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
+# Multistep backend driver: a logical clock and (optionally) an ephemeral Postgres container.
+tokio = { version = "1.45.0", features = ["rt", "rt-multi-thread"] }
+testcontainers = { version = "0.27.2" }
+testcontainers-modules = { version = "0.15", features = ["postgres"] }
 tabled = "0.21"

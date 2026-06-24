@@ -1,10 +1,11 @@
 //! Reshuffle metrics and the assignment diffing that produces them.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::time::Duration;
 
 use libp2p_identity::PeerId;
-use network_scheduler::types::{Assignment, Chunk};
 
+use crate::simulation::StepPlacement;
 use crate::{ChunkId, ChunkOwners, ChunkSizeIndex};
 
 /// Metrics for a single simulation step.
@@ -21,11 +22,13 @@ pub struct ReshuffleMetrics {
     pub total_capacity_bytes: u64,
     pub used_capacity_bytes: u64,
     pub eligible_workers: usize,
-    /// False when scheduling failed (panicked) at this step; the run stops after.
+    /// False when scheduling failed at this step; the run stops after.
     pub scheduled: bool,
     pub failure_reason: Option<String>,
     /// Data movement restricted to version-restricted chunks only.
     pub restricted_movement: DataMovement,
+    /// Wall-clock time the scheduler spent on this step.
+    pub schedule_duration: Duration,
 }
 
 /// Data movement between two assignments, classified by cause.
@@ -55,18 +58,24 @@ pub struct StepStats {
     pub eligible_workers: usize,
 }
 
-/// Computes a step's metrics by diffing the new assignment against the previous
-/// one. Returns the current chunk owners for use as the next step's previous.
+/// Computes a step's metrics by diffing the step's placement against the
+/// previous one. Returns the current chunk owners for use as the next step's
+/// previous.
 pub fn measure_reshuffle(
     previous_owners: &ChunkOwners,
-    chunks: &[Chunk],
-    assignment: &Assignment,
+    placement: StepPlacement,
     restricted: &HashSet<ChunkId>,
     stats: StepStats,
     total_capacity_bytes: u64,
 ) -> (ReshuffleMetrics, ChunkOwners) {
-    let current_owners = chunk_owners(chunks, assignment);
-    let chunk_sizes = index_chunk_sizes(chunks);
+    let StepPlacement {
+        owners: current_owners,
+        chunk_sizes,
+        replication_by_weight,
+        used_capacity_bytes,
+        total_chunks,
+        schedule_duration,
+    } = placement;
 
     let data_movement = compute_data_movement(previous_owners, &current_owners, &chunk_sizes);
     let restricted_movement = compute_data_movement(
@@ -79,16 +88,17 @@ pub fn measure_reshuffle(
         step: stats.step,
         new_chunks_in_step: stats.new_chunks,
         new_restricted_in_step: stats.new_restricted,
-        total_chunks: chunks.len(),
+        total_chunks,
         total_restricted_chunks: restricted.len(),
-        replication_by_weight: assignment.replication_by_weight.clone(),
+        replication_by_weight,
         data_movement,
         total_capacity_bytes,
-        used_capacity_bytes: used_capacity(chunks, assignment),
+        used_capacity_bytes,
         eligible_workers: stats.eligible_workers,
         scheduled: true,
         failure_reason: None,
         restricted_movement,
+        schedule_duration,
     };
 
     (metrics, current_owners)
@@ -117,38 +127,8 @@ pub fn failed_step_metrics(
         scheduled: false,
         failure_reason: Some(reason),
         restricted_movement: DataMovement::zero(),
+        schedule_duration: Duration::ZERO,
     }
-}
-
-/// Maps each chunk to the set of workers holding it in `assignment`.
-fn chunk_owners(chunks: &[Chunk], assignment: &Assignment) -> ChunkOwners {
-    let mut owners: ChunkOwners = BTreeMap::new();
-    for (worker, indexes) in &assignment.worker_chunks {
-        for &index in indexes {
-            let chunk = &chunks[index as usize];
-            owners
-                .entry((chunk.dataset.clone(), chunk.id.clone()))
-                .or_default()
-                .insert(*worker);
-        }
-    }
-    owners
-}
-
-fn index_chunk_sizes(chunks: &[Chunk]) -> ChunkSizeIndex {
-    chunks
-        .iter()
-        .map(|c| ((c.dataset.clone(), c.id.clone()), c.size))
-        .collect()
-}
-
-fn used_capacity(chunks: &[Chunk], assignment: &Assignment) -> u64 {
-    assignment
-        .worker_chunks
-        .values()
-        .flatten()
-        .map(|&index| chunks[index as usize].size as u64)
-        .sum()
 }
 
 /// Keeps only the owner entries whose chunk id is in `restricted`.
