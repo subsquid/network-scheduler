@@ -1,0 +1,962 @@
+//! In-memory reference model of [`SchedulerStorage`](crate::scheduler_storage::SchedulerStorage) —
+//! test-only. Serves as the simulation's oracle and a fast backend for the storage suites; it is
+//! not a production storage path.
+
+use crate::scheduler_storage::algorithm::{ScheduleOutput, SchedulingAlgorithm};
+use crate::scheduler_storage::{
+    AssignmentId, AssignmentWorker, ChunkPk, PortalAssignment, SchedulerStorage, StorageError,
+    Tick, WorkerAssignment, WorkerPk,
+};
+use crate::types::{BlockNumber, Chunk, Worker, WorkerStatus};
+use anyhow::Result;
+use libp2p_identity::PeerId;
+use semver::Version;
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::ops::RangeInclusive;
+use thiserror::Error;
+
+mod nonoverlap;
+#[cfg(test)]
+mod tests;
+
+type Dataset = String;
+type ChunkId = String;
+
+type WorkerAssignmentId = u64;
+type PortalAssignmentId = u64;
+type TimeUnit = u64;
+
+type PublishedWorkerAssignment = WorkerAssignment;
+
+/// One cycle's routing changes, not yet applied to the confirmed routing. An
+/// empty `Vec` means the chunk was removed. Replayed in order and dropped by
+/// `confirm_worker_assignment`, so total memory is bounded by the confirmation lag.
+#[derive(Debug, Clone)]
+struct ChunkRoutingDiff {
+    changes: BTreeMap<ChunkPk, Vec<WorkerPk>>,
+}
+
+#[derive(Default, Debug)]
+struct SchedulerChunkMetadata {
+    applied_at_worker_assignment_id: Option<WorkerAssignmentId>,
+    applied_at_portal_assignment_id: Option<PortalAssignmentId>,
+    marked_for_removal: bool,
+    /// True if refused at registration for overlapping a live chunk in its dataset; never scheduled
+    /// or reconsidered
+    rejected: bool,
+    dropped_at_portal_assignment_id: Option<PortalAssignmentId>,
+    dropped_at_worker_assignment_id: Option<WorkerAssignmentId>,
+}
+
+/// Lifecycle-state predicates over the `sched_chunk_metadata` columns, named after the states in
+/// `docs/mvcc-storage.md`. (`discovered` — no metadata row — and the bare `rejected`/
+/// `marked_for_removal` flags aren't methods: the former has no row, the latter read for themselves.)
+///
+/// The stamps are cumulative, so each milestone has two readings. The predicates split into two
+/// families and the name tells you which at a glance:
+///
+/// * **Threshold reached** — "has the chunk ever passed milestone X?". True from the milestone
+///   onward, *including* after the chunk has moved further along (an `entered_portal_assignment`
+///   chunk stays `entered_*` even once dropped). These mirror the column verb in the past tense:
+///   `entered_*` for the `applied_at_*` stamps, `confirmed_by` for the derived watermark threshold.
+///   They read as "has passed this point", never as a present condition.
+/// * **Current state** — "is the chunk in state X *right now*?". True only in the window between one
+///   stamp and the next, and it closes when the next stamp lands. These read as a present
+///   adjectival condition: `portal_visible`, `tombstoned`.
+///
+/// `in_removal` is the union of the removal-tail current states; `live` / `worker_servable` are
+/// derived roles composed from the two families.
+impl SchedulerChunkMetadata {
+    // --- Threshold-reached: monotone, "has the chunk ever passed milestone X?" ---
+
+    /// Threshold: has ever entered a worker assignment (workers were told to download it). Stays
+    /// true thereafter, even once the chunk is dropped or tombstoned.
+    fn entered_worker_assignment(&self) -> bool {
+        self.applied_at_worker_assignment_id.is_some()
+    }
+
+    /// Threshold: has ever been promoted into a portal assignment. Stays true even after the chunk
+    /// is dropped from the portal — for "promoted *and still there*", use `portal_visible`.
+    fn entered_portal_assignment(&self) -> bool {
+        self.applied_at_portal_assignment_id.is_some()
+    }
+
+    /// Threshold: its worker assignment is at or below the confirmation `watermark` (an X% quorum of
+    /// workers reported holding it). Derived, so it takes the watermark rather than reading a column;
+    /// the `_by` arg is the threshold-family tell. Monotone in the watermark, which only advances.
+    fn confirmed_by(&self, watermark: WorkerAssignmentId) -> bool {
+        self.applied_at_worker_assignment_id
+            .is_some_and(|worker_aid| worker_aid <= watermark)
+    }
+
+    // --- Current state: momentary, "is the chunk in state X right now?" ---
+
+    /// Current: promoted into a portal assignment and not yet dropped from one — the window between
+    /// the two portal stamps. (Threshold counterpart: `entered_portal_assignment`.)
+    fn portal_visible(&self) -> bool {
+        self.applied_at_portal_assignment_id.is_some()
+            && self.dropped_at_portal_assignment_id.is_none()
+    }
+
+    /// Current/terminal: dropped from the worker assignment. The row is retained as an audit marker
+    /// and the chunk leaves every future cycle, so this state never closes.
+    fn tombstoned(&self) -> bool {
+        self.dropped_at_worker_assignment_id.is_some()
+    }
+
+    /// Current: in the removal tail by any of the three removal stamps — marked for removal, or
+    /// already dropped at the portal or worker level. The union of the tail's current states.
+    fn in_removal(&self) -> bool {
+        self.marked_for_removal
+            || self.dropped_at_portal_assignment_id.is_some()
+            || self.dropped_at_worker_assignment_id.is_some()
+    }
+
+    // --- Derived roles: composed from both families ---
+
+    /// Role: admitted and not leaving — neither rejected nor anywhere in the removal tail. A live
+    /// chunk still claims its block range (the registration comparison set). Equivalent to
+    /// `worker_servable() && !marked_for_removal && dropped_at_portal.is_none()`, the condition
+    /// `live_admitted_chunks` filters on.
+    fn live(&self) -> bool {
+        !self.rejected && !self.in_removal()
+    }
+
+    /// Role: not rejected and not tombstoned — eligible to appear in a worker assignment. Unlike
+    /// `live`, a draining chunk (marked / portal-dropped but not yet tombstoned) is still served by
+    /// workers through the M-tick window.
+    fn worker_servable(&self) -> bool {
+        !self.rejected && !self.tombstoned()
+    }
+}
+
+/// 1:1 replacement of an old chunk, keyed by `old_chunk_pk` (at most one per
+/// source chunk). Completed rows are kept as an inert audit trail.
+#[derive(Debug, Clone)]
+struct ChunkCorrection {
+    new_chunk_pk: ChunkPk,
+    dataset: Dataset,
+    created_at: TimeUnit,
+    applied_at_portal_assignment_id: Option<PortalAssignmentId>,
+}
+
+/// Reasons `register_correction` rejects a request.
+#[derive(Debug, Error)]
+pub enum CorrectionRejected {
+    #[error("old chunk {old_pk:?} not found")]
+    OldChunkNotFound { old_pk: ChunkPk },
+    #[error("a correction for old chunk {old_pk:?} already exists")]
+    DuplicatePending { old_pk: ChunkPk },
+    #[error("old chunk {old_pk:?} is already being removed")]
+    OldChunkBeingRemoved { old_pk: ChunkPk },
+    #[error("old chunk {old_pk:?} was rejected at registration (terminal — nothing to supersede)")]
+    OldChunkRejected { old_pk: ChunkPk },
+    #[error("replacement chunk {dataset}/{chunk_id} already exists")]
+    ReplacementChunkExists { dataset: Dataset, chunk_id: ChunkId },
+    #[error("replacement dataset {new_dataset} does not match old chunk dataset {old_dataset}")]
+    DatasetMismatch {
+        old_dataset: Dataset,
+        new_dataset: Dataset,
+    },
+    #[error("replacement range {new:?} does not match old chunk {old_pk:?} range {old:?}")]
+    RangeChanged {
+        old_pk: ChunkPk,
+        old: RangeInclusive<BlockNumber>,
+        new: RangeInclusive<BlockNumber>,
+    },
+}
+
+/// Grace-period holdover for a `(chunk, worker)` pair removed from the ideal assignment
+/// while the chunk is still portal-visible. Pending until the superseding worker
+/// assignment is confirmed and the pair leaves the portal assignment; draining
+/// (M-tick window) after.
+#[derive(Debug, Clone)]
+struct StaleMapping {
+    /// First worker assignment whose ideal no longer routes the chunk to this
+    /// worker; the drain activates once `<=` the confirmation watermark.
+    superseded_at_worker_assignment_id: WorkerAssignmentId,
+    /// `None` while pending; once set, anchors the M-tick drain.
+    dropped_at_portal_assignment_id: Option<PortalAssignmentId>,
+}
+
+#[derive(Debug, Clone)]
+struct WorkerEntry {
+    peer_id: PeerId,
+    version: Option<Version>,
+    inactive_since: Option<TimeUnit>,
+}
+
+impl WorkerEntry {
+    fn status(&self) -> WorkerStatus {
+        match self.inactive_since {
+            None => WorkerStatus::Online,
+            Some(_) => WorkerStatus::Stale,
+        }
+    }
+}
+
+mod counter {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    #[derive(Default, Debug)]
+    pub struct Counter(AtomicU64);
+
+    impl Counter {
+        /// Fresh monotonically increasing id, starting at 1; 0 is reserved as
+        /// the "no id allocated yet" sentinel for defaulted watermarks.
+        pub fn next(&self) -> u64 {
+            self.0.fetch_add(1, Ordering::Relaxed) + 1
+        }
+    }
+}
+use counter::Counter;
+
+#[derive(Default, Debug)]
+struct Counters {
+    chunk_pk: Counter,
+    worker_id: Counter,
+    worker_assignment_id: Counter,
+    portal_assignment_id: Counter,
+}
+
+#[derive(Default)]
+pub(crate) struct InMemoryStorage {
+    datasets: HashSet<Dataset>,
+    chunks: BTreeMap<ChunkPk, Chunk>,
+    /// Natural identity → surrogate pk; a duplicate `(dataset, id)` insert is rejected
+    /// (mirrors Postgres `UNIQUE (dataset_id, chunk_id)`). Never pruned — chunks
+    /// are tombstoned, not deleted.
+    chunk_index: HashMap<(Dataset, ChunkId), ChunkPk>,
+
+    sched_chunk_metadata: BTreeMap<ChunkPk, SchedulerChunkMetadata>,
+    sched_worker_assignments: BTreeMap<WorkerAssignmentId, TimeUnit>,
+    sched_portal_assignments: BTreeMap<PortalAssignmentId, TimeUnit>,
+
+    // The highest worker assignment confirmed by the workers
+    sched_worker_assignment_confirmation: WorkerAssignmentId,
+
+    sched_stale_mappings: BTreeMap<(ChunkPk, WorkerPk), StaleMapping>,
+    sched_workers: BTreeMap<WorkerPk, WorkerEntry>,
+    // Active chunk -> workers mapping (latest scheduled ideal).
+    sched_ideal_chunk_workers: BTreeMap<ChunkPk, Vec<WorkerPk>>,
+    // Routing as of the highest confirmed worker assignment. What portals route by.
+    sched_confirmed_chunk_workers: BTreeMap<ChunkPk, Vec<WorkerPk>>,
+    // Per-cycle routing changes waiting to be applied to the confirmed routing.
+    sched_worker_assignment_diffs: BTreeMap<WorkerAssignmentId, ChunkRoutingDiff>,
+
+    // Keyed by old_chunk_pk.
+    chunk_corrections: BTreeMap<ChunkPk, ChunkCorrection>,
+
+    counters: Counters,
+}
+
+#[derive(Debug, Error)]
+pub enum InsertChunkError {
+    #[error("dataset {dataset} not found")]
+    NoDatasetFound { dataset: Dataset },
+    #[error("chunk {dataset}/{chunk_id} already exists")]
+    ChunkAlreadyExists { dataset: Dataset, chunk_id: ChunkId },
+}
+
+#[derive(Debug, Error)]
+pub enum InsertDatasetError {
+    #[error("dataset {dataset} already exists")]
+    UniqueConstraintViolation { dataset: Dataset },
+}
+
+impl InMemoryStorage {
+    fn assignment_workers(&self) -> BTreeMap<WorkerPk, AssignmentWorker> {
+        self.sched_workers
+            .iter()
+            .map(|(id, entry)| {
+                (
+                    *id,
+                    AssignmentWorker {
+                        peer_id: entry.peer_id,
+                        status: entry.status(),
+                    },
+                )
+            })
+            .collect()
+    }
+
+    /// Per-chunk holders physically on disk now: `ideal ∪ stale`, deduped. What a
+    /// placement-aware [`SchedulingAlgorithm`](crate::scheduler_storage::algorithm::SchedulingAlgorithm)
+    /// reconciles against.
+    fn current_placement(&self) -> BTreeMap<ChunkPk, Vec<WorkerPk>> {
+        let mut out: BTreeMap<ChunkPk, BTreeSet<WorkerPk>> = BTreeMap::new();
+        for (pk, workers) in &self.sched_ideal_chunk_workers {
+            out.entry(*pk).or_default().extend(workers.iter().copied());
+        }
+        for (pk, worker_id) in self.sched_stale_mappings.keys() {
+            out.entry(*pk).or_default().insert(*worker_id);
+        }
+        out.into_iter()
+            .map(|(pk, set)| (pk, set.into_iter().collect()))
+            .collect()
+    }
+
+    /// Used by the ingester or operator to include datasets in the system.
+    pub fn insert_new_datasets(
+        &mut self,
+        datasets: Vec<Dataset>,
+    ) -> Result<(), InsertDatasetError> {
+        for dataset in datasets {
+            if !self.datasets.insert(dataset.clone()) {
+                return Err(InsertDatasetError::UniqueConstraintViolation { dataset });
+            }
+        }
+        Ok(())
+    }
+
+    /// Ingester entry point. Errors if a chunk names an unregistered dataset or duplicates an
+    /// existing `(dataset, id)` (mirroring Postgres' UNIQUE constraint). Returns the number
+    /// inserted, which on success is all of them.
+    pub fn insert_new_chunks(&mut self, chunks: Vec<Chunk>) -> Result<usize, InsertChunkError> {
+        let mut added = 0;
+        for chunk in chunks {
+            let dataset = (*chunk.dataset).clone();
+            if !self.datasets.contains(&dataset) {
+                return Err(InsertChunkError::NoDatasetFound { dataset });
+            }
+            let chunk_id = (*chunk.id).clone();
+            if self.insert_one_chunk(chunk).is_none() {
+                return Err(InsertChunkError::ChunkAlreadyExists { dataset, chunk_id });
+            }
+            added += 1;
+        }
+        Ok(added)
+    }
+
+    /// Shared index/pk bookkeeping behind `insert_new_chunks` and a correction's replacement insert;
+    /// callers own the dataset-registered check and the typed error. Returns `None` on a duplicate
+    /// `(dataset, id)`.
+    fn insert_one_chunk(&mut self, chunk: Chunk) -> Option<ChunkPk> {
+        use std::collections::hash_map::Entry;
+        match self
+            .chunk_index
+            .entry(((*chunk.dataset).clone(), (*chunk.id).clone()))
+        {
+            Entry::Vacant(vac) => {
+                let pk = ChunkPk(self.counters.chunk_pk.next() as i64);
+                vac.insert(pk);
+                self.chunks.insert(pk, chunk);
+                Some(pk)
+            }
+            Entry::Occupied(_) => None,
+        }
+    }
+
+    /// Typed-error registration backing the `SchedulerStorage::register_correction` wrapper.
+    /// Named distinctly so the trait method isn't shadowed: tests that assert a specific
+    /// `CorrectionRejected` variant call this directly, while the happy path goes through the trait.
+    fn register_correction_int(
+        &mut self,
+        old_pk: ChunkPk,
+        new_chunk: Chunk,
+        now: TimeUnit,
+    ) -> Result<ChunkPk, CorrectionRejected> {
+        let Some(old_chunk) = self.chunks.get(&old_pk) else {
+            return Err(CorrectionRejected::OldChunkNotFound { old_pk });
+        };
+        let dataset = (*old_chunk.dataset).clone();
+        let old_blocks = old_chunk.blocks.clone();
+
+        // The replacement must already belong to the old chunk's dataset; reject rather than
+        // silently rewrite it.
+        if *new_chunk.dataset != dataset {
+            return Err(CorrectionRejected::DatasetMismatch {
+                old_dataset: dataset,
+                new_dataset: (*new_chunk.dataset).clone(),
+            });
+        }
+
+        if self.chunk_corrections.contains_key(&old_pk) {
+            return Err(CorrectionRejected::DuplicatePending { old_pk });
+        }
+
+        if let Some(meta) = self.sched_chunk_metadata.get(&old_pk) {
+            // A rejected old chunk is terminal — never admitted, nothing portal-visible to supersede;
+            // reviving it through a correction would also defeat the no-self-heal rule.
+            if meta.rejected {
+                return Err(CorrectionRejected::OldChunkRejected { old_pk });
+            }
+            if meta.in_removal() {
+                return Err(CorrectionRejected::OldChunkBeingRemoved { old_pk });
+            }
+        }
+
+        // A correction is a same-range 1-to-1 swap. Refuse a range-changing replacement before it is
+        // inserted or a correction row is created — admitting it would either leave a dangling
+        // pending correction (blocking future corrections of this chunk) or publish an overlap.
+        if new_chunk.blocks != old_blocks {
+            return Err(CorrectionRejected::RangeChanged {
+                old_pk,
+                old: old_blocks,
+                new: new_chunk.blocks.clone(),
+            });
+        }
+
+        // Insert the replacement (same-range 1-to-1, same dataset as checked above).
+        let chunk_id = (*new_chunk.id).clone();
+        let Some(new_pk) = self.insert_one_chunk(new_chunk) else {
+            return Err(CorrectionRejected::ReplacementChunkExists { dataset, chunk_id });
+        };
+        // The replacement's sched_chunk_metadata row is created by register_new_chunks (the
+        // standard addition flow), not here.
+
+        self.chunk_corrections.insert(
+            old_pk,
+            ChunkCorrection {
+                new_chunk_pk: new_pk,
+                dataset,
+                created_at: now,
+                applied_at_portal_assignment_id: None,
+            },
+        );
+        Ok(new_pk)
+    }
+
+    /// Apply ready corrections, re-evaluating after each firing so chains collapse in one cycle.
+    /// A correction fires once its replacement is confirmed and no *pending* correction still has
+    /// to produce its old chunk (i.e. no pending `X → old`). The only real dependency is a
+    /// correction chain (`B → C` waits for `A → B` because `B` is `A → B`'s replacement);
+    /// independent corrections in the same dataset fire in the same cycle. `created_at` is not
+    /// consulted. Returns the old chunk PKs that fired.
+    fn apply_ready_corrections(&mut self, portal_aid: PortalAssignmentId) -> Vec<ChunkPk> {
+        let confirmed_up_to = self.sched_worker_assignment_confirmation;
+        let mut fired: Vec<ChunkPk> = Vec::new();
+
+        loop {
+            // Next ready correction: replacement confirmed, and this chunk is not still being
+            // produced by another pending correction.
+            let next_ready: Option<ChunkPk> = self
+                .chunk_corrections
+                .iter()
+                .filter(|(_, c)| c.applied_at_portal_assignment_id.is_none())
+                .filter(|(_, c)| {
+                    self.sched_chunk_metadata
+                        .get(&c.new_chunk_pk)
+                        .is_some_and(|m| m.confirmed_by(confirmed_up_to))
+                })
+                .find(|(old_pk, _)| {
+                    !self.chunk_corrections.values().any(|other| {
+                        other.applied_at_portal_assignment_id.is_none()
+                            && other.new_chunk_pk == **old_pk
+                    })
+                })
+                .map(|(pk, _)| *pk);
+
+            let Some(old_pk) = next_ready else {
+                break;
+            };
+
+            // The removal mark is picked up by the drop pass later this cycle.
+            if let Some(meta) = self.sched_chunk_metadata.get_mut(&old_pk) {
+                meta.marked_for_removal = true;
+            }
+
+            let entry = self
+                .chunk_corrections
+                .get_mut(&old_pk)
+                .expect("old_pk came from chunk_corrections");
+            entry.applied_at_portal_assignment_id = Some(portal_aid);
+
+            fired.push(old_pk);
+        }
+
+        fired
+    }
+
+    /// Evict workers that went stale strictly before `stale_cutoff`.
+    fn evict_stale_workers(&mut self, stale_cutoff: TimeUnit) {
+        self.sched_workers
+            .retain(|_, entry| !matches!(entry.inactive_since, Some(ts) if ts < stale_cutoff));
+    }
+
+    /// True if `dropped_at_portal` names a portal assignment created at or before `cutoff` — i.e.
+    /// its M-tick grace has elapsed. `None` (never dropped) is not elapsed.
+    fn portal_drop_elapsed(
+        &self,
+        dropped_at_portal: Option<PortalAssignmentId>,
+        cutoff: TimeUnit,
+    ) -> bool {
+        dropped_at_portal
+            .and_then(|aid| self.sched_portal_assignments.get(&aid))
+            .is_some_and(|created_at| *created_at <= cutoff)
+    }
+
+    /// Tombstone chunks whose portal-removal happened at least `m_ticks` ago.
+    /// One-way: the row stays as a permanent tombstone and the chunk leaves all
+    /// future cycles. Also clears the chunk's stale mappings — the portal-level
+    /// grace has already elapsed, so no worker-level drain is needed.
+    fn tombstone_expired_chunks(
+        &mut self,
+        new_worker_aid: WorkerAssignmentId,
+        now: TimeUnit,
+        m_ticks: TimeUnit,
+    ) {
+        let Some(cutoff) = now.checked_sub(m_ticks) else {
+            return;
+        };
+        let to_tombstone: Vec<ChunkPk> = self
+            .sched_chunk_metadata
+            .iter()
+            .filter_map(|(pk, meta)| {
+                (!meta.tombstoned()
+                    && self.portal_drop_elapsed(meta.dropped_at_portal_assignment_id, cutoff))
+                .then_some(*pk)
+            })
+            .collect();
+        for pk in &to_tombstone {
+            let meta = self
+                .sched_chunk_metadata
+                .get_mut(pk)
+                .expect("pk came from sched_chunk_metadata");
+            meta.dropped_at_worker_assignment_id = Some(new_worker_aid);
+            self.sched_stale_mappings
+                .retain(|(stale_pk, _), _| stale_pk != pk);
+        }
+    }
+
+    /// Delete draining stale mappings whose dropping portal assignment is at
+    /// least `m_ticks` old. Pending mappings never expire here — their M-tick
+    /// clock hasn't started.
+    fn expire_drained_stale_mappings(&mut self, now: TimeUnit, m_ticks: TimeUnit) {
+        let Some(cutoff) = now.checked_sub(m_ticks) else {
+            return;
+        };
+        let expired: Vec<(ChunkPk, WorkerPk)> = self
+            .sched_stale_mappings
+            .iter()
+            .filter_map(|(key, mapping)| {
+                self.portal_drop_elapsed(mapping.dropped_at_portal_assignment_id, cutoff)
+                    .then_some(*key)
+            })
+            .collect();
+        for key in expired {
+            self.sched_stale_mappings.remove(&key);
+        }
+    }
+
+    /// Mint a pending stale mapping for each `(chunk, worker)` pair dropped from
+    /// the ideal, anchored on `new_worker_aid`. Deliberately not gated on portal
+    /// visibility: a confirmed-but-unpromoted chunk can still lose a pair, which
+    /// must enter `sched_stale_mappings` so `ideal ∪ stale` stays a superset of
+    /// the confirmed routing. Chunks already leaving the portal are skipped — the
+    /// whole-chunk removal handles them.
+    fn record_reshuffle_stale_mappings(
+        &mut self,
+        ideal_mappings: &BTreeMap<ChunkPk, HashSet<WorkerPk>>,
+        new_worker_aid: WorkerAssignmentId,
+    ) {
+        for (pk, current_workers) in &self.sched_ideal_chunk_workers {
+            let being_removed = self
+                .sched_chunk_metadata
+                .get(pk)
+                .is_some_and(|m| m.dropped_at_portal_assignment_id.is_some());
+            if being_removed {
+                continue;
+            }
+            let ideal_workers = ideal_mappings.get(pk);
+            for &worker_id in current_workers {
+                let still_assigned = ideal_workers.is_some_and(|iw| iw.contains(&worker_id));
+                if !still_assigned {
+                    self.sched_stale_mappings
+                        .entry((*pk, worker_id))
+                        .or_insert(StaleMapping {
+                            superseded_at_worker_assignment_id: new_worker_aid,
+                            dropped_at_portal_assignment_id: None,
+                        });
+                }
+            }
+        }
+    }
+
+    /// Record the diff between the new ideal and the current one, for later
+    /// replay by `confirm_worker_assignment`. Must run before
+    /// `commit_ideal_mappings` overwrites `sched_ideal_chunk_workers`.
+    fn record_worker_assignment_diff(
+        &mut self,
+        ideal_mappings: &BTreeMap<ChunkPk, HashSet<WorkerPk>>,
+        new_worker_aid: WorkerAssignmentId,
+    ) {
+        let mut changes: BTreeMap<ChunkPk, Vec<WorkerPk>> = BTreeMap::new();
+
+        for (pk, new_workers) in ideal_mappings {
+            let old_set: HashSet<WorkerPk> = self
+                .sched_ideal_chunk_workers
+                .get(pk)
+                .map(|workers| workers.iter().copied().collect())
+                .unwrap_or_default();
+            if &old_set != new_workers {
+                changes.insert(*pk, new_workers.iter().copied().collect());
+            }
+        }
+
+        // Chunks dropped from the ideal: empty `Vec` = removal.
+        for pk in self.sched_ideal_chunk_workers.keys() {
+            if !ideal_mappings.contains_key(pk) {
+                changes.insert(*pk, Vec::new());
+            }
+        }
+
+        if !changes.is_empty() {
+            self.sched_worker_assignment_diffs
+                .insert(new_worker_aid, ChunkRoutingDiff { changes });
+        }
+    }
+
+    fn commit_ideal_mappings(&mut self, ideal_mappings: BTreeMap<ChunkPk, HashSet<WorkerPk>>) {
+        // Flip-flop: a pair back in the ideal is no longer stale.
+        for (pk, ideal_workers) in &ideal_mappings {
+            for &worker_id in ideal_workers {
+                self.sched_stale_mappings.remove(&(*pk, worker_id));
+            }
+        }
+
+        self.sched_ideal_chunk_workers = ideal_mappings
+            .into_iter()
+            .map(|(pk, workers)| (pk, workers.into_iter().collect()))
+            .collect();
+    }
+
+    /// Published worker assignment: `ideal ∪ stale` (pending and draining), with
+    /// tombstoned chunks excluded and worker lists deduped. Because a stale row
+    /// is minted the moment a pair leaves the ideal, this is always a superset of
+    /// the confirmed routing — workers never drop data a portal still routes to.
+    /// The caller allocates and registers `id`.
+    fn build_worker_assignment(
+        &self,
+        id: WorkerAssignmentId,
+        replication_by_weight: BTreeMap<u16, u16>,
+    ) -> PublishedWorkerAssignment {
+        // `current_placement` is the same `ideal ∪ stale` union, sorted and deduped; keep only the
+        // chunks workers may still serve.
+        let mut chunk_workers = self.current_placement();
+        chunk_workers.retain(|pk, _| {
+            self.sched_chunk_metadata
+                .get(pk)
+                .is_none_or(|m| m.worker_servable())
+        });
+
+        let chunks: BTreeMap<ChunkPk, Chunk> = chunk_workers
+            .keys()
+            .filter_map(|pk| self.chunks.get(pk).map(|c| (*pk, c.clone())))
+            .collect();
+
+        WorkerAssignment {
+            id: id as AssignmentId,
+            chunk_workers,
+            chunks,
+            workers: self.assignment_workers(),
+            replication_by_weight,
+        }
+    }
+
+    /// Apply the non-overlap promotion gate (`docs/nonoverlap-promotion-gate.md`): mark each chunk
+    /// chosen by [`nonoverlap::chunks_to_promote`] portal-visible under `portal_aid`. The gating
+    /// decision is read-only and lives in [`nonoverlap`].
+    fn promote_through_overlap_gate(
+        &mut self,
+        portal_aid: PortalAssignmentId,
+        confirmed_up_to: WorkerAssignmentId,
+    ) {
+        for pk in nonoverlap::chunks_to_promote(self, confirmed_up_to) {
+            let meta = self
+                .sched_chunk_metadata
+                .get_mut(&pk)
+                .expect("promoted pk must have metadata");
+            meta.applied_at_portal_assignment_id = Some(portal_aid);
+        }
+    }
+}
+
+impl SchedulerStorage for InMemoryStorage {
+    fn insert_new_datasets(&mut self, datasets: Vec<String>) -> Result<(), StorageError> {
+        self.insert_new_datasets(datasets)
+            .map_err(anyhow::Error::from)?;
+        Ok(())
+    }
+
+    fn insert_new_chunks(&mut self, chunks: Vec<Chunk>) -> Result<(), StorageError> {
+        match self.insert_new_chunks(chunks) {
+            Ok(_added) => Ok(()),
+            // Typed so callers can treat a re-insert as a no-op; a missing dataset stays a DB error.
+            Err(InsertChunkError::ChunkAlreadyExists { .. }) => {
+                Err(StorageError::ChunkAlreadyExists)
+            }
+            Err(err @ InsertChunkError::NoDatasetFound { .. }) => {
+                Err(anyhow::Error::from(err).into())
+            }
+        }
+    }
+
+    /// Create a default lifecycle row for any chunk lacking one. Returns the new PKs.
+    fn register_new_chunks(&mut self) -> Result<Vec<ChunkPk>, StorageError> {
+        let decision = nonoverlap::admission_decision(self);
+        for &pk in &decision.admitted {
+            let insert_new = self
+                .sched_chunk_metadata
+                .insert(pk, SchedulerChunkMetadata::default());
+            assert!(insert_new.is_none());
+        }
+        // A rejected chunk gets a terminal row so the scan never reconsiders it and it stays
+        // unscheduled.
+        for &pk in &decision.rejected {
+            let insert_new = self.sched_chunk_metadata.insert(
+                pk,
+                SchedulerChunkMetadata {
+                    rejected: true,
+                    ..Default::default()
+                },
+            );
+            assert!(insert_new.is_none());
+        }
+        Ok(decision.admitted)
+    }
+
+    fn update_worker_set(
+        &mut self,
+        active_workers: &[Worker],
+        now: Tick,
+        gc_ticks: u64,
+    ) -> Result<(), StorageError> {
+        let mut remaining: HashMap<PeerId, &Worker> =
+            active_workers.iter().map(|w| (w.id, w)).collect();
+
+        // Workers that go inactive this call, collected to drop their stale mappings below.
+        let mut departed: Vec<WorkerPk> = Vec::new();
+
+        // Matched peers are drained from `remaining`; leftovers are new.
+        for (id, entry) in self.sched_workers.iter_mut() {
+            if let Some(worker) = remaining.remove(&entry.peer_id) {
+                entry.inactive_since = None;
+                entry.version = worker.version.clone();
+            } else if entry.inactive_since.is_none() {
+                entry.inactive_since = Some(now);
+                departed.push(*id);
+            }
+        }
+
+        for (peer_id, worker) in remaining {
+            let id = WorkerPk(self.counters.worker_id.next() as i64);
+            self.sched_workers.insert(
+                id,
+                WorkerEntry {
+                    peer_id,
+                    version: worker.version.clone(),
+                    inactive_since: None,
+                },
+            );
+        }
+
+        let departed_set: HashSet<WorkerPk> = departed.iter().copied().collect();
+        self.sched_stale_mappings
+            .retain(|(_, worker_id), _| !departed_set.contains(worker_id));
+
+        self.evict_stale_workers(now.saturating_sub(gc_ticks));
+
+        Ok(())
+    }
+
+    /// Run one scheduling cycle: tombstone expired chunks, expire stale mappings, run `algorithm`,
+    /// then diff + commit the result. Returns the published worker assignment.
+    fn run_scheduling_cycle<Algo>(
+        &mut self,
+        algorithm: &Algo,
+        config: &Algo::Config,
+        now: Tick,
+        m_ticks: u64,
+    ) -> Result<WorkerAssignment, StorageError>
+    where
+        Algo: SchedulingAlgorithm + Send + Sync,
+    {
+        // Allocated first so tombstoning below can reference it.
+        let new_worker_aid = self.counters.worker_assignment_id.next();
+        self.sched_worker_assignments.insert(new_worker_aid, now);
+
+        self.tombstone_expired_chunks(new_worker_aid, now, m_ticks);
+
+        self.expire_drained_stale_mappings(now, m_ticks);
+
+        // Snapshot after expiry so the algorithm sees post-expiry placement.
+        let current_placement = self.current_placement();
+
+        let chunks: Vec<(ChunkPk, Chunk)> = self
+            .chunks
+            .iter()
+            .filter(|(pk, _)| {
+                self.sched_chunk_metadata
+                    .get(pk)
+                    .is_none_or(|m| m.worker_servable())
+            })
+            .map(|(pk, chunk)| (*pk, chunk.clone()))
+            .collect();
+        let workers: Vec<(WorkerPk, Worker)> = self
+            .sched_workers
+            .iter()
+            .map(|(id, entry)| {
+                (
+                    *id,
+                    Worker {
+                        id: entry.peer_id,
+                        status: entry.status(),
+                        version: entry.version.clone(),
+                    },
+                )
+            })
+            .collect();
+
+        // A shortage is surfaced with nothing committed, so a degraded run can be driven through it.
+        let ScheduleOutput {
+            mapping: ideal_mappings,
+            replication_by_weight,
+        } = algorithm
+            .schedule(chunks, workers, &current_placement, config)
+            .map_err(|_| StorageError::Shortage)?;
+
+        self.record_reshuffle_stale_mappings(&ideal_mappings, new_worker_aid);
+
+        // Must precede commit_ideal_mappings, which overwrites the old ideal.
+        self.record_worker_assignment_diff(&ideal_mappings, new_worker_aid);
+
+        self.commit_ideal_mappings(ideal_mappings);
+
+        let assignment = self.build_worker_assignment(new_worker_aid, replication_by_weight);
+
+        // Stamp first-time entry into a worker assignment.
+        for pk in self.sched_ideal_chunk_workers.keys() {
+            let meta = self.sched_chunk_metadata.entry(*pk).or_default();
+            if !meta.entered_worker_assignment() {
+                meta.applied_at_worker_assignment_id = Some(new_worker_aid);
+            }
+        }
+
+        Ok(assignment)
+    }
+
+    /// Record that workers have confirmed up to this assignment: advances the
+    /// watermark and replays the intervening routing diffs into
+    /// `sched_confirmed_chunk_workers`, dropping them as applied. The in-memory
+    /// model does not record confirmation time, so `now` is unused.
+    fn confirm_worker_assignment(
+        &mut self,
+        assignment_id: AssignmentId,
+        _now: Tick,
+    ) -> Result<(), StorageError> {
+        let assignment_id = assignment_id as WorkerAssignmentId;
+        let previous = self.sched_worker_assignment_confirmation;
+        let new_watermark = previous.max(assignment_id);
+        if new_watermark == previous {
+            return Ok(());
+        }
+
+        let to_apply: Vec<WorkerAssignmentId> = self
+            .sched_worker_assignment_diffs
+            .range(previous + 1..=new_watermark)
+            .map(|(id, _)| *id)
+            .collect();
+        for id in to_apply {
+            let diff = self
+                .sched_worker_assignment_diffs
+                .remove(&id)
+                .expect("diff id came from the range above");
+            for (pk, workers) in diff.changes {
+                if workers.is_empty() {
+                    self.sched_confirmed_chunk_workers.remove(&pk);
+                } else {
+                    self.sched_confirmed_chunk_workers.insert(pk, workers);
+                }
+            }
+        }
+
+        self.sched_worker_assignment_confirmation = new_watermark;
+        Ok(())
+    }
+
+    /// Produce a new portal assignment. Atomically: apply ready corrections,
+    /// promote confirmed chunks (skipping pending correction targets), drop
+    /// chunks marked for removal, and start the M-tick drain for stale mappings
+    /// whose superseding worker assignment is now confirmed. Returns the
+    /// portal-visible chunks routed by the confirmed routing.
+    fn run_visibility_cycle(&mut self, now: Tick) -> Result<PortalAssignment, StorageError> {
+        let portal_assignment_id = self.counters.portal_assignment_id.next();
+        self.sched_portal_assignments
+            .insert(portal_assignment_id, now);
+
+        let confirmed_up_to = self.sched_worker_assignment_confirmation;
+
+        // Before the promote/drop pass so corrections fired this cycle take
+        // effect immediately.
+        self.apply_ready_corrections(portal_assignment_id);
+
+        // Promote before drop so a correction's atomic swap (old marked, new promoted) is never
+        // observed as both.
+        self.promote_through_overlap_gate(portal_assignment_id, confirmed_up_to);
+        for meta in self.sched_chunk_metadata.values_mut() {
+            if meta.marked_for_removal && meta.dropped_at_portal_assignment_id.is_none() {
+                meta.dropped_at_portal_assignment_id = Some(portal_assignment_id);
+            }
+        }
+
+        // Activate drains: once the superseding assignment is confirmed, this is
+        // the portal assignment that drops the pair — stamp it to start the
+        // M-tick drain.
+        for mapping in self.sched_stale_mappings.values_mut() {
+            if mapping.dropped_at_portal_assignment_id.is_none()
+                && mapping.superseded_at_worker_assignment_id <= confirmed_up_to
+            {
+                mapping.dropped_at_portal_assignment_id = Some(portal_assignment_id);
+            }
+        }
+
+        let portal_chunks: BTreeMap<ChunkPk, Chunk> = self
+            .sched_chunk_metadata
+            .iter()
+            .filter(|(_, meta)| meta.portal_visible())
+            .filter_map(|(pk, _)| self.chunks.get(pk).map(|chunk| (*pk, chunk.clone())))
+            .collect();
+
+        // Route by the confirmed routing — the ideal may be ahead of the
+        // watermark and point at workers that haven't downloaded yet.
+        let chunk_workers: BTreeMap<ChunkPk, Vec<WorkerPk>> = portal_chunks
+            .keys()
+            .filter_map(|pk| {
+                self.sched_confirmed_chunk_workers
+                    .get(pk)
+                    .map(|workers| (*pk, workers.clone()))
+            })
+            .collect();
+
+        let workers = self.assignment_workers();
+
+        Ok(PortalAssignment {
+            id: portal_assignment_id as AssignmentId,
+            chunk_workers,
+            chunks: portal_chunks,
+            workers,
+        })
+    }
+
+    /// Mark a chunk for removal in a later visibility cycle. The in-memory model does not record
+    /// removal time, so `now` is unused.
+    fn mark_for_removal(&mut self, chunk_pk: ChunkPk, _now: Tick) -> Result<(), StorageError> {
+        if let Some(meta) = self.sched_chunk_metadata.get_mut(&chunk_pk) {
+            meta.marked_for_removal = true;
+        }
+        Ok(())
+    }
+
+    fn register_correction(
+        &mut self,
+        old_pk: ChunkPk,
+        new_chunk: Chunk,
+        now: Tick,
+    ) -> Result<ChunkPk, StorageError> {
+        self.register_correction_int(old_pk, new_chunk, now)
+            .map_err(|e| StorageError::CorrectionRejected {
+                reason: e.to_string(),
+            })
+    }
+}

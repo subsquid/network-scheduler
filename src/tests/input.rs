@@ -1,3 +1,4 @@
+use bytesize::ByteSize;
 use itertools::Itertools;
 use libp2p_identity::PeerId;
 use rand::prelude::*;
@@ -64,22 +65,47 @@ pub fn generate_input(
     (test_chunks, workers, total_size)
 }
 
-pub fn generate_chunks(n: ChunkIndex, weights: &[ChunkWeight]) -> TestChunks {
-    const MAX_CHUNK_SIZE: u32 = 200 << 20; // 200MB
-
+/// Generates `n` chunks, deriving each chunk's size from `chunk_size(i)`.
+/// `chunk_size` must be `Sync` as it is invoked from a rayon parallel iterator.
+fn generate_chunks_with(
+    n: ChunkIndex,
+    weights: &[ChunkWeight],
+    chunk_size: impl Fn(ChunkIndex) -> u32 + Sync,
+) -> TestChunks {
     let entries = (0..n)
         .into_par_iter()
-        .map(|i| TestChunkEntry {
-            chunk_id: format!("0000000000/{:010}-{:010}-{:08x}", i, i + 1, i),
-            size: rand::rng().random_range(0..MAX_CHUNK_SIZE),
-            weight: *weights.choose(&mut rand::rng()).unwrap(),
-            minimum_worker_version: None,
+        .map(|i| {
+            let mut rng = rand::rngs::SmallRng::seed_from_u64(i as u64);
+            let chunk_id = format!("0000000000/{:010}-{:010}-{:08x}", i, i + 1, i);
+            TestChunkEntry {
+                chunk_id,
+                size: chunk_size(i),
+                weight: *weights.choose(&mut rng).unwrap(),
+                minimum_worker_version: None,
+            }
         })
         .collect();
     TestChunks {
         dataset: "s3://solana-mainnet-0".to_string(),
         entries,
     }
+}
+
+pub fn generate_chunks(n: ChunkIndex, weights: &[ChunkWeight]) -> TestChunks {
+    const MAX_CHUNK_SIZE: u32 = 200 << 20; // 200MB
+
+    generate_chunks_with(n, weights, |i| {
+        rand::rngs::SmallRng::seed_from_u64(i as u64).random_range(0..MAX_CHUNK_SIZE)
+    })
+}
+
+pub fn generate_chunks_fixed_size(
+    n: ChunkIndex,
+    weights: &[ChunkWeight],
+    chunk_size: ByteSize,
+) -> TestChunks {
+    let size = chunk_size.as_u64() as u32;
+    generate_chunks_with(n, weights, move |_| size)
 }
 
 pub fn generate_workers(n: WorkerIndex) -> Vec<PeerId> {
