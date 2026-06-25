@@ -29,6 +29,12 @@ pub fn prepare_chunks(
 /// segment are dropped). Also emits per-segment chunk/size metrics.
 impl WeightStrategy for DatasetsConfig {
     fn prepare(&self, chunks: Vec<Chunk>) -> Vec<(Chunk, ChunkWeight, Option<Version>)> {
+        debug_assert!(
+            chunks.is_sorted_by(
+                |a, b| (&a.dataset, a.blocks.start()) <= (&b.dataset, b.blocks.start())
+            ),
+            "prepare: chunks must be sorted by (dataset, block)"
+        );
         let mut prepared = Vec::with_capacity(chunks.len());
         for (dataset, chunks) in &chunks.into_iter().chunk_by(|chunk| chunk.dataset.clone()) {
             let chunks = chunks.collect_vec();
@@ -102,4 +108,66 @@ fn to_absolute_blocks(segments: &[DatasetSegmentConfig], last_block: u64) -> Vec
             }
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cli::{DatasetSegmentConfig, DatasetsConfig};
+    use crate::types::Chunk;
+    use std::sync::Arc;
+
+    fn chunk(dataset: &str, first_block: u64) -> Chunk {
+        Chunk {
+            dataset: Arc::new(dataset.to_string()),
+            id: Arc::new(format!("{first_block:010}")),
+            size: 1,
+            blocks: first_block..=first_block,
+            files: Arc::new(Vec::new()),
+            summary: None,
+        }
+    }
+
+    fn config() -> DatasetsConfig {
+        let mut cfg = DatasetsConfig::new();
+        cfg.insert(
+            "ds".to_string(),
+            vec![
+                DatasetSegmentConfig {
+                    from: 0,
+                    weight: 1,
+                    minimum_worker_version: None,
+                },
+                DatasetSegmentConfig {
+                    from: 100,
+                    weight: 9,
+                    minimum_worker_version: None,
+                },
+            ],
+        );
+        cfg
+    }
+
+    // Sorted by (dataset, block): every chunk kept, weight taken from its block segment.
+    #[test]
+    fn prepare_accepts_sorted_chunks() {
+        let out = prepare_chunks(
+            vec![
+                chunk("s3://ds", 0),
+                chunk("s3://ds", 50),
+                chunk("s3://ds", 150),
+            ],
+            &config(),
+        );
+        let weights: Vec<ChunkWeight> = out.iter().map(|(_, w, _)| *w).collect();
+        assert_eq!(weights, vec![1, 1, 9]);
+    }
+
+    // Out of (dataset, block) order trips the debug-only assert.
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "sorted by (dataset, block)")]
+    fn prepare_rejects_unsorted_chunks() {
+        prepare_chunks(vec![chunk("s3://ds", 10), chunk("s3://ds", 0)], &config());
+    }
 }
