@@ -168,6 +168,7 @@ pub(super) async fn fetch_active_chunks(
         JOIN sched_chunk_metadata s ON s.chunk_pk = c.chunk_pk
         WHERE s.dropped_at_worker_assignment_id IS NULL
           AND NOT s.rejected
+        ORDER by (d.name, c.first_block)
         "#,
     )
     .fetch_all(&mut **tx)
