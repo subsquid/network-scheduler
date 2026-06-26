@@ -22,6 +22,7 @@ lazy_static::lazy_static! {
 
     pub static ref S3_REQUESTS: Gauge = Default::default();
     pub static ref S3_KEYS_LISTED: Gauge = Default::default();
+    pub static ref S3_SUMMARY_DOWNLOAD_RETRIES: Gauge = Default::default();
 
     pub static ref ASSIGNMENT_JSON_SIZE: Gauge = Default::default();
     pub static ref ASSIGNMENT_COMPRESSED_JSON_SIZE: Gauge = Default::default();
@@ -173,6 +174,11 @@ pub fn register_metrics(network: String) -> Registry {
         "s3_keys_listed",
         "Number of S3 keys listed on the last execution",
         S3_KEYS_LISTED.clone(),
+    );
+    registry.register(
+        "s3_summary_download_retries",
+        "Number of chunk summary download retries on the last execution",
+        S3_SUMMARY_DOWNLOAD_RETRIES.clone(),
     );
     registry.register_with_unit(
         "assignment_json_size",

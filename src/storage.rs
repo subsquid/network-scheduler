@@ -38,6 +38,16 @@ fn advance_continuity(
     Ok(chunk_end + 1)
 }
 
+/// How many times to attempt downloading a chunk's summary before giving up.
+/// The S3 endpoint occasionally stalls mid-stream (the AWS SDK reports it as
+/// "throughput of 0 B/s was observed"), which is transient and usually clears
+/// on a retry. Without this, a single stall discards the whole run's progress
+/// for the dataset, so a large new dataset can fail to ever finish indexing.
+const SUMMARY_DOWNLOAD_ATTEMPTS: u32 = 5;
+
+/// Base delay for the exponential backoff between summary download attempts.
+const SUMMARY_RETRY_BASE_DELAY: Duration = Duration::from_millis(500);
+
 #[derive(Clone)]
 pub struct S3Storage {
     client: s3::Client,
@@ -60,19 +70,35 @@ impl S3Storage {
         dataset_load_timeout: Option<Duration>,
     ) -> anyhow::Result<BTreeMap<Arc<String>, Vec<Chunk>>> {
         let _timer = crate::metrics::Timer::new("load_newer_chunks");
-        stream::iter(datasets)
+        // Log and skip datasets that fail to load instead of aborting: one unreachable bucket
+        // must not freeze updates for all datasets.
+        let result = stream::iter(datasets)
             .map(|(dataset, last_chunk)| {
                 let storage = DatasetStorage::new(self.client.clone(), dataset);
                 async move {
                     let chunks = storage
                         .list_new_chunks(last_chunk, CONCURRENT_CHUNKS, dataset_load_timeout)
-                        .await?;
-                    anyhow::Ok((storage.dataset, chunks))
+                        .await;
+                    (storage.dataset, chunks)
                 }
             })
             .buffer_unordered(concurrent_downloads)
-            .try_collect()
-            .await
+            .filter_map(|(dataset, chunks)| async move {
+                match chunks {
+                    Ok(chunks) => Some((dataset, chunks)),
+                    Err(e) => {
+                        tracing::error!(
+                            dataset = %dataset,
+                            error = ?e,
+                            "Failed to load chunks for dataset; skipping it for this run"
+                        );
+                        None
+                    }
+                }
+            })
+            .collect::<BTreeMap<_, _>>()
+            .await;
+        Ok(result)
     }
 }
 
@@ -299,17 +325,18 @@ impl DatasetStorage {
 
             chunks.append(&mut batch);
 
-            if let Some(deadline) = deadline {
-                if Instant::now() >= deadline && !stream.exhausted() {
-                    tracing::warn!(
-                        "Dataset {} summary population timed out after {}s. \
+            if let Some(deadline) = deadline
+                && Instant::now() >= deadline
+                && !stream.exhausted()
+            {
+                tracing::warn!(
+                    "Dataset {} summary population timed out after {}s. \
                          {} chunks processed. Remaining chunks will be processed on next run.",
-                        self.dataset,
-                        dataset_load_timeout.unwrap().as_secs(),
-                        chunks.len(),
-                    );
-                    break;
-                }
+                    self.dataset,
+                    dataset_load_timeout.unwrap().as_secs(),
+                    chunks.len(),
+                );
+                break;
             }
         }
 
@@ -319,6 +346,28 @@ impl DatasetStorage {
     }
 
     async fn populate_with_summary(&self, data_chunk: &mut Chunk) -> anyhow::Result<()> {
+        let mut attempt = 1;
+        loop {
+            match self.try_populate_with_summary(data_chunk).await {
+                Ok(()) => return Ok(()),
+                Err(e) if attempt < SUMMARY_DOWNLOAD_ATTEMPTS => {
+                    let delay = SUMMARY_RETRY_BASE_DELAY * 2u32.pow(attempt - 1);
+                    tracing::warn!(
+                        chunk = %data_chunk,
+                        attempt,
+                        error = ?e,
+                        "Failed to download chunk summary; retrying in {delay:?}",
+                    );
+                    metrics::S3_SUMMARY_DOWNLOAD_RETRIES.inc();
+                    tokio::time::sleep(delay).await;
+                    attempt += 1;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    async fn try_populate_with_summary(&self, data_chunk: &mut Chunk) -> anyhow::Result<()> {
         let key = format!("{}/blocks.parquet", data_chunk.id);
         let temp_file = tempfile::tempfile()?;
         let mut tokio_file = tokio::fs::File::from_std(temp_file);
