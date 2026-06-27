@@ -15,5 +15,8 @@ datasets:
 
 # Those parameters are required, but effectively ignored in CLI mode:
 worker_inactive_timeout_sec: 600
+# Optional per-dataset time budget for large backlogs (listing + summary downloads).
+# Per-operation hangs are bounded by SDK timeouts regardless of this setting.
+# dataset_load_timeout_sec: 3600
 worker_storage_bytes: 483183820800
 worker_stale_bytes: 375809638400

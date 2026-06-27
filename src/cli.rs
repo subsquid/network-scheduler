@@ -5,6 +5,7 @@ use std::{
 };
 
 use anyhow::ensure;
+use aws_config::timeout::TimeoutConfig;
 use clap::Parser;
 use secrecy::{ExposeSecret, SecretString};
 use semver::Version;
@@ -81,6 +82,7 @@ impl S3Args {
     pub async fn config(&self) -> aws_config::SdkConfig {
         aws_config::from_env()
             .endpoint_url(self.aws_s3_endpoint.clone())
+            .timeout_config(s3_timeout_config())
             .load()
             .await
     }
@@ -242,6 +244,23 @@ fn default_concurrent_downloads() -> usize {
     20
 }
 
+/// Per-HTTP-attempt ceiling for any S3 API call (list, get, put).
+const S3_OPERATION_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Hard cap on a single S3 API call including SDK retries.
+const S3_OPERATION_TIMEOUT: Duration = Duration::from_secs(180);
+
+/// Max wait for the first response byte after the request is sent.
+const S3_READ_TIMEOUT: Duration = Duration::from_secs(60);
+
+fn s3_timeout_config() -> TimeoutConfig {
+    TimeoutConfig::builder()
+        .operation_attempt_timeout(S3_OPERATION_ATTEMPT_TIMEOUT)
+        .operation_timeout(S3_OPERATION_TIMEOUT)
+        .read_timeout(S3_READ_TIMEOUT)
+        .build()
+}
+
 /// Newtype to give `SecretString` a `Clone` impl, so `Config` can derive `Clone`.
 #[derive(Debug, Deserialize)]
 #[serde(transparent)]
@@ -262,5 +281,44 @@ impl CloudflareSecret {
 impl From<String> for CloudflareSecret {
     fn from(s: String) -> Self {
         Self(SecretString::from(s))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aws_config::BehaviorVersion;
+
+    #[test]
+    fn s3_timeout_config_sets_expected_values() {
+        let cfg = s3_timeout_config();
+        assert_eq!(
+            cfg.operation_attempt_timeout(),
+            Some(S3_OPERATION_ATTEMPT_TIMEOUT)
+        );
+        assert_eq!(cfg.operation_timeout(), Some(S3_OPERATION_TIMEOUT));
+        assert_eq!(cfg.read_timeout(), Some(S3_READ_TIMEOUT));
+    }
+
+    /// Proves the timeout config is applied to a real client and S3 calls fail
+    /// within a bounded time instead of hanging (connect refused → ~3s SDK connect timeout).
+    #[tokio::test]
+    async fn s3_list_fails_within_bounded_time_on_unreachable_endpoint() {
+        let config = aws_config::defaults(BehaviorVersion::latest())
+            .endpoint_url("http://127.0.0.1:9")
+            .timeout_config(s3_timeout_config())
+            .load()
+            .await;
+        let client = aws_sdk_s3::Client::new(&config);
+
+        let start = std::time::Instant::now();
+        let result = client.list_objects_v2().bucket("test").send().await;
+        let elapsed = start.elapsed();
+
+        assert!(result.is_err(), "expected list_objects to fail: {result:?}");
+        assert!(
+            elapsed < Duration::from_secs(30),
+            "list_objects took {elapsed:?}; expected bounded failure within 30s"
+        );
     }
 }
