@@ -257,6 +257,28 @@ impl DatasetStorage {
             .expect("Dataset should start with s3://")
     }
 
+    fn dataset_load_timed_out(
+        deadline: Option<Instant>,
+        dataset_load_timeout: Option<Duration>,
+        dataset: &str,
+        chunks_loaded: usize,
+        exhausted: bool,
+    ) -> bool {
+        let Some(deadline) = deadline else {
+            return false;
+        };
+        if Instant::now() < deadline || exhausted {
+            return false;
+        }
+        tracing::warn!(
+            dataset,
+            timeout_sec = dataset_load_timeout.map(|d| d.as_secs()),
+            chunks_loaded,
+            "Dataset load timed out; remaining chunks will be processed on next run",
+        );
+        true
+    }
+
     #[instrument(skip_all, level = "debug", fields(dataset = %self.dataset))]
     pub async fn list_new_chunks(
         &self,
@@ -275,7 +297,21 @@ impl DatasetStorage {
         );
         let mut chunks = Vec::new();
 
-        while let Some(mut batch) = stream.next_batch().await? {
+        loop {
+            if Self::dataset_load_timed_out(
+                deadline,
+                dataset_load_timeout,
+                &self.dataset,
+                chunks.len(),
+                stream.exhausted(),
+            ) {
+                break;
+            }
+
+            let Some(mut batch) = stream.next_batch().await? else {
+                break;
+            };
+
             stream::iter(batch.iter_mut())
                 .map(anyhow::Ok)
                 .try_for_each_concurrent(Some(concurrent_downloads), |ch| async move {
@@ -286,20 +322,6 @@ impl DatasetStorage {
                 .await?;
 
             chunks.append(&mut batch);
-
-            if let Some(deadline) = deadline
-                && Instant::now() >= deadline
-                && !stream.exhausted()
-            {
-                tracing::warn!(
-                    "Dataset {} summary population timed out after {}s. \
-                         {} chunks processed. Remaining chunks will be processed on next run.",
-                    self.dataset,
-                    dataset_load_timeout.unwrap().as_secs(),
-                    chunks.len(),
-                );
-                break;
-            }
         }
 
         tracing::debug!("Downloaded {} chunks", chunks.len());
