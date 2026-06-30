@@ -42,7 +42,7 @@ impl S3Storage {
 
     pub async fn load_newer_chunks(
         &self,
-        datasets: impl IntoIterator<Item = (Arc<String>, Option<&Chunk>)>,
+        datasets: impl IntoIterator<Item = (Arc<String>, Option<&Chunk>, Option<u64>)>,
         concurrent_downloads: usize,
         dataset_load_timeout: Option<Duration>,
     ) -> anyhow::Result<BTreeMap<Arc<String>, Vec<Chunk>>> {
@@ -50,11 +50,16 @@ impl S3Storage {
         // Log and skip datasets that fail to load instead of aborting: one unreachable bucket
         // must not freeze updates for all datasets.
         let result = stream::iter(datasets)
-            .map(|(dataset, last_chunk)| {
+            .map(|(dataset, last_chunk, from_block)| {
                 let storage = DatasetStorage::new(self.client.clone(), dataset);
                 async move {
                     let chunks = storage
-                        .list_new_chunks(last_chunk, CONCURRENT_CHUNKS, dataset_load_timeout)
+                        .list_new_chunks(
+                            last_chunk,
+                            CONCURRENT_CHUNKS,
+                            dataset_load_timeout,
+                            from_block,
+                        )
                         .await;
                     (storage.dataset, chunks)
                 }
@@ -77,6 +82,12 @@ impl S3Storage {
             .await;
         Ok(result)
     }
+}
+
+/// Whether a chunk starts below the dataset's scheduled `from` block and would
+/// therefore be dropped during scheduling (see `weight::prepare_chunks`).
+fn chunk_below_from(chunk: &Chunk, from_block: Option<u64>) -> bool {
+    from_block.is_some_and(|from| *chunk.blocks.start() < from)
 }
 
 #[derive(Clone)]
@@ -263,6 +274,7 @@ impl DatasetStorage {
         last_chunk: Option<&Chunk>,
         concurrent_downloads: usize,
         dataset_load_timeout: Option<Duration>,
+        from_block: Option<u64>,
     ) -> anyhow::Result<Vec<Chunk>> {
         tracing::debug!("Downloading chunks from {}", self.dataset);
 
@@ -276,6 +288,10 @@ impl DatasetStorage {
         let mut chunks = Vec::new();
 
         while let Some(mut batch) = stream.next_batch().await? {
+            // Drop chunks below the dataset's scheduled `from` block: they are discarded
+            // during scheduling, so downloading their summaries only delays the assignment.
+            batch.retain(|chunk| !chunk_below_from(chunk, from_block));
+
             stream::iter(batch.iter_mut())
                 .map(anyhow::Ok)
                 .try_for_each_concurrent(Some(concurrent_downloads), |ch| async move {
@@ -398,6 +414,44 @@ mod test {
     use aws_config::BehaviorVersion;
     use std::env;
 
+    fn chunk(dataset: &Arc<String>, first: u64, last: u64) -> Chunk {
+        Chunk::new(
+            dataset.clone(),
+            format!("0000000000/{first:010}-{last:010}-{first:08x}"),
+            1,
+            vec!["blocks.parquet".to_string()],
+        )
+        .unwrap()
+    }
+
+    // A newly added dataset with a high `from` (e.g. ethereum-mainnet-3 `from: 25000000`)
+    // must not pay for summary downloads of the millions of early-block chunks that
+    // scheduling discards — that blew the dataset load timeout and staled the scheduler.
+    #[test]
+    fn skips_chunks_below_dataset_from() {
+        let dataset = Arc::new("s3://ethereum-mainnet-3".to_string());
+        let early = chunk(&dataset, 128_937, 177_263);
+        let straddling = chunk(&dataset, 24_999_500, 25_000_500);
+        let at_from = chunk(&dataset, 25_000_000, 25_001_000);
+
+        let from = Some(25_000_000);
+        // mirrors `weight::prepare_chunks`, which keeps a chunk iff its start >= from.
+        assert!(chunk_below_from(&early, from));
+        assert!(chunk_below_from(&straddling, from));
+        assert!(!chunk_below_from(&at_from, from));
+
+        // Without a `from` bound every chunk is loaded, preserving the previous behavior.
+        assert!(!chunk_below_from(&early, None));
+
+        let batch = vec![early, straddling, at_from];
+        let kept: Vec<_> = batch
+            .into_iter()
+            .filter(|c| !chunk_below_from(c, from))
+            .collect();
+        assert_eq!(kept.len(), 1);
+        assert_eq!(*kept[0].blocks.start(), 25_000_000);
+    }
+
     async fn make_s3_client() -> anyhow::Result<s3::Client> {
         let endpoint = env::var("AWS_ENDPOINT_URL")?;
 
@@ -446,7 +500,7 @@ mod test {
     async fn test_load_chunks(dataset: &str) {
         let ds = make_storage(&format!("s3://{dataset}")).await.unwrap();
         let chunks = ds
-            .list_new_chunks(None, CONCURRENT_CHUNKS, None)
+            .list_new_chunks(None, CONCURRENT_CHUNKS, None, None)
             .await
             .unwrap();
         let expected = chunks.len();
