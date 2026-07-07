@@ -112,7 +112,7 @@ fn main() -> anyhow::Result<()> {
                 sqd_assignments::WorkerStatus::UnsupportedVersion => {
                     WorkerStatus::UnsupportedVersion
                 }
-                _ => WorkerStatus::Offline,
+                sqd_assignments::WorkerStatus::DeprecatedVersion => WorkerStatus::Online,
             };
             Worker {
                 id: peer_id,
