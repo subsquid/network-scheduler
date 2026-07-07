@@ -3,7 +3,7 @@ members = ["tools/compare_fb", "tools/clear_block_hash", "tools/reshuffle_sim"]
 
 [package]
 name = "network-scheduler"
-version = "3.11.0"
+version = "3.12.0"
 edition = "2024"
 
 [features]
