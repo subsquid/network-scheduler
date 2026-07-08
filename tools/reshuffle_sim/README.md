@@ -62,6 +62,8 @@ All fields are optional. `copy`/`replace` are lists, so a run can do several. Un
 | `upgrade_schedule` | — | `step:fraction` breakpoints for the share of upgraded workers. |
 | `initial_new_fraction` | `0.0` | Share of workers already on the new version at step 0. |
 | `lift_restriction_at_step` | — | Step at which the version restriction is dropped. |
+| `confirm_lag_steps` | `0` | Steps the fleet takes to download a published assignment before it counts as confirmed (multistep only). |
+| `portal_lag_steps` | `0` | Extra steps for the portal to route a confirmed assignment before its superseded copies may drain (multistep only). |
 | `copy` | — | List of `{ src, dst, at_step }` — see below. |
 | `replace` | — | List of `{ dataset, at_step }` — see below (multistep only). |
 
@@ -83,6 +85,33 @@ See `deploy/scenarios/` for ready-made profiles.
 - Multistep seeds the baseline and schedules it from empty, so step 1's reference is the scheduler's own placement, not the input file's; each step measures movement relative to the previous step.
 - Chunks are inserted one row per `INSERT`, so large inputs are slow against Postgres — prefer smaller `chunks_per_step` / `steps`.
 - The version-restriction and worker-upgrade modeling is config-driven (a dedicated restricted dataset carries a `minimum_worker_version`) and honored by **both** schedulers.
+
+## Confirmation and portal catch-up (multistep only)
+
+By default the simulation confirms each new assignment the instant it is published, so a superseded
+copy is cleared to drain the same step it was replaced — reshuffles look free. In production
+confirmation is not instant: workers download the new copies (confirmation), and the portal must
+route to them before the old copies are safe to remove. Both take time, during which the old and new
+copies coexist and occupy capacity.
+
+Two knobs model that lag as whole simulation steps. Both default to `0` (the confirm-immediately
+behaviour above), and both hold back the storage's confirmation watermark:
+
+- `confirm_lag_steps` — how long the fleet takes to download a published assignment. An assignment
+  published at step *S* counts as confirmed at step *S + confirm_lag_steps*.
+- `portal_lag_steps` — extra steps before the portal routes a confirmed assignment; a superseded
+  copy may only drain once its replacement clears both lags (`S + confirm_lag_steps +
+  portal_lag_steps`).
+
+While an assignment is unconfirmed its superseded copies keep occupying disk, so raising either lag
+inflates the `Stale (% cap)` and `used %` columns and can bring a capacity shortage forward — the
+transient overhang a fast ingest imposes on a slower fleet, which the zero-lag default hides.
+
+```yaml
+scheduler: multistep
+confirm_lag_steps: 3     # workers take 3 steps to download an assignment
+portal_lag_steps: 1      # portal routes it one step after that
+```
 
 ## Copying and replacing datasets
 

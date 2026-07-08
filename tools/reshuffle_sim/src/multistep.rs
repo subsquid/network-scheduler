@@ -14,8 +14,8 @@ use network_scheduler::{
     cli::{Config, DatasetsConfig},
     multistep_scheduler::SchedulingConfig as MultistepConfig,
     scheduler_storage::{
-        ChunkPk, NewChunk, SchedulerStorage, StorageError, WorkerAssignment, WorkerAssignmentChunk,
-        WorkerPk,
+        AssignmentId, ChunkPk, NewChunk, SchedulerStorage, StorageError, WorkerAssignment,
+        WorkerAssignmentChunk, WorkerPk,
         algorithm::MultistepAlgorithm,
         postgres::PostgresStorage,
         test_harness::pg_harness::{self, PgData},
@@ -102,6 +102,14 @@ pub struct MultistepScheduler {
     initial_owners: ChunkOwners,
     replace: Vec<ReplacePlan>,
     copy: Vec<CopyPlan>,
+    /// Cycles a published assignment waits before the fleet has downloaded it (uniform latency).
+    confirm_lag_steps: u32,
+    /// Extra cycles before the portal routes a confirmed assignment, gating when its superseded
+    /// copies may drain.
+    portal_lag_steps: u32,
+    /// Worker-assignment ids in publication order (index 0 = baseline). The confirmation watermark
+    /// trails the newest publication by `confirm_lag_steps + portal_lag_steps` entries.
+    published_ids: Vec<AssignmentId>,
     /// 1-based step counter, advanced once per `step`.
     current_step: u32,
     /// Placed chunks of datasets still awaiting a replace — a same-cycle replace reads its target's
@@ -115,6 +123,7 @@ pub struct MultistepScheduler {
 }
 
 impl MultistepScheduler {
+    #[allow(clippy::too_many_arguments)]
     pub fn build(
         config: &Config,
         baseline: &mut Baseline,
@@ -122,6 +131,8 @@ impl MultistepScheduler {
         restricted_dataset: Option<String>,
         replace: Vec<ReplacePlan>,
         copy: Vec<CopyPlan>,
+        confirm_lag_steps: u32,
+        portal_lag_steps: u32,
         ingestion: Ingestion,
     ) -> anyhow::Result<Option<Self>> {
         let mut backend = match database_url {
@@ -203,6 +214,9 @@ impl MultistepScheduler {
             initial_owners: ChunkOwners::new(),
             replace,
             copy,
+            confirm_lag_steps,
+            portal_lag_steps,
+            published_ids: Vec::new(),
             current_step: 0,
             latest_chunks: BTreeMap::new(),
             worker_index: WorkerIndex::default(),
@@ -238,31 +252,47 @@ impl MultistepScheduler {
     }
 
     /// Run one scheduling cycle. Advances the clock by the removal delay (so earlier steps' removed
-    /// copies age out), then confirms the assignment fleet-wide and runs visibility, so the copies
-    /// it replaces start their removal timer.
+    /// copies age out), then confirms the fleet up to the lagged watermark and runs visibility, so
+    /// only assignments the fleet+portal have caught up to let their superseded copies drain.
     fn run_cycle(&mut self) -> anyhow::Result<CycleResult> {
-        let storage = &mut self.backend.storage;
         self.clock += M_TICKS;
         let started = Instant::now();
-        let assignment =
-            match storage.run_scheduling_cycle(&self.algo, &self.config, self.clock, M_TICKS) {
-                Ok(assignment) => assignment,
-                Err(StorageError::Shortage) => {
-                    return Ok(CycleResult::Shortage(
+        let assignment = match self.backend.storage.run_scheduling_cycle(
+            &self.algo,
+            &self.config,
+            self.clock,
+            M_TICKS,
+        ) {
+            Ok(assignment) => assignment,
+            Err(StorageError::Shortage) => {
+                return Ok(CycleResult::Shortage(
                     "scheduling shortage: worker capacity cannot satisfy all replication floors \
                      (lower min_replication, raise worker_storage_bytes, or add workers)"
                         .to_string(),
                 ));
-                }
-                Err(e) => return Err(anyhow!("scheduling cycle failed: {e}")),
-            };
+            }
+            Err(e) => return Err(anyhow!("scheduling cycle failed: {e}")),
+        };
         let schedule_duration = started.elapsed();
         // Before confirm/visibility expire or drain stale, so the snapshot matches `assignment`.
-        let stale = storage.stale_mappings()?;
+        let stale = self.backend.storage.stale_mappings()?;
         self.clock += CLOCK_STEP;
-        storage.confirm_worker_assignment(assignment.id, self.clock)?;
-        storage.run_visibility_cycle(self.clock)?;
+        // Confirm only up to the lagged watermark: the copies this cycle superseded keep occupying
+        // capacity until the assignment that replaced them clears both lags. Both lags 0 confirms
+        // the just-published assignment — the previous confirm-immediately behaviour.
+        self.published_ids.push(assignment.id);
+        let watermark = self.confirmation_watermark();
+        self.backend
+            .storage
+            .confirm_worker_assignment(watermark, self.clock)?;
+        self.backend.storage.run_visibility_cycle(self.clock)?;
         Ok(CycleResult::Scheduled(assignment, stale, schedule_duration))
+    }
+
+    /// The publication `confirm_lag_steps + portal_lag_steps` cycles back.
+    fn confirmation_watermark(&self) -> AssignmentId {
+        let lag = (self.confirm_lag_steps + self.portal_lag_steps) as usize;
+        lagged_watermark(&self.published_ids, lag)
     }
 
     /// Supersede every chunk of `bucket` with a same-range correction, sourced from `latest_chunks`
@@ -417,6 +447,12 @@ impl StepScheduler for MultistepScheduler {
     }
 }
 
+/// The id `lag` publications before the newest, clamped to the baseline (index 0).
+fn lagged_watermark(published_ids: &[AssignmentId], lag: usize) -> AssignmentId {
+    let latest = published_ids.len() - 1;
+    published_ids[latest.saturating_sub(lag)]
+}
+
 fn log_table_sizes(storage: &PostgresStorage) {
     if !tracing::enabled!(tracing::Level::DEBUG) {
         return;
@@ -524,6 +560,25 @@ mod tests {
                 status: WorkerStatus::Online,
             },
         )
+    }
+
+    #[test]
+    fn lagged_watermark_trails_publications_and_clamps_to_baseline() {
+        // Publication history: baseline (id 10), then steps publishing 11, 12, 13.
+        let ids = [10, 11, 12, 13];
+
+        // Zero lag confirms the newest publication immediately (the prior behaviour).
+        assert_eq!(lagged_watermark(&ids, 0), 13);
+        // Lag 1/2 trail by that many publications.
+        assert_eq!(lagged_watermark(&ids, 1), 12);
+        assert_eq!(lagged_watermark(&ids, 2), 11);
+        // A lag past the start clamps to the baseline, never underflows.
+        assert_eq!(lagged_watermark(&ids, 3), 10);
+        assert_eq!(lagged_watermark(&ids, 99), 10);
+
+        // Early in the run only the baseline exists, so every lag resolves to it.
+        assert_eq!(lagged_watermark(&[10], 0), 10);
+        assert_eq!(lagged_watermark(&[10], 5), 10);
     }
 
     #[test]
