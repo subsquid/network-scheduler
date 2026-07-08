@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::io::{IsTerminal, Write};
+use std::time::Duration;
 
 use bytesize::ByteSize;
 use network_scheduler::types::Worker;
@@ -26,10 +27,15 @@ pub fn format_version_distribution(workers: &[Worker]) -> String {
         .join(" ")
 }
 
+/// Human-readable scheduling time, in milliseconds with one decimal.
+fn format_duration(d: Duration) -> String {
+    format!("{:.1} ms", d.as_secs_f64() * 1000.0)
+}
+
 /// Index of the first of the three "Workers" sub-columns (new / lost / shuffled).
 const WORKERS_COL: usize = 10;
 /// Single-value columns whose header should span both header rows.
-const SINGLE_COLS: [usize; 12] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 13, 14];
+const SINGLE_COLS: [usize; 13] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 13, 14, 15];
 
 /// Builds the metrics table. The three worker counts sit under one spanning
 /// `Workers` header (`new / lost / shuffled`); other headers are stacked across
@@ -52,9 +58,10 @@ fn build_table(metrics: &[ReshuffleMetrics]) -> tabled::Table {
         "",
         "Upgraded\nworkers",
         "Sched.",
+        "Sched\ntime",
     ]);
     builder.push_record([
-        "", "", "", "", "", "", "", "", "", "", "new", "lost", "shuffled", "", "",
+        "", "", "", "", "", "", "", "", "", "", "new", "lost", "shuffled", "", "", "",
     ]);
 
     for m in metrics {
@@ -97,6 +104,7 @@ fn build_table(metrics: &[ReshuffleMetrics]) -> tabled::Table {
             dm.workers_shuffled.to_string(),
             m.eligible_workers.to_string(),
             if m.scheduled { "yes" } else { "NO" }.to_string(),
+            format_duration(m.schedule_duration),
         ]);
     }
 

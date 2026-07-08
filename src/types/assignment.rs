@@ -1,3 +1,5 @@
+#[cfg(test)]
+use std::collections::BTreeSet;
 use std::collections::{BTreeMap, HashMap};
 
 use libp2p_identity::PeerId;
@@ -170,6 +172,20 @@ impl Assignment {
         }
 
         assignment_builder.finish()
+    }
+
+    /// Invert `worker_chunks` into `chunk index -> set of holding workers`. `n_chunks` sizes the
+    /// result so every chunk is present (chunks with no copies map to an empty set). Test-only: the
+    /// inverse view several test suites recompute by hand.
+    #[cfg(test)]
+    pub fn chunk_holders(&self, n_chunks: usize) -> Vec<BTreeSet<PeerId>> {
+        let mut out = vec![BTreeSet::new(); n_chunks];
+        for (&worker, chunks) in &self.worker_chunks {
+            for &ci in chunks {
+                out[ci as usize].insert(worker);
+            }
+        }
+        out
     }
 
     fn worker_ids_for_chunk(&self) -> Vec<Vec<WorkerIndex>> {

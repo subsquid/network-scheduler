@@ -159,7 +159,7 @@ pub fn load_baseline(path: &PathBuf, worker_version: &Version) -> anyhow::Result
     let (chunks, chunk_owners) = extract_chunks_and_owners(&fb)?;
     let datasets = compute_dataset_stats(&chunks);
 
-    eprintln!(
+    tracing::info!(
         "Loaded {} chunks across {} datasets, {} workers",
         chunks.len(),
         datasets.len(),
