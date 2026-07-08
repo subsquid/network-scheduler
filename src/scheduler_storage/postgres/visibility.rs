@@ -1,7 +1,7 @@
 //! Phase helpers for [`PostgresStorage::run_visibility_cycle`] and
 //! [`PostgresStorage::confirm_worker_assignment`].
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 use anyhow::{Context, Result};
 use sqlx::postgres::PgConnection;
@@ -9,11 +9,10 @@ use sqlx::{Postgres, Row, Transaction};
 
 use crate::metrics::PhaseTimer;
 use crate::scheduler_storage::{
-    AssignmentId, AssignmentWorker, ChunkPk, PortalAssignment, WorkerPk,
+    AssignmentId, AssignmentWorker, ChunkPk, PortalAssignment, WorkerAssignmentChunk, WorkerPk,
 };
-use crate::types::Chunk;
+use crate::types::BlockNumber;
 
-use super::nonoverlap::{self, Candidate};
 use super::rows::{
     ChunkRow, DatasetInterner, WorkerRow, assignment_worker_from_row, chunk_from_row, tick_to_i64,
 };
@@ -197,21 +196,20 @@ pub(super) async fn apply_ready_corrections(
 
     // Structural fixpoint: fire a confirmed correction unless a still-pending (unfired) correction
     // produces its old chunk. Re-scan until stable so a chain collapses in one pass whatever the
-    // row order.
-    let mut fired: std::collections::HashSet<ChunkPk> = std::collections::HashSet::new();
+    // row order. `unfired_producers` holds every unfired correction's new_chunk_pk (replacements
+    // are freshly inserted rows, so those pks are distinct); a correction is blocked exactly while
+    // its old chunk is in that set. The O(1) lookup keeps a P-correction batch at O(P) per pass —
+    // the per-candidate rescan it replaces was O(P²), tens of seconds at a 147K-chunk replacement.
+    let mut fired: HashSet<ChunkPk> = HashSet::new();
+    let mut unfired_producers: HashSet<ChunkPk> = pending.iter().map(|&(_, new, _)| new).collect();
     loop {
         let mut progressed = false;
-        for &(old, _new, confirmed) in &pending {
-            if !confirmed || fired.contains(&old) {
-                continue;
-            }
-            let blocked_by_pending_producer = pending
-                .iter()
-                .any(|&(q_old, q_new, _)| q_new == old && !fired.contains(&q_old));
-            if blocked_by_pending_producer {
+        for &(old, new, confirmed) in &pending {
+            if !confirmed || fired.contains(&old) || unfired_producers.contains(&old) {
                 continue;
             }
             fired.insert(old);
+            unfired_producers.remove(&new);
             progressed = true;
         }
         if !progressed {
@@ -246,68 +244,124 @@ pub(super) async fn apply_ready_corrections(
     Ok(())
 }
 
-/// Chunks eligible for promotion: confirmed, not yet visible, not dropped, not marked_for_removal,
-/// and not a pending correction's replacement (those promote via the correction path).
-async fn promotable_chunks(
-    tx: &mut Transaction<'_, Postgres>,
-    confirmed_up_to: AssignmentId,
-) -> Result<Vec<Candidate>> {
-    let mut timer = PhaseTimer::new("run_visibility_cycle:promotable_chunks");
-    let rows = sqlx::query(
-        r#"
-        SELECT s.chunk_pk, c.dataset_id, d.name AS dataset_name,
-               c.first_block, c.last_block_delta
-        FROM sched_chunk_metadata s
-        JOIN chunks c ON c.chunk_pk = s.chunk_pk
-        JOIN datasets d ON d.id = c.dataset_id
-        WHERE s.applied_at_worker_assignment_id IS NOT NULL
-          AND s.applied_at_worker_assignment_id <= $1
-          AND s.applied_at_portal_assignment_id IS NULL
-          AND s.dropped_at_portal_assignment_id IS NULL
-          AND s.marked_for_removal IS NULL
-          AND s.chunk_pk NOT IN (
-              SELECT new_chunk_pk FROM chunk_corrections
-              WHERE applied_at_portal_assignment_id IS NULL
-          )
-        "#,
-    )
-    .bind(confirmed_up_to)
-    .fetch_all(&mut **tx)
-    .await?;
-    timer.stmt(rows.len() as u64);
-    Ok(rows.iter().map(Candidate::from_row).collect())
-}
-
-/// Promote eligible chunks to portal-visible; atomic with [`drop_marked_chunks`]. Runs the
-/// non-overlap gate: a chunk promotes only if it doesn't overlap one that stays visible, nor another
-/// chunk promoted earlier in this batch.
+/// Promote every eligible chunk to portal-visible in one UPDATE: confirmed by a worker assignment
+/// at/under the watermark, not yet visible, not dropped, not marked for removal, and not a pending
+/// correction's replacement (those promote via the correction path). No `rejected` check — rejected
+/// chunks never reach a worker assignment, so the first condition already excludes them. The
+/// non-overlap gate now lives in [`evict_portal_overlaps`], which settles overlaps in memory over the
+/// visible set we fetch anyway — so this neither fetches the candidates nor probes per chunk.
 pub(super) async fn promote_eligible_chunks(
     tx: &mut Transaction<'_, Postgres>,
     new_pa_id: AssignmentId,
     confirmed_up_to: AssignmentId,
 ) -> Result<()> {
-    let candidates = promotable_chunks(tx, confirmed_up_to).await?;
-    let conflicting = nonoverlap::overlapping_visible(&mut **tx, &candidates).await?;
-    let (clear, mut held): (Vec<Candidate>, Vec<Candidate>) = candidates
-        .into_iter()
-        .partition(|c| !conflicting.contains(&c.pk));
-    let (to_promote, batch_held) = nonoverlap::settle_within_batch(clear);
-    held.extend(batch_held);
-    nonoverlap::report_promotion_held_back(&held);
-
-    if to_promote.is_empty() {
-        return Ok(());
-    }
     let mut timer = PhaseTimer::new("run_visibility_cycle:promote_eligible_chunks");
     let res = sqlx::query(
-        "UPDATE sched_chunk_metadata SET applied_at_portal_assignment_id = $1 WHERE chunk_pk = ANY($2)",
+        r#"
+        UPDATE sched_chunk_metadata SET applied_at_portal_assignment_id = $1
+        WHERE applied_at_worker_assignment_id IS NOT NULL
+          AND applied_at_worker_assignment_id <= $2
+          AND applied_at_portal_assignment_id IS NULL
+          AND dropped_at_portal_assignment_id IS NULL
+          AND marked_for_removal IS NULL
+          AND chunk_pk NOT IN (
+              SELECT new_chunk_pk FROM chunk_corrections
+              WHERE applied_at_portal_assignment_id IS NULL
+          )
+        "#,
     )
     .bind(new_pa_id)
-    .bind(&to_promote)
+    .bind(confirmed_up_to)
     .execute(&mut **tx)
-    .await?;
+    .await
+    .context("run_visibility_cycle: promote eligible chunks")?;
     timer.stmt(res.rows_affected());
     Ok(())
+}
+
+/// Portal non-overlap gate, in memory over the visible set the assignment build already holds: one
+/// sorted pass covers what the old SQL probe + in-batch settle did (new-vs-existing and new-vs-new).
+/// Overlappers — lowest `(first_block, chunk_pk)` wins — are dropped from `chunks` and un-promoted, to
+/// be reconsidered next cycle. The held-back gauge is emitted every cycle and should always read 0:
+/// registration keeps admitted chunks disjoint, so a non-zero count means that invariant broke — hence
+/// the `warn`.
+pub(super) async fn evict_portal_overlaps(
+    conn: &mut PgConnection,
+    chunks: &mut BTreeMap<ChunkPk, WorkerAssignmentChunk>,
+) -> Result<()> {
+    // Time the in-memory sort + sweep as a CPU phase: swept count as items, no statements.
+    let losers = {
+        let mut timer = PhaseTimer::new("run_visibility_cycle:portal_overlap_sweep");
+        let losers = portal_overlap_losers(chunks);
+        timer.items(chunks.len() as u64);
+        losers
+    };
+    crate::metrics::report_promotion_held_back(held_back_by_dataset(chunks, &losers));
+    if losers.is_empty() {
+        return Ok(());
+    }
+    tracing::warn!(
+        count = losers.len(),
+        "chunks evicted from portal assignment: block range overlaps another visible chunk \
+         (registration should have prevented this)"
+    );
+    let mut timer = PhaseTimer::new("run_visibility_cycle:evict_portal_overlaps");
+    let res = sqlx::query(
+        "UPDATE sched_chunk_metadata SET applied_at_portal_assignment_id = NULL WHERE chunk_pk = ANY($1)",
+    )
+    .bind(&losers)
+    .execute(conn)
+    .await
+    .context("run_visibility_cycle: un-promote overlapping chunks")?;
+    timer.stmt(res.rows_affected());
+    for pk in &losers {
+        chunks.remove(pk);
+    }
+    Ok(())
+}
+
+/// pks of visible chunks that overlap an earlier-ranked chunk in the same dataset. Single sorted
+/// sweep: chunks are interned, so group by the dataset `Arc`'s identity; within a dataset keep the
+/// lowest `(first_block, chunk_pk)` and reject anything whose start falls at/before the last kept end
+/// (same predicate as [`super::nonoverlap::settle_within_batch`], over the whole visible set).
+fn portal_overlap_losers(chunks: &BTreeMap<ChunkPk, WorkerAssignmentChunk>) -> Vec<ChunkPk> {
+    let mut items: Vec<(usize, BlockNumber, BlockNumber, ChunkPk)> = chunks
+        .iter()
+        .map(|(&pk, c)| {
+            (
+                std::sync::Arc::as_ptr(&c.dataset) as usize,
+                *c.blocks.start(),
+                *c.blocks.end(),
+                pk,
+            )
+        })
+        .collect();
+    items.sort_unstable_by_key(|&(dataset, first, _last, pk)| (dataset, first, pk));
+    let mut losers = Vec::new();
+    let mut last: Option<(usize, BlockNumber)> = None; // (dataset, last_block of last kept)
+    for (dataset, first, last_block, pk) in items {
+        match last {
+            Some((kept_dataset, kept_end)) if kept_dataset == dataset && first <= kept_end => {
+                losers.push(pk);
+            }
+            _ => last = Some((dataset, last_block)),
+        }
+    }
+    losers
+}
+
+/// Per-dataset counts of evicted chunks, for the held-back gauge.
+fn held_back_by_dataset(
+    chunks: &BTreeMap<ChunkPk, WorkerAssignmentChunk>,
+    losers: &[ChunkPk],
+) -> BTreeMap<String, i64> {
+    let mut counts: BTreeMap<String, i64> = BTreeMap::new();
+    for pk in losers {
+        if let Some(chunk) = chunks.get(pk) {
+            *counts.entry(chunk.dataset.to_string()).or_default() += 1;
+        }
+    }
+    counts
 }
 
 pub(super) async fn drop_marked_chunks(
@@ -357,11 +411,12 @@ pub(super) async fn activate_confirmed_drains(
 /// Portal-visible = applied to a portal assignment and not dropped.
 pub(super) async fn fetch_portal_visible_chunks(
     conn: &mut PgConnection,
-) -> Result<BTreeMap<ChunkPk, Chunk>> {
+) -> Result<BTreeMap<ChunkPk, WorkerAssignmentChunk>> {
     let mut timer = PhaseTimer::new("run_visibility_cycle:fetch_portal_visible_chunks");
     let chunk_rows: Vec<ChunkRow> = sqlx::query_as(
         r#"
-        SELECT c.chunk_pk, d.name AS dataset_name, c.chunk_id, c.size, c.files,
+        SELECT c.chunk_pk, d.name AS dataset_name, c.chunk_id, c.size,
+               c.schema_id, c.tables_present,
                c.first_block, c.last_block_delta
         FROM chunks c
         JOIN datasets d ON d.id = c.dataset_id
@@ -370,34 +425,36 @@ pub(super) async fn fetch_portal_visible_chunks(
           AND s.dropped_at_portal_assignment_id IS NULL
         "#,
     )
-    .fetch_all(conn)
+    .fetch_all(&mut *conn)
     .await?;
     timer.stmt(chunk_rows.len() as u64);
 
     let mut datasets = DatasetInterner::new();
-    let mut out: BTreeMap<ChunkPk, Chunk> = BTreeMap::new();
-    for row in &chunk_rows {
-        out.insert(
-            row.chunk_pk,
-            chunk_from_row(row, datasets.intern(&row.dataset_name))?,
-        );
+    let mut out: BTreeMap<ChunkPk, WorkerAssignmentChunk> = BTreeMap::new();
+    for row in chunk_rows {
+        let dataset = datasets.intern(&row.dataset_name);
+        out.insert(row.chunk_pk, chunk_from_row(row, dataset));
     }
     Ok(out)
 }
 
-/// Confirmed routing for the given portal-visible chunks.
+/// Confirmed routing for the portal-visible chunks. The visible set is re-derived server-side —
+/// the same predicate `fetch_portal_visible_chunks` reads and `evict_portal_overlaps` has already
+/// written its un-promotions to — instead of shipping the ~6M-pk array back as a parameter
+/// (~50 MB serialized and a server-side hash of every element, ~3x the join's cost).
 pub(super) async fn fetch_confirmed_routing(
     conn: &mut PgConnection,
-    portal_pks: &[ChunkPk],
 ) -> Result<BTreeMap<ChunkPk, Vec<WorkerPk>>> {
-    if portal_pks.is_empty() {
-        return Ok(BTreeMap::new());
-    }
     let mut timer = PhaseTimer::new("run_visibility_cycle:fetch_confirmed_routing");
     let rows = sqlx::query(
-        "SELECT chunk_pk, worker_ids FROM sched_confirmed_chunk_workers WHERE chunk_pk = ANY($1)",
+        r#"
+        SELECT ccw.chunk_pk, ccw.worker_ids
+        FROM sched_confirmed_chunk_workers ccw
+        JOIN sched_chunk_metadata s ON s.chunk_pk = ccw.chunk_pk
+        WHERE s.applied_at_portal_assignment_id IS NOT NULL
+          AND s.dropped_at_portal_assignment_id IS NULL
+        "#,
     )
-    .bind(portal_pks)
     .fetch_all(conn)
     .await?;
     timer.stmt(rows.len() as u64);
@@ -431,7 +488,7 @@ pub(super) async fn fetch_portal_workers(
 
 pub(super) fn assemble_portal_assignment(
     id: AssignmentId,
-    chunks: BTreeMap<ChunkPk, Chunk>,
+    chunks: BTreeMap<ChunkPk, WorkerAssignmentChunk>,
     chunk_workers: BTreeMap<ChunkPk, Vec<WorkerPk>>,
     workers: BTreeMap<WorkerPk, AssignmentWorker>,
 ) -> PortalAssignment {

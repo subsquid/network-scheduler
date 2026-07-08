@@ -16,8 +16,9 @@ use crate::scheduler_storage::Tick;
 use crate::scheduler_storage::in_memory::InMemoryStorage;
 use crate::scheduler_storage::postgres::PostgresStorage;
 use crate::scheduler_storage::test_harness::inspect::ChunkView;
-use crate::types::{Chunk, ChunkWeight};
-use crate::weight::WeightStrategy;
+use crate::scheduler_storage::{AlgoChunk, NewChunk as StorageNewChunk};
+use crate::types::ChunkWeight;
+use crate::weight::{SchedulingChunk, WeightStrategy};
 
 pub(super) type Seed = [u8; 32];
 
@@ -484,12 +485,31 @@ impl WeightTable {
     }
 }
 
+/// Sim-only: lets insert-input chunks flow through [`WeightStrategy::prepare`] directly.
+impl SchedulingChunk for StorageNewChunk {
+    fn dataset(&self) -> &std::sync::Arc<String> {
+        &self.dataset
+    }
+    fn id(&self) -> &std::sync::Arc<String> {
+        &self.id
+    }
+    fn blocks(&self) -> &std::ops::RangeInclusive<crate::types::BlockNumber> {
+        &self.blocks
+    }
+    fn size(&self) -> u32 {
+        self.size
+    }
+}
+
 impl WeightStrategy for WeightTable {
-    fn prepare(&self, chunks: Vec<Chunk>) -> Vec<(Chunk, ChunkWeight, Option<Version>)> {
+    fn prepare<T: SchedulingChunk>(
+        &self,
+        chunks: Vec<T>,
+    ) -> Vec<(T, ChunkWeight, Option<Version>)> {
         chunks
             .into_iter()
             .map(|chunk| {
-                let weight = self.weight_of(&chunk.id);
+                let weight = self.weight_of(chunk.id());
                 (chunk, weight, None)
             })
             .collect()
@@ -502,31 +522,17 @@ pub(super) fn chunk_pk(chunk: &NewChunk) -> (String, String) {
     (chunk.dataset.clone(), chunk.key.clone())
 }
 
-fn make_chunk(
-    dataset: String,
-    id: String,
-    size: u32,
-    blocks: std::ops::RangeInclusive<u64>,
-) -> Chunk {
-    Chunk {
-        dataset: Arc::new(dataset),
-        id: Arc::new(id),
-        size,
-        blocks,
-        files: Arc::new(Vec::new()),
-        summary: None,
-    }
-}
-
-/// Build the storage `Chunk` for a model chunk. Weight is *not* recorded here — call
+/// Build the storage insert input for a model chunk. Weight is *not* recorded here — call
 /// [`record_weights`] separately.
-pub(super) fn storage_chunk(chunk: &NewChunk) -> Chunk {
-    make_chunk(
-        chunk.dataset.clone(),
-        chunk.key.clone(),
-        chunk.size,
-        chunk.blocks.clone(),
-    )
+pub(super) fn storage_chunk(chunk: &NewChunk) -> StorageNewChunk {
+    StorageNewChunk {
+        dataset: Arc::new(chunk.dataset.clone()),
+        id: Arc::new(chunk.key.clone()),
+        size: chunk.size,
+        blocks: chunk.blocks.clone(),
+        schema_id: None,
+        tables_present: None,
+    }
 }
 
 /// Record each chunk's weight so the scheduler's [`WeightStrategy`] can return it.
@@ -536,13 +542,12 @@ pub(super) fn record_weights(weights: &WeightTable, chunks: &[NewChunk]) {
     }
 }
 
-/// Read-path counterpart of [`storage_chunk`], for a chunk *already in storage*: records no weight
-/// (it's already in the table).
-pub(super) fn chunk_from_view(view: &ChunkView) -> Chunk {
-    make_chunk(
-        view.dataset.clone(),
-        view.chunk_id.clone(),
-        view.size,
-        view.blocks.clone(),
-    )
+/// Read-path counterpart of [`storage_chunk`]: the algorithm's view of a chunk already in storage.
+pub(super) fn chunk_from_view(view: &ChunkView) -> AlgoChunk {
+    AlgoChunk {
+        dataset: Arc::new(view.dataset.clone()),
+        id: Arc::new(view.chunk_id.clone()),
+        size: view.size,
+        blocks: view.blocks.clone(),
+    }
 }

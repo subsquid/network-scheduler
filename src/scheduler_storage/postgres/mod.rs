@@ -7,11 +7,19 @@
 //! `Tick` values are logical integer timestamps stored in `BIGINT` columns;
 //! `m_ticks`/`gc_ticks` are raw tick counts used in integer arithmetic.
 
+// `register_correction`; also enabled by `pg-testkit` for offline tools (reshuffle-sim).
+#[cfg(any(test, feature = "pg-testkit"))]
+mod correction;
+mod debug;
+pub mod explain;
 // Not yet wired into a production caller; remove once the scheduler loop uses it.
 mod nonoverlap;
 mod registration;
 mod rows;
 mod scheduling_cycle;
+mod schema;
+#[cfg(any(test, feature = "pg-testkit"))]
+mod testkit;
 mod visibility;
 mod workers;
 
@@ -27,13 +35,13 @@ use sqlx::postgres::PgConnection;
 use crate::metrics::{PhaseTimer, Timer};
 use crate::scheduler_storage::algorithm::{ScheduleOutput, SchedulingAlgorithm};
 use crate::scheduler_storage::{
-    AssignmentId, ChunkPk, PortalAssignment, SchedulerStorage, StorageError, Tick,
-    WorkerAssignment, WorkerPk,
+    AssignmentId, ChunkPk, DatasetId, NewChunk, PortalAssignment, SchedulerStorage, StorageError,
+    Tick, WorkerAssignment,
 };
-use crate::types::{Chunk, Worker};
+use crate::types::{DatasetSchema, Worker};
 
 use nonoverlap::Candidate;
-use rows::{chunk_from_row, tick_to_i64};
+use rows::tick_to_i64;
 
 /// Rows per batched write. Caps the jsonb payload and keeps a single statement under Postgres'
 /// per-value / message-size limits. The cycle's writes also need whole chunks to stay within one
@@ -65,6 +73,17 @@ impl PostgresStorage {
             let mut conn = PgConnection::connect(database_url)
                 .await
                 .context("failed to connect to Postgres")?;
+            // Session-scoped GUCs, held for this connection's lifetime: raise sort/hash
+            // memory for the cycle's heavy routing and visibility queries.
+            for stmt in [
+                "SET work_mem = '512MB'",
+                "SET maintenance_work_mem = '512MB'",
+            ] {
+                sqlx::query(stmt)
+                    .execute(&mut conn)
+                    .await
+                    .with_context(|| format!("failed to run {stmt}"))?;
+            }
             // Advisory locks are cluster-wide, not per-database; scope the key to the
             // current database, or per-test databases on one cluster collide on the lock.
             let locked: bool = sqlx::query_scalar(
@@ -104,36 +123,99 @@ impl PostgresStorage {
         rt.block_on(f(conn.get_mut()))
     }
 
-    /// `&self` variant of [`Self::with_conn`] for the test-only
+    /// `&self` variant of [`Self::with_conn`] for read-only callers: the test-only
     /// [`StorageInspect`](crate::scheduler_storage::test_harness::inspect::StorageInspect)
-    /// reads. The `RefCell` borrow is taken in this sync frame and held across
-    /// `block_on`; no guard crosses an `.await`.
-    #[cfg(test)]
+    /// reads and [`Self::table_sizes`]. The `RefCell` borrow is taken in this sync frame
+    /// and held across `block_on`; no guard crosses an `.await`.
     fn with_conn_ref<T>(&self, f: impl AsyncFnOnce(&mut PgConnection) -> T) -> T {
         let mut conn = self.conn.borrow_mut();
         self.rt.block_on(f(&mut conn))
     }
+
+    /// Register same-range corrections in bulk: one transaction, all-or-nothing. Returns the
+    /// replacement pks in input order. The trait's `register_correction` is a batch of one.
+    #[cfg(any(test, feature = "pg-testkit"))]
+    pub fn register_corrections(
+        &mut self,
+        corrections: Vec<(ChunkPk, NewChunk)>,
+        now: Tick,
+    ) -> Result<Vec<ChunkPk>, StorageError> {
+        if corrections.is_empty() {
+            return Ok(Vec::new());
+        }
+        let batch_size = self.batch_size;
+        self.with_conn(async move |conn| {
+            correction::register_corrections(conn, &corrections, now, batch_size).await
+        })
+    }
+
+    /// Clone every live chunk of dataset `src` into dataset `dst`, server-side; the next
+    /// `register_new_chunks` admits the clones. Returns the number of clones.
+    #[cfg(any(test, feature = "pg-testkit"))]
+    pub fn copy_dataset_chunks(&mut self, src: &str, dst: &str) -> Result<u64, StorageError> {
+        self.with_conn(async move |conn| testkit::copy_dataset_chunks(conn, src, dst).await)
+    }
 }
 
 impl SchedulerStorage for PostgresStorage {
-    fn insert_new_datasets(&mut self, datasets: Vec<String>) -> Result<(), StorageError> {
+    fn insert_new_datasets(
+        &mut self,
+        datasets: Vec<(String, DatasetSchema)>,
+    ) -> Result<(), StorageError> {
         self.with_conn(async move |conn| -> Result<(), StorageError> {
             let mut timer = PhaseTimer::new("insert_new_datasets");
-            for name in &datasets {
-                // A duplicate name is rejected by the UNIQUE(name) constraint — surfaced as the
-                // database's error, not pre-checked here.
-                let res = sqlx::query("INSERT INTO datasets (name) VALUES ($1)")
-                    .bind(name)
-                    .execute(&mut *conn)
-                    .await
-                    .context("insert_new_datasets")?;
-                timer.stmt(res.rows_affected());
+            let mut tx = conn.begin().await.context("insert_new_datasets: begin")?;
+            for (name, dataset_schema) in &datasets {
+                let dataset_id: DatasetId =
+                    sqlx::query_scalar("INSERT INTO datasets (name) VALUES ($1) RETURNING id")
+                        .bind(name)
+                        .fetch_one(&mut *tx)
+                        .await
+                        .context("insert_new_datasets")?;
+                schema::ensure_current_schema(&mut tx, dataset_id, dataset_schema).await?;
+                timer.stmt(3); // dataset insert + schema supersede + activate
             }
+            tx.commit().await.context("insert_new_datasets: commit")?;
             Ok(())
         })
     }
 
-    fn insert_new_chunks(&mut self, chunks: Vec<Chunk>) -> Result<(), StorageError> {
+    fn set_dataset_schema(
+        &mut self,
+        dataset: &str,
+        dataset_schema: DatasetSchema,
+    ) -> Result<(), StorageError> {
+        self.with_conn(async move |conn| -> Result<(), StorageError> {
+            let mut tx = conn.begin().await.context("set_dataset_schema: begin")?;
+            let dataset_id: Option<DatasetId> =
+                sqlx::query_scalar("SELECT id FROM datasets WHERE name = $1")
+                    .bind(dataset)
+                    .fetch_optional(&mut *tx)
+                    .await
+                    .context("set_dataset_schema: lookup")?;
+            let Some(dataset_id) = dataset_id else {
+                return Err(
+                    anyhow::anyhow!("set_dataset_schema: dataset {dataset} not found").into(),
+                );
+            };
+            schema::ensure_current_schema(&mut tx, dataset_id, &dataset_schema).await?;
+            tx.commit().await.context("set_dataset_schema: commit")?;
+            Ok(())
+        })
+    }
+
+    fn load_schemas(
+        &self,
+        schema_ids: Option<&[crate::scheduler_storage::SchemaId]>,
+    ) -> Result<BTreeMap<crate::scheduler_storage::SchemaId, DatasetSchema>, StorageError> {
+        self.with_conn_ref(async move |conn| {
+            schema::load_schemas(conn, schema_ids)
+                .await
+                .map_err(StorageError::from)
+        })
+    }
+
+    fn insert_new_chunks(&mut self, chunks: Vec<NewChunk>) -> Result<(), StorageError> {
         let batch_size = self.batch_size;
         self.with_conn(async move |conn| {
             registration::insert_chunks(conn, &chunks, batch_size).await
@@ -222,8 +304,7 @@ impl SchedulerStorage for PostgresStorage {
                 .begin()
                 .await
                 .context("run_scheduling_cycle: begin gc")?;
-            let new_wa_id = phase::open_worker_assignment(&mut gc_tx, now).await?;
-            phase::tombstone_expired_chunks(&mut gc_tx, new_wa_id, now, m_ticks).await?;
+            phase::tombstone_expired_chunks(&mut gc_tx, now, m_ticks).await?;
             phase::expire_drained_stale_mappings(&mut gc_tx, now, m_ticks).await?;
             gc_tx
                 .commit()
@@ -233,75 +314,45 @@ impl SchedulerStorage for PostgresStorage {
             // Phase B — placement reconcile; rolls back on shortage, leaving Phase A committed.
             let mut tx = conn.begin().await.context("run_scheduling_cycle: begin")?;
 
-            // Ideal rows are reused below for prev-ideal diffing (same transaction).
-            let ideal_placement_rows = phase::fetch_ideal_placement_rows(&mut tx).await?;
-            let stale_placement_rows = phase::fetch_stale_placement_rows(&mut tx).await?;
-            // The algorithm and the storage helpers now share the surrogate newtypes
-            // (ChunkPk/WorkerPk), so no conversion is needed at this boundary.
-            let current_placement =
-                phase::merge_current_placement(&ideal_placement_rows, &stale_placement_rows);
+            // One streamed round-trip for the algorithm's inputs; build_worker_assignment
+            // re-fetches the (much smaller) placed subset itself.
+            let (chunks_for_algo, current_placement) =
+                phase::fetch_active_chunks_with_placement(&mut tx).await?;
 
-            let chunk_rows = phase::fetch_active_chunks(&mut tx).await?;
             let worker_rows = phase::fetch_workers(&mut tx).await?;
-
-            // Decode the active chunks for the algorithm. build_worker_assignment re-fetches the
-            // (much smaller) placed subset itself, so we don't keep a full chunk map around.
-            let mut datasets = rows::DatasetInterner::new();
-            let mut chunks_for_algo: Vec<(ChunkPk, Chunk)> = Vec::with_capacity(chunk_rows.len());
-            for row in &chunk_rows {
-                let chunk = chunk_from_row(row, datasets.intern(&row.dataset_name))?;
-                chunks_for_algo.push((row.chunk_pk, chunk));
-            }
-
             let phase::DecodedWorkers {
                 published: workers_map,
                 for_algo: workers_for_algo,
             } = phase::decode_workers(&worker_rows)?;
 
-            // The algorithm's only `Err` is infeasibility, i.e. a shortage.
             let ScheduleOutput {
-                mapping,
+                mapping: ideal_mappings,
                 replication_by_weight,
-            } = algorithm
-                .schedule(
-                    chunks_for_algo,
-                    workers_for_algo,
-                    &current_placement,
-                    config,
-                )
-                .map_err(|_| StorageError::Shortage)?;
+            } = {
+                let mut timer = PhaseTimer::new("run_scheduling_cycle:schedule");
+                let chunk_count = chunks_for_algo.len() as u64;
+                let out = algorithm
+                    .schedule(
+                        chunks_for_algo,
+                        workers_for_algo,
+                        &current_placement,
+                        config,
+                    )
+                    .map_err(|_| StorageError::Shortage)?;
+                timer.items(chunk_count);
+                out
+            };
 
-            let ideal_mappings = mapping;
+            // Open the assignment the diffs and stamps below record under.
+            let new_wa_id = phase::open_worker_assignment(&mut tx, now).await?;
 
-            let mut prev_ideal: BTreeMap<ChunkPk, std::collections::HashSet<WorkerPk>> =
-                BTreeMap::new();
-            for row in &ideal_placement_rows {
-                prev_ideal.insert(row.chunk_pk, row.worker_ids.iter().copied().collect());
-            }
-
-            let being_removed = phase::fetch_being_removed_chunks(&mut tx).await?;
-
-            phase::mint_superseded_stale_mappings(
-                &mut tx,
-                new_wa_id,
-                &prev_ideal,
-                &ideal_mappings,
-                &workers_map,
-                &being_removed,
-                batch_size,
-            )
-            .await?;
-            phase::record_routing_diffs(
-                &mut tx,
-                new_wa_id,
-                &prev_ideal,
-                &ideal_mappings,
-                batch_size,
-            )
-            .await?;
-            phase::commit_new_ideal(&mut tx, &prev_ideal, &ideal_mappings, batch_size).await?;
-            phase::resolve_flip_flops(&mut tx, &ideal_mappings, batch_size).await?;
-            phase::stamp_entered_chunks(&mut tx, new_wa_id, &ideal_mappings).await?;
+            // Stage the new ideal into the empty future twin (the only app-side marshalling left),
+            // then derive every per-cycle delta — stale mint, routing diffs, flip-flop resolution,
+            // entered stamps — and promote the twin, all as one simple-query round-trip joining the
+            // live ideal (prev) against the future ideal (new). The swap runs last in that batch, so
+            // the diffs still read the still-live prev ideal.
+            phase::write_future_ideal(&mut tx, &ideal_mappings, batch_size).await?;
+            phase::apply_deltas_and_swap(&mut tx, new_wa_id).await?;
 
             tx.commit().await.context("run_scheduling_cycle: commit")?;
 
@@ -367,9 +418,13 @@ impl SchedulerStorage for PostgresStorage {
 
             tx.commit().await.context("run_visibility_cycle: commit")?;
 
-            let chunks = phase::fetch_portal_visible_chunks(conn).await?;
-            let portal_pks: Vec<ChunkPk> = chunks.keys().copied().collect();
-            let chunk_workers = phase::fetch_confirmed_routing(conn, &portal_pks).await?;
+            let mut chunks = phase::fetch_portal_visible_chunks(conn).await?;
+            // Settle overlaps in memory over the visible set we just fetched (see
+            // `evict_portal_overlaps`), keeping the assignment disjoint without a per-promotion probe.
+            // The eviction's un-promotes are written back before the routing fetch, so its
+            // server-side visibility predicate sees the same set as `chunks`.
+            phase::evict_portal_overlaps(conn, &mut chunks).await?;
+            let chunk_workers = phase::fetch_confirmed_routing(conn).await?;
             let workers = phase::fetch_portal_workers(conn).await?;
 
             Ok::<_, StorageError>(phase::assemble_portal_assignment(
@@ -397,14 +452,15 @@ impl SchedulerStorage for PostgresStorage {
         })
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pg-testkit"))]
     fn register_correction(
         &mut self,
         old_pk: ChunkPk,
-        new_chunk: Chunk,
+        new_chunk: NewChunk,
         now: Tick,
     ) -> Result<ChunkPk, StorageError> {
-        // Implemented in `tests::correction`, alongside the other postgres test-only code.
-        self.register_correction_impl(old_pk, new_chunk, now)
+        // A batch of one; the batch API in the sibling `correction` module is the implementation.
+        let pks = self.register_corrections(vec![(old_pk, new_chunk)], now)?;
+        Ok(pks[0])
     }
 }

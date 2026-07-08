@@ -17,14 +17,14 @@ use super::utils::{
     CHUNK_SIZE, CLOCK_STEP, DATASETS, GC_TICKS, M_TICKS, WEIGHTS, WORKER_CAPACITY, WeightTable,
     chunk_from_view, mint_key, record_weights, sim_datasets, storage_chunk, trace_enabled,
 };
-use crate::scheduler_storage::algorithm::SchedulingAlgorithm;
+use crate::scheduler_storage::algorithm::{CurrentPlacement, SchedulingAlgorithm};
 use crate::scheduler_storage::in_memory::InMemoryStorage;
 use crate::scheduler_storage::test_harness::inspect::{Snapshot as RawSnapshot, StorageInspect};
 use crate::scheduler_storage::{
-    AssignmentId, ChunkPk, PortalAssignment, SchedulerStorage, StorageError, Tick,
+    AlgoChunk, AssignmentId, ChunkPk, PortalAssignment, SchedulerStorage, StorageError, Tick,
     WorkerAssignment, WorkerPk,
 };
-use crate::types::{Chunk, Worker, WorkerStatus};
+use crate::types::{DatasetSchema, Worker, WorkerStatus};
 use crate::weight::WeightStrategy;
 use proptest::statistics;
 use proptest_state_machine::iterative_runner::IterativeSutStateMachine;
@@ -296,7 +296,7 @@ pub(super) struct PooledWorker {
 /// and the worker roster. Chunk and placement state live only in the storage.
 pub(super) struct SimUnderTest<D: SimStorage> {
     storage: D,
-    algo: MultistepAlgorithm,
+    algo: MultistepAlgorithm<WeightTable>,
     /// Shared `chunk-id → weight` table — the scheduler reads it back as its `WeightStrategy`.
     weights: WeightTable,
     /// Fixed worker pool — never resized; churn flips each worker's `active`.
@@ -532,7 +532,7 @@ impl<D: SimStorage> SimUnderTest<D> {
             .map(|(i, worker)| (WorkerPk(i as i64 + 1), worker.clone()))
             .collect();
         let excluded = self.chunks_excluded_from_floor();
-        let mut chunk_pairs: Vec<(ChunkPk, Chunk)> = self
+        let mut chunk_pairs: Vec<(ChunkPk, AlgoChunk)> = self
             .storage
             .get_chunks(|_| true)
             .iter()
@@ -541,7 +541,12 @@ impl<D: SimStorage> SimUnderTest<D> {
             .collect();
         chunk_pairs.sort_by(|a, b| a.0.cmp(&b.0));
         self.algo
-            .schedule(chunk_pairs, worker_pairs, &BTreeMap::new(), &self.config)
+            .schedule(
+                chunk_pairs,
+                worker_pairs,
+                &CurrentPlacement::default(),
+                &self.config,
+            )
             .is_ok()
     }
 
@@ -846,7 +851,7 @@ impl<D: SimStorage> SimUnderTest<D> {
             .storage
             .get_chunks_metadata(|meta| {
                 (meta.marked_for_removal || meta.dropped_at_portal_assignment_id.is_some())
-                    && meta.dropped_at_worker_assignment_id.is_none()
+                    && meta.dropped_from_worker_assignment_at.is_none()
             })
             .is_empty()
     }
@@ -1305,12 +1310,18 @@ impl<D: SimStorage> SimUnderTest<D> {
 
         // Chunk inserts require their dataset to already exist.
         storage
-            .insert_new_datasets(config.datasets.clone())
+            .insert_new_datasets(
+                config
+                    .datasets
+                    .iter()
+                    .map(|name| (name.clone(), DatasetSchema::default()))
+                    .collect(),
+            )
             .expect("datasets are fresh");
 
         let weights = WeightTable::default();
         let mut sim = SimUnderTest {
-            algo: MultistepAlgorithm::new(Box::new(weights.clone())),
+            algo: MultistepAlgorithm::new(weights.clone()),
             weights,
             storage,
             workers,

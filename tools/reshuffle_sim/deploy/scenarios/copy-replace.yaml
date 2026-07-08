@@ -1,0 +1,9 @@
+# 7-step multistep exercising the copy + replace correction paths.
+# Pair with production_config.yaml and the mainnet input.
+chunks_per_step: 2000
+steps: 30
+scheduler: multistep
+copy:
+  - { src: base-mainnet, dst: base-mainnet-2, at_step: 3 }
+replace:
+  - { dataset: binance-mainnet, at_step: 5 }

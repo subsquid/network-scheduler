@@ -309,6 +309,11 @@ impl PhaseTimer {
         self.statements += 1;
         self.rows += rows;
     }
+
+    /// Add to the row count without counting a statement, so a CPU phase reports `statements = 0`.
+    pub fn items(&mut self, rows: u64) {
+        self.rows += rows;
+    }
 }
 
 impl Drop for PhaseTimer {

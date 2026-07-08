@@ -29,10 +29,7 @@ fn run_cycle_multi(
     mappings: impl IntoIterator<Item = (ChunkPk, Vec<WorkerPk>)>,
     at: TimeUnit,
 ) -> WorkerAssignment {
-    let mapping: IdealMapping = mappings
-        .into_iter()
-        .map(|(pk, ids)| (pk, ids.into_iter().collect::<HashSet<_>>()))
-        .collect();
+    let mapping: IdealMapping = mappings.into_iter().collect();
     let algorithm = StaticSchedulingAlgorithm { mapping };
     storage
         .run_scheduling_cycle(&algorithm, &(), at, GRACE_PERIOD)
@@ -180,7 +177,7 @@ fn register_correction_old_chunk_dropped_at_worker() {
         .sched_chunk_metadata
         .get_mut(&a_pk)
         .unwrap()
-        .dropped_at_worker_assignment_id = Some(1);
+        .dropped_from_worker_assignment_at = Some(1);
 
     let result = storage.register_correction_int(a_pk, chunk("a", 2, 100), 1);
     assert_matches!(result, Err(CorrectionRejected::OldChunkBeingRemoved { .. }));
@@ -406,7 +403,7 @@ fn correction_old_chunk_removed_from_worker_after_m_ticks() -> anyhow::Result<()
     assert!(
         storage
             .get_chunk_metadata_by_pk(a_pk)
-            .dropped_at_worker_assignment_id
+            .dropped_from_worker_assignment_at
             .is_none(),
         "A must NOT be tombstoned yet (< GRACE_PERIOD since portal drop)"
     );
@@ -421,9 +418,9 @@ fn correction_old_chunk_removed_from_worker_after_m_ticks() -> anyhow::Result<()
     assert!(
         storage
             .get_chunk_metadata_by_pk(a_pk)
-            .dropped_at_worker_assignment_id
+            .dropped_from_worker_assignment_at
             .is_some(),
-        "A metadata must have dropped_at_worker_assignment_id set after M_TICKS"
+        "A metadata must have dropped_from_worker_assignment_at set after M_TICKS"
     );
     Ok(())
 }

@@ -8,6 +8,7 @@ use std::collections::BTreeMap;
 use std::panic::AssertUnwindSafe;
 use std::time::{Duration, Instant};
 
+use libp2p_identity::PeerId;
 use network_scheduler::{
     cli::DatasetsConfig,
     scheduling::{ScheduledChunk, SchedulingConfig, schedule},
@@ -17,24 +18,34 @@ use network_scheduler::{
 use semver::Version;
 
 use crate::{
-    ChunkOwners,
+    ChunkOwners, WorkerIndex,
     simulation::{StepContext, StepOutcome, StepPlacement, StepScheduler},
 };
 
 pub struct StatelessScheduler {
     /// The input-file placement, used as step 1's reference.
     initial_owners: ChunkOwners,
+    /// Maps each step's placement `PeerId`s to the same compact indices used in
+    /// `initial_owners`, so owners stay comparable across steps.
+    worker_index: WorkerIndex,
 }
 
 impl StatelessScheduler {
-    pub fn new(initial_owners: ChunkOwners) -> Self {
-        Self { initial_owners }
+    pub fn new(initial_owners: ChunkOwners, worker_peer_ids: Vec<PeerId>) -> Self {
+        let mut worker_index = WorkerIndex::default();
+        for peer in worker_peer_ids {
+            worker_index.intern(peer);
+        }
+        Self {
+            initial_owners,
+            worker_index,
+        }
     }
 }
 
 impl StepScheduler for StatelessScheduler {
-    fn initial_owners(&self) -> ChunkOwners {
-        self.initial_owners.clone()
+    fn take_initial_owners(&mut self) -> ChunkOwners {
+        std::mem::take(&mut self.initial_owners)
     }
 
     fn step(&mut self, ctx: StepContext) -> anyhow::Result<StepOutcome> {
@@ -59,13 +70,14 @@ impl StepScheduler for StatelessScheduler {
             .sum();
 
         Ok(StepOutcome::Scheduled(StepPlacement {
-            owners: chunk_owners_from_assignment(&chunks, &assignment),
+            owners: chunk_owners_from_assignment(&chunks, &assignment, &mut self.worker_index),
             chunk_sizes: chunks
                 .iter()
                 .map(|c| ((c.dataset.clone(), c.id.clone()), c.size))
                 .collect(),
             replication_by_weight: assignment.replication_by_weight,
             used_capacity_bytes,
+            stale_capacity_bytes: 0,
             total_chunks: chunks.len(),
             schedule_duration,
         }))
@@ -156,16 +168,26 @@ fn run_scheduler(
     (assignment, schedule_duration)
 }
 
-fn chunk_owners_from_assignment(chunks: &[Chunk], assignment: &Assignment) -> ChunkOwners {
+fn chunk_owners_from_assignment(
+    chunks: &[Chunk],
+    assignment: &Assignment,
+    worker_index: &mut WorkerIndex,
+) -> ChunkOwners {
     let mut owners: ChunkOwners = BTreeMap::new();
     for (worker, indexes) in &assignment.worker_chunks {
+        let idx = worker_index.intern(*worker);
         for &chunk_index in indexes {
             let chunk = &chunks[chunk_index as usize];
             owners
                 .entry((chunk.dataset.clone(), chunk.id.clone()))
                 .or_default()
-                .insert(*worker);
+                .push(idx);
         }
+    }
+    // Holders are pushed in worker-iteration order; sort so `ChunkOwners`' merge-diff
+    // invariant holds. Each worker owns a chunk at most once, so no dedup is needed.
+    for holders in owners.values_mut() {
+        holders.sort_unstable();
     }
     owners
 }

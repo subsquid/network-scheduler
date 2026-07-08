@@ -18,7 +18,7 @@ mod mvcc_protocol;
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn storage_with(chunks: Vec<Chunk>) -> InMemoryStorage {
+fn storage_with(chunks: Vec<NewChunk>) -> InMemoryStorage {
     let mut storage = InMemoryStorage::default();
     let datasets: Vec<Dataset> = chunks
         .iter()
@@ -261,20 +261,20 @@ fn tombstone_respects_m_ticks_boundary() {
     let (mut storage, pk) = setup_for_tombstone(100);
 
     // elapsed = 50 < m_ticks → not tombstoned.
-    storage.tombstone_expired_chunks(42, 150, 100);
+    storage.tombstone_expired_chunks(150, 100);
     assert_none!(
         storage
             .get_chunk_metadata_by_pk(pk)
-            .dropped_at_worker_assignment_id
+            .dropped_from_worker_assignment_at
     );
 
-    // elapsed = 100 ≥ m_ticks → tombstoned.
-    storage.tombstone_expired_chunks(42, 200, 100);
+    // elapsed = 100 ≥ m_ticks → tombstoned, stamped with the drop tick.
+    storage.tombstone_expired_chunks(200, 100);
     assert_eq!(
         storage
             .get_chunk_metadata_by_pk(pk)
-            .dropped_at_worker_assignment_id,
-        Some(42)
+            .dropped_from_worker_assignment_at,
+        Some(200)
     );
 }
 
@@ -282,25 +282,25 @@ fn tombstone_respects_m_ticks_boundary() {
 fn tombstone_skips_when_now_below_m_ticks() {
     let (mut storage, pk) = setup_for_tombstone(0);
     // now < m_ticks → checked_sub fails → nothing eligible.
-    storage.tombstone_expired_chunks(42, 50, 100);
+    storage.tombstone_expired_chunks(50, 100);
     assert_none!(
         storage
             .get_chunk_metadata_by_pk(pk)
-            .dropped_at_worker_assignment_id
+            .dropped_from_worker_assignment_at
     );
 }
 
 #[test]
 fn tombstone_is_idempotent() {
     let (mut storage, pk) = setup_for_tombstone(100);
-    storage.tombstone_expired_chunks(42, 300, 100);
-    storage.tombstone_expired_chunks(99, 400, 100);
+    storage.tombstone_expired_chunks(300, 100);
+    storage.tombstone_expired_chunks(400, 100);
     assert_eq!(
         storage
             .get_chunk_metadata_by_pk(pk)
-            .dropped_at_worker_assignment_id,
-        Some(42),
-        "tombstone id should be set once and never overwritten"
+            .dropped_from_worker_assignment_at,
+        Some(300),
+        "tombstone tick should be set once and never overwritten"
     );
 }
 
@@ -322,7 +322,7 @@ fn tombstone_clears_stale_mappings_for_chunk() {
         .sched_stale_mappings
         .insert((other_pk, WorkerPk(3)), pending(1));
 
-    storage.tombstone_expired_chunks(42, 300, 100);
+    storage.tombstone_expired_chunks(300, 100);
     let tombstoned_pk = pk;
     assert!(
         storage
@@ -347,7 +347,7 @@ fn tombstone_does_not_touch_sched_ideal_chunk_workers() {
         .sched_ideal_chunk_workers
         .insert(pk, vec![WorkerPk(1), WorkerPk(2)]);
 
-    storage.tombstone_expired_chunks(42, 300, 100);
+    storage.tombstone_expired_chunks(300, 100);
     let target_pk = pk;
     let rows = storage.get_chunk_workers(|pk, _| *pk == target_pk);
     assert_eq!(rows.len(), 1);
@@ -597,10 +597,10 @@ fn run_scheduling_cycle_applies_mapping_from_algorithm() {
     let worker_id_1 = worker_ids[0];
     let worker_id_2 = worker_ids[1];
 
-    let mapping: IdealMapping = BTreeMap::from([
-        (pk_1, HashSet::from([worker_id_1, worker_id_2])),
-        (pk_2, HashSet::from([worker_id_1])),
-    ]);
+    let mapping: IdealMapping = vec![
+        (pk_1, vec![worker_id_1, worker_id_2]),
+        (pk_2, vec![worker_id_1]),
+    ];
     let algorithm = StaticSchedulingAlgorithm { mapping };
 
     let assignment = storage
@@ -647,7 +647,7 @@ fn worker_assignment_diffs_recorded_after_cycle_then_cleared_on_confirm() {
         .unwrap();
     let worker_id = workers(&storage)[0].worker_id;
 
-    let mapping: IdealMapping = BTreeMap::from([(pk_1, HashSet::from([worker_id]))]);
+    let mapping: IdealMapping = vec![(pk_1, vec![worker_id])];
     let algorithm = StaticSchedulingAlgorithm { mapping };
 
     let assignment = storage

@@ -23,6 +23,21 @@ fn replay(config: &SimConfig, actions: Vec<Action>) -> Sut {
     sim
 }
 
+/// Postgres-backed [`replay`], for captures that only reproduce against the real storage (the
+/// in-memory oracle takes a different path through the same algorithm).
+fn replay_pg(
+    config: &SimConfig,
+    actions: Vec<Action>,
+) -> SimUnderTest<crate::scheduler_storage::postgres::PostgresStorage> {
+    use crate::scheduler_storage::postgres::PostgresStorage;
+    let mut sim = SimUnderTest::<PostgresStorage>::init_test(config);
+    for action in actions {
+        sim = SimUnderTest::apply(sim, config, action);
+        SimUnderTest::check_invariants(&sim, config);
+    }
+    sim
+}
+
 /// Shared `SimConfig` baseline. Each regression overrides only the fields its property turns on
 /// via struct-update (`SimConfig { min_replication: 3, ..base_config() }`), keeping the captured
 /// configs to the dimensions that matter.
@@ -143,6 +158,58 @@ fn heavy_bonus_starves_multicopy_light_floor() {
             Action::AddChunks(vec![heavy(4, 1051823)]),
             Action::AddChunks(vec![heavy(5, 1292486)]),
             Action::AddChunks((7..=27).map(light).collect()),
+            Action::CheckConverged(ConvergenceCheck::FloorsPreemptBonuses),
+        ],
+    );
+}
+
+/// Captured from a `pg::flood_after_max_replication_converges` failure
+/// (`SIM_CASE_SEED=0387582ae5de820164ae4e80144e0fc24d5eb52b295666e57af767dd6994998f`): a harder
+/// instance of what [`heavy_bonus_starves_multicopy_light_floor`] guards. Six heavy chunks fill a
+/// 6-worker fleet (`min_replication = 2`) with bonus copies, then thirteen light chunks arrive whose
+/// floors should preempt those bonuses; instead the scheduler reports a shortage a from-scratch
+/// placement would not — incremental reconcile is weaker than scheduling from scratch.
+///
+/// `#[ignore]`d because the gap is unfixed and the oracle (`FloorsPreemptBonuses`) is correct: parked
+/// red as a TODO — fix the algorithm, not the assertion. Un-ignore once reconcile matches from-scratch.
+#[ignore = "open reconcile gap: incremental reconcile weaker than from-scratch (FloorsPreemptBonuses)"]
+#[test]
+fn flood_multicopy_light_floor_starved_by_heavy_bonus_unfixed() {
+    let config = SimConfig {
+        worker_count: 6,
+        min_replication: 2,
+        saturation: 0.95,
+        converge_is_terminal: true,
+        ..base_config()
+    };
+    let heavy =
+        |seed: u64, size: u32| new_chunk((mint_key(seed), size, 12, "s3://sim-0".to_string()));
+    let light = |seed: u64, size: u32| new_chunk((mint_key(seed), size, 1, "s3://sim-0".to_string()));
+
+    replay_pg(
+        &config,
+        vec![
+            Action::AddChunks(vec![heavy(36399, 1105773)]),
+            Action::AddChunks(vec![heavy(33442, 623516)]),
+            Action::AddChunks(vec![heavy(11818, 1771546)]),
+            Action::AddChunks(vec![heavy(12217, 1080678)]),
+            Action::AddChunks(vec![heavy(737, 1185398)]),
+            Action::AddChunks(vec![heavy(37487, 2070339)]),
+            Action::AddChunks(vec![
+                light(64477, 1747677),
+                light(5393, 1102784),
+                light(24846, 1769675),
+                light(18624, 1248314),
+                light(50146, 1792169),
+                light(32030, 2022997),
+                light(41831, 2078627),
+                light(62395, 1078324),
+                light(41638, 1963798),
+                light(63939, 2009171),
+                light(20709, 593880),
+                light(15157, 929558),
+                light(29775, 1805314),
+            ]),
             Action::CheckConverged(ConvergenceCheck::FloorsPreemptBonuses),
         ],
     );

@@ -12,7 +12,8 @@ use crate::scheduler_storage::postgres::PostgresStorage;
 use crate::scheduler_storage::test_harness::assert_portal_chunks_exact;
 use crate::scheduler_storage::test_harness::pg_harness::fresh_db;
 use crate::types::ChunkWeight;
-use crate::weight::WeightStrategy;
+use crate::types::DatasetSchema;
+use crate::weight::{SchedulingChunk, WeightStrategy};
 use proptest::prelude::*;
 use semver::Version;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -44,13 +45,14 @@ impl TestStorage for PostgresStorage {
 
 /// Fresh storage seeded with `chunks` (and their datasets); metadata is materialised by the first
 /// `run_real_cycle`, mirroring the real scheduler loop.
-fn make_storage<S: TestStorage>(chunks: Vec<Chunk>) -> S {
+fn make_storage<S: TestStorage>(chunks: Vec<NewChunk>) -> S {
     let mut storage = S::fresh();
-    let datasets: Vec<String> = chunks
+    let datasets: Vec<(String, DatasetSchema)> = chunks
         .iter()
         .map(|chunk| (*chunk.dataset).clone())
         .collect::<HashSet<_>>()
         .into_iter()
+        .map(|name| (name, DatasetSchema::default()))
         .collect();
     storage.insert_new_datasets(datasets).unwrap();
     storage.insert_new_chunks(chunks).unwrap();
@@ -66,7 +68,10 @@ fn make_storage<S: TestStorage>(chunks: Vec<Chunk>) -> S {
 struct UniformWeight;
 
 impl WeightStrategy for UniformWeight {
-    fn prepare(&self, chunks: Vec<Chunk>) -> Vec<(Chunk, ChunkWeight, Option<Version>)> {
+    fn prepare<T: SchedulingChunk>(
+        &self,
+        chunks: Vec<T>,
+    ) -> Vec<(T, ChunkWeight, Option<Version>)> {
         chunks.into_iter().map(|chunk| (chunk, 1, None)).collect()
     }
 }
@@ -86,7 +91,7 @@ fn run_real_cycle<S: SchedulerStorage>(storage: &mut S, at: TimeUnit) -> WorkerA
     storage.register_new_chunks().expect("register new chunks");
     storage
         .run_scheduling_cycle(
-            &MultistepAlgorithm::new(Box::new(UniformWeight)),
+            &MultistepAlgorithm::new(UniformWeight),
             &real_config(),
             at,
             GRACE_PERIOD,

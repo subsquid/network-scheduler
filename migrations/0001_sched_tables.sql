@@ -1,32 +1,65 @@
--- Scheduler tables. The scheduler owns only sched_*; 'datasets' and 'chunks'
--- are shared infrastructure created IF NOT EXISTS so a fresh database works,
--- while shared deployments that already have them are unaffected.
+-- Scheduler tables. The scheduler owns only sched_*; 'schemas', 'datasets' and 'chunks' are
+-- shared infrastructure, created IF NOT EXISTS. A pre-schema 'chunks' table must be recreated
+-- (WIP; no upgrade path).
 
 CREATE TABLE IF NOT EXISTS datasets (
-    id      SMALLSERIAL PRIMARY KEY,
-    name    TEXT        NOT NULL UNIQUE
+    id   SMALLSERIAL PRIMARY KEY,
+    name TEXT        NOT NULL UNIQUE
 );
+
+-- A dataset's schema (tables, fields, default fields) as jsonb, deduped per dataset by content
+-- hash. The dataset's current read schema is the row with superseded_at IS NULL; older rows are
+-- kept because chunks stay pinned to the schema they were written under.
+CREATE TABLE IF NOT EXISTS schemas (
+    id            SERIAL      PRIMARY KEY,
+    dataset_id    SMALLINT    NOT NULL REFERENCES datasets(id),
+    hash          BYTEA       NOT NULL,  -- SHA-256 of the canonical schema json
+    schema        JSONB       NOT NULL,
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    superseded_at TIMESTAMPTZ,           -- NULL = the dataset's current read schema
+    UNIQUE (dataset_id, hash),
+    UNIQUE (id, dataset_id)  -- FK target for the chunks same-dataset schema pin
+);
+
+-- At most one current (non-superseded) schema per dataset.
+CREATE UNIQUE INDEX IF NOT EXISTS schemas_one_current_per_dataset
+    ON schemas (dataset_id) WHERE superseded_at IS NULL;
 
 CREATE TABLE IF NOT EXISTS chunks (
     chunk_pk             BIGSERIAL    PRIMARY KEY,
     dataset_id           SMALLINT     NOT NULL REFERENCES datasets(id),
     chunk_id             TEXT         NOT NULL,
     size                 INT          NOT NULL,
-    files                TEXT[]       NOT NULL,
+    -- Schema the chunk was written under (the file set derives from its tables). Stamped at
+    -- insert with the dataset's current schema when the writer doesn't supply one.
+    schema_id            INTEGER      NOT NULL,
+    -- Which of schema_id's tables the chunk carries: bit i = table i in sorted-name order,
+    -- 0 = the file is legitimately absent. NULL = unknown → all present.
+    tables_present       BIT VARYING,
     first_block          BIGINT       NOT NULL,
     -- last_block - first_block; a chunk's span fits in INT, so store the delta not a second BIGINT.
     last_block_delta     INT          NOT NULL,
     last_block_hash      TEXT,
     last_block_timestamp BIGINT,
     registered_at        TIMESTAMPTZ  NOT NULL DEFAULT now(),
-    UNIQUE (dataset_id, chunk_id)
+    UNIQUE (dataset_id, chunk_id),
+    -- The pinned schema must belong to the chunk's own dataset. DB-enforced because external
+    -- clients stamp schema_id (same reasoning as chunk_corrections_same_dataset).
+    CONSTRAINT chunks_schema_same_dataset
+        FOREIGN KEY (schema_id, dataset_id) REFERENCES schemas (id, dataset_id)
 );
 
--- The non-overlap checks (registration + promotion) probe "live chunks in this dataset whose range
--- reaches up to the candidate's first block". Indexing the range end (first_block + last_block_delta)
--- makes that probe selective for tip-of-chain ingestion. See docs/nonoverlap-promotion-gate.md.
-CREATE INDEX IF NOT EXISTS chunks_dataset_last_block
-    ON chunks (dataset_id, (first_block + last_block_delta));
+-- The non-overlap probe asks "does any live chunk in this dataset overlap the candidate's range?".
+-- A btree can bound only one side of that predicate, and liveness lives in sched_chunk_metadata,
+-- invisible to any chunks index -- so btree probes degrade to O(N²) when a dataset arrives whole in
+-- one batch (no live row to early-exit on; minutes at ~150K chunks). The GiST index covers both
+-- range endpoints, so a probe touches only truly intersecting rows; btree_gist lets dataset_id
+-- lead. The probe must build the range with this exact expression to ride the index.
+CREATE EXTENSION IF NOT EXISTS btree_gist;
+CREATE INDEX IF NOT EXISTS chunks_dataset_range_gist ON chunks USING gist (
+    dataset_id,
+    int8range(first_block, first_block + last_block_delta, '[]')
+);
 
 -- One row per scheduling cycle.
 CREATE TABLE IF NOT EXISTS sched_worker_assignments (
@@ -64,7 +97,9 @@ CREATE TABLE IF NOT EXISTS sched_chunk_metadata (
     -- clock.)
     rejected                        BOOLEAN NOT NULL DEFAULT FALSE,
     dropped_at_portal_assignment_id BIGINT REFERENCES sched_portal_assignments(id),
-    dropped_at_worker_assignment_id BIGINT REFERENCES sched_worker_assignments(id)
+    -- Tick at which the chunk was tombstoned (pulled from the worker layer), m_ticks after its
+    -- portal drop. NULL = not tombstoned.
+    dropped_from_worker_assignment_at BIGINT
 );
 
 -- What the scheduler currently wants; published worker assignment = this ∪ sched_stale_mappings.
@@ -73,9 +108,21 @@ CREATE TABLE IF NOT EXISTS sched_ideal_chunk_workers (
     worker_ids  BIGINT[] NOT NULL
 );
 
+-- Twin of sched_ideal_chunk_workers. run_scheduling_cycle stages the freshly computed ideal here,
+-- derives the per-cycle stale/diff/flip-flop deltas by set-joining the live ideal against it
+-- (server-side, no app-side diffing), then rename-swaps the two tables. The swap leaves this table
+-- empty and sched_ideal_chunk_workers holding the new placement, ready for the next cycle.
+--
+-- Structure must stay identical to sched_ideal_chunk_workers: after a swap this table *is* the old
+-- ideal (and vice versa), so both need the same PK + chunks FK to remain a valid drop-in.
+CREATE TABLE IF NOT EXISTS sched_future_ideal_chunk_workers (
+    chunk_pk    BIGINT   PRIMARY KEY, -- deliberately do not reference chunks
+    worker_ids  BIGINT[] NOT NULL
+);
+
 -- What portals route by; lags the ideal until the confirmation watermark advances.
 CREATE TABLE IF NOT EXISTS sched_confirmed_chunk_workers (
-    chunk_pk    BIGINT   PRIMARY KEY REFERENCES chunks(chunk_pk),
+    chunk_pk    BIGINT   PRIMARY KEY, -- deliberately do not reference chunks
     worker_ids  BIGINT[] NOT NULL
 );
 
@@ -102,7 +149,21 @@ CREATE INDEX IF NOT EXISTS sched_stale_mappings_worker_id
 CREATE INDEX IF NOT EXISTS sched_chunk_metadata_portal_drop
     ON sched_chunk_metadata (dropped_at_portal_assignment_id)
     WHERE dropped_at_portal_assignment_id IS NOT NULL
-      AND dropped_at_worker_assignment_id IS NULL;
+      AND dropped_from_worker_assignment_at IS NULL;
+
+-- drop_marked_chunks flips every marked-but-not-yet-dropped row each visibility cycle; the
+-- predicate matches the UPDATE's, so an idle cycle is an empty index scan instead of a full
+-- metadata scan. Rows leave the index when their portal drop lands.
+CREATE INDEX IF NOT EXISTS sched_chunk_metadata_marked
+    ON sched_chunk_metadata (chunk_pk)
+    WHERE marked_for_removal IS NOT NULL
+      AND dropped_at_portal_assignment_id IS NULL;
+
+-- The tombstoned-stale cleanup deletes by "tombstoned at tick $now"; indexing the tick keeps that
+-- lookup off a full metadata scan (tombstoned rows accumulate for the table's lifetime).
+CREATE INDEX IF NOT EXISTS sched_chunk_metadata_tombstoned
+    ON sched_chunk_metadata (dropped_from_worker_assignment_at)
+    WHERE dropped_from_worker_assignment_at IS NOT NULL;
 
 -- Serves the promotion gate (visibility cycle): chunks confirmed by a worker assignment, not yet
 -- portal-visible, not dropped, not marked for removal, not rejected. The partial predicate keeps it

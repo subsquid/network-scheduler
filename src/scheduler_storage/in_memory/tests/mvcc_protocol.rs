@@ -145,7 +145,7 @@ fn chunk_migration_through_grace_period() {
         .collect();
     for meta in storage.get_chunks_metadata(|_| true) {
         let in_active = active_chunks.contains(&meta.chunk_pk);
-        let tombstoned = meta.dropped_at_worker_assignment_id.is_some();
+        let tombstoned = meta.dropped_from_worker_assignment_at.is_some();
         assert!(
             in_active ^ tombstoned,
             "chunk {:?} must be in chunk_workers XOR tombstoned \
@@ -296,7 +296,7 @@ struct Setup {
 }
 
 fn setup(num_workers: usize, num_chunks: usize) -> Setup {
-    let chunks: Vec<Chunk> = (0..num_chunks)
+    let chunks: Vec<NewChunk> = (0..num_chunks)
         .map(|i| chunk("a", (i + 1) as u32, 100))
         .collect();
     let mut storage = storage_with(chunks.clone());
@@ -337,10 +337,7 @@ fn run_cycle(
 fn ideal_mapping<'a>(
     entries: impl IntoIterator<Item = (&'a ChunkPk, Vec<WorkerPk>)>,
 ) -> IdealMapping {
-    entries
-        .into_iter()
-        .map(|(pk, ids)| (*pk, ids.into_iter().collect::<HashSet<_>>()))
-        .collect()
+    entries.into_iter().map(|(pk, ids)| (*pk, ids)).collect()
 }
 
 /// Order-insensitive view of `chunk_workers` for literal comparison. Panics on

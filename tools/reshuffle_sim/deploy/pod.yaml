@@ -1,0 +1,54 @@
+# One-shot reshuffle-sim pod: waits for $START_SIGNAL, runs the sim, tees output to the /logs PVC so
+# it survives an OOM kill. Blocking on the signal avoids racing a half-copied input. See run-pod.sh.
+#
+# limits.memory hard-caps the sim so it's OOM-killed instead of taking the node down; the /logs copy
+# outlives the kill (README: reading it).
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: reshuffle-sim-logs
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 100Mi
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: reshuffle-sim
+spec:
+  restartPolicy: Never
+  volumes:
+    - name: logs
+      persistentVolumeClaim:
+        claimName: reshuffle-sim-logs
+  containers:
+    - name: reshuffle-sim
+      # Tag defaults to latest; run-pod.sh rewrites it from $IMAGE_TAG (e.g. a 12-char commit SHA).
+      image: gcr.io/bright-meridian-316511/subsquid/reshuffle-sim:latest
+      imagePullPolicy: Always
+      resources:
+        requests:
+          cpu: "2"
+          memory: "8144M"
+        limits:
+          # Hard cap: OOM-killed past 10Gi instead of taking the node down; the /logs copy survives.
+          memory: "10Gi"
+      volumeMounts:
+        - { name: logs, mountPath: /logs }
+      env:
+        - name: DATABASE_URL
+          valueFrom:
+            secretKeyRef:
+              name: reshuffle-sim-db
+              key: url
+        # run-pod.sh copies config/profile/input into /app, then touches $START_SIGNAL to start.
+        - name: START_SIGNAL
+          value: /app/START
+        # run-pod.sh overrides per launch: full = whole run, ingest = seed and stop, resume = seeded DB.
+        - { name: SIM_MODE, value: "full" }
+        # entrypoint.sh tees stdout+stderr here, on the /logs volume so it outlives the container.
+        - { name: LOG_FILE, value: /logs/reshuffle-sim.log }
+        # pg_timing=debug: per-phase SQL timing. multistep=debug: per-step table row counts.
+        - { name: RUST_LOG, value: "error,pg_timing=debug,reshuffle_sim::multistep=debug" }

@@ -1,5 +1,4 @@
 use std::collections::BTreeMap;
-use std::io::{IsTerminal, Write};
 use std::time::Duration;
 
 use bytesize::ByteSize;
@@ -33,9 +32,9 @@ fn format_duration(d: Duration) -> String {
 }
 
 /// Index of the first of the three "Workers" sub-columns (new / lost / shuffled).
-const WORKERS_COL: usize = 10;
+const WORKERS_COL: usize = 11;
 /// Single-value columns whose header should span both header rows.
-const SINGLE_COLS: [usize; 13] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 13, 14, 15];
+const SINGLE_COLS: [usize; 14] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 14, 15, 16];
 
 /// Builds the metrics table. The three worker counts sit under one spanning
 /// `Workers` header (`new / lost / shuffled`); other headers are stacked across
@@ -53,6 +52,7 @@ fn build_table(metrics: &[ReshuffleMetrics]) -> tabled::Table {
         "Total\ndownload",
         "Restr.\ndownload",
         "Free cap\n(used %)",
+        "Stale\n(% cap)",
         "Workers",
         "",
         "",
@@ -61,7 +61,7 @@ fn build_table(metrics: &[ReshuffleMetrics]) -> tabled::Table {
         "Sched\ntime",
     ]);
     builder.push_record([
-        "", "", "", "", "", "", "", "", "", "", "new", "lost", "shuffled", "", "", "",
+        "", "", "", "", "", "", "", "", "", "", "", "new", "lost", "shuffled", "", "", "",
     ]);
 
     for m in metrics {
@@ -71,6 +71,11 @@ fn build_table(metrics: &[ReshuffleMetrics]) -> tabled::Table {
         let free_capacity = m.total_capacity_bytes.saturating_sub(m.used_capacity_bytes);
         let used_pct = if m.total_capacity_bytes > 0 {
             m.used_capacity_bytes as f64 / m.total_capacity_bytes as f64 * 100.0
+        } else {
+            0.0
+        };
+        let stale_pct = if m.total_capacity_bytes > 0 {
+            m.stale_capacity_bytes as f64 / m.total_capacity_bytes as f64 * 100.0
         } else {
             0.0
         };
@@ -99,6 +104,7 @@ fn build_table(metrics: &[ReshuffleMetrics]) -> tabled::Table {
             ByteSize(total_download).to_string(),
             ByteSize(restricted_download).to_string(),
             format!("{} ({used_pct:.1}%)", ByteSize(free_capacity)),
+            format!("{stale_pct:.1}%"),
             dm.workers_receiving_new.to_string(),
             dm.workers_losing.to_string(),
             dm.workers_shuffled.to_string(),
@@ -120,52 +126,48 @@ fn build_table(metrics: &[ReshuffleMetrics]) -> tabled::Table {
     table
 }
 
-/// Renders the metrics table live: on a terminal it redraws the whole table in
-/// place each step (overwriting the previous render); when output is piped it
-/// renders nothing until `finish`, which prints the table once.
-pub struct LiveTable {
-    is_tty: bool,
-    last_height: usize,
+/// One-line summary of a step, printed as it finishes. A per-step record in the log means a run
+/// killed mid-way (e.g. OOM) still shows every step it completed, not just the final table.
+pub fn print_step(m: &ReshuffleMetrics) {
+    let dm = &m.data_movement;
+    let total_download = dm.new_chunk_bytes + dm.shuffled_bytes + dm.increased_replication_bytes;
+    let free_capacity = m.total_capacity_bytes.saturating_sub(m.used_capacity_bytes);
+    let pct = |n: u64| {
+        if m.total_capacity_bytes > 0 {
+            n as f64 / m.total_capacity_bytes as f64 * 100.0
+        } else {
+            0.0
+        }
+    };
+    println!(
+        "step {} | new {} (r{}) | total {} (r{}) | download {} (new {}, shuffled {}/{}, repl +{}/-{}) \
+         | free {} ({:.1}% used) | stale {:.1}% | workers +{}/-{}/{} | upgraded {} | sched {} {}",
+        m.step,
+        m.new_chunks_in_step,
+        m.new_restricted_in_step,
+        m.total_chunks,
+        m.total_restricted_chunks,
+        ByteSize(total_download),
+        ByteSize(dm.new_chunk_bytes),
+        dm.shuffled_count,
+        ByteSize(dm.shuffled_bytes),
+        ByteSize(dm.increased_replication_bytes),
+        ByteSize(dm.decreased_replication_bytes),
+        ByteSize(free_capacity),
+        pct(m.used_capacity_bytes),
+        pct(m.stale_capacity_bytes),
+        dm.workers_receiving_new,
+        dm.workers_losing,
+        dm.workers_shuffled,
+        m.eligible_workers,
+        if m.scheduled { "yes" } else { "NO" },
+        format_duration(m.schedule_duration),
+    );
 }
 
-impl Default for LiveTable {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl LiveTable {
-    pub fn new() -> Self {
-        Self {
-            is_tty: std::io::stdout().is_terminal(),
-            last_height: 0,
-        }
-    }
-
-    /// Redraws the table in place for the steps collected so far. No-op when
-    /// output isn't a terminal (deferred to `finish`).
-    pub fn update(&mut self, metrics: &[ReshuffleMetrics]) {
-        if !self.is_tty {
-            return;
-        }
-        let rendered = build_table(metrics).to_string();
-        let mut stdout = std::io::stdout();
-        if self.last_height > 0 {
-            // Move to the first line of the previous render, then clear downward.
-            let _ = write!(stdout, "\x1b[{}F\x1b[0J", self.last_height);
-        }
-        let _ = writeln!(stdout, "{rendered}");
-        let _ = stdout.flush();
-        self.last_height = rendered.lines().count();
-    }
-
-    /// Prints the final table once when output isn't a terminal (it was already
-    /// drawn live otherwise).
-    pub fn finish(&self, metrics: &[ReshuffleMetrics]) {
-        if !self.is_tty {
-            println!("{}", build_table(metrics));
-        }
-    }
+/// Prints the full metrics table once — the end-of-run summary.
+pub fn print_table(metrics: &[ReshuffleMetrics]) {
+    println!("{}", build_table(metrics));
 }
 
 #[cfg(test)]

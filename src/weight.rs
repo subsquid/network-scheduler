@@ -1,26 +1,56 @@
+use std::ops::RangeInclusive;
+use std::sync::Arc;
+
 use itertools::Itertools;
 
 use semver::Version;
 
 use crate::cli::{DatasetSegmentConfig, DatasetsConfig};
 use crate::metrics::{self, DatasetSegmentStats};
-use crate::types::{Chunk, ChunkWeight};
+use crate::types::{BlockNumber, Chunk, ChunkWeight};
+
+/// The scheduling algorithms' view of a chunk.
+pub trait SchedulingChunk {
+    fn dataset(&self) -> &Arc<String>;
+    fn id(&self) -> &Arc<String>;
+    fn blocks(&self) -> &RangeInclusive<BlockNumber>;
+    fn size(&self) -> u32;
+    fn bucket(&self) -> &str {
+        self.dataset().strip_prefix("s3://").unwrap()
+    }
+}
+
+impl SchedulingChunk for Chunk {
+    fn dataset(&self) -> &Arc<String> {
+        &self.dataset
+    }
+    fn id(&self) -> &Arc<String> {
+        &self.id
+    }
+    fn blocks(&self) -> &RangeInclusive<BlockNumber> {
+        &self.blocks
+    }
+    fn size(&self) -> u32 {
+        self.size
+    }
+}
 
 /// Assigns each chunk its replication weight (and the minimum worker version that may hold it),
 /// dropping any chunk the strategy doesn't cover. This is the one seam through which the scheduler
 /// learns how heavily to replicate a chunk; production drives it from the [`DatasetsConfig`] (weight
 /// by block-range segment), while tests can supply their own mapping.
 pub trait WeightStrategy {
-    fn prepare(&self, chunks: Vec<Chunk>) -> Vec<(Chunk, ChunkWeight, Option<Version>)>;
+    fn prepare<T: SchedulingChunk>(&self, chunks: Vec<T>)
+    -> Vec<(T, ChunkWeight, Option<Version>)>;
 }
 
 /// Thin free-function form of [`WeightStrategy::prepare`], so call sites read as
 /// `prepare_chunks(chunks, &strategy)`. A [`DatasetsConfig`] is itself a [`WeightStrategy`], so the
 /// production call sites pass `&config.datasets` unchanged.
-pub fn prepare_chunks(
-    chunks: Vec<Chunk>,
+pub fn prepare_chunks<T: SchedulingChunk>(
+    chunks: Vec<T>,
     strategy: &impl WeightStrategy,
-) -> Vec<(Chunk, ChunkWeight, Option<Version>)> {
+) -> Vec<(T, ChunkWeight, Option<Version>)> {
     strategy.prepare(chunks)
 }
 
@@ -28,18 +58,21 @@ pub fn prepare_chunks(
 /// takes the weight of the block-range segment its first block falls in (chunks before the first
 /// segment are dropped). Also emits per-segment chunk/size metrics.
 impl WeightStrategy for DatasetsConfig {
-    fn prepare(&self, chunks: Vec<Chunk>) -> Vec<(Chunk, ChunkWeight, Option<Version>)> {
+    fn prepare<T: SchedulingChunk>(
+        &self,
+        chunks: Vec<T>,
+    ) -> Vec<(T, ChunkWeight, Option<Version>)> {
         debug_assert!(
-            chunks.is_sorted_by(
-                |a, b| (&a.dataset, a.blocks.start()) <= (&b.dataset, b.blocks.start())
-            ),
+            chunks.is_sorted_by(|a, b| {
+                (a.dataset(), a.blocks().start()) <= (b.dataset(), b.blocks().start())
+            }),
             "prepare: chunks must be sorted by (dataset, block)"
         );
         let mut prepared = Vec::with_capacity(chunks.len());
-        for (dataset, chunks) in &chunks.into_iter().chunk_by(|chunk| chunk.dataset.clone()) {
+        for (dataset, chunks) in &chunks.into_iter().chunk_by(|chunk| chunk.dataset().clone()) {
             let chunks = chunks.collect_vec();
             let bucket = chunks[0].bucket();
-            let last_block = *chunks.last().unwrap().blocks.end();
+            let last_block = *chunks.last().unwrap().blocks().end();
             let segments = to_absolute_blocks(&self[bucket], last_block);
 
             let mut cur = 0;
@@ -47,7 +80,8 @@ impl WeightStrategy for DatasetsConfig {
             let mut segment_size = 0;
             let mut stats = Vec::new();
             for chunk in chunks {
-                while cur + 1 < segments.len() && chunk.blocks.start() >= &segments[cur + 1].from {
+                while cur + 1 < segments.len() && chunk.blocks().start() >= &segments[cur + 1].from
+                {
                     stats.push(DatasetSegmentStats {
                         from: segments[cur].original_from,
                         num_chunks: segment_chunks,
@@ -59,9 +93,9 @@ impl WeightStrategy for DatasetsConfig {
                     cur += 1;
                 }
 
-                if chunk.blocks.start() >= &segments[cur].from {
+                if chunk.blocks().start() >= &segments[cur].from {
                     segment_chunks += 1;
-                    segment_size += chunk.size as u64;
+                    segment_size += chunk.size() as u64;
                     prepared.push((
                         chunk,
                         segments[cur].weight,

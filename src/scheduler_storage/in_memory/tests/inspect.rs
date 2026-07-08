@@ -23,7 +23,7 @@ impl StorageInspect for InMemoryStorage {
                     marked_for_removal: meta.marked_for_removal,
                     rejected: meta.rejected,
                     dropped_at_portal_assignment_id: meta.dropped_at_portal_assignment_id,
-                    dropped_at_worker_assignment_id: meta.dropped_at_worker_assignment_id,
+                    dropped_from_worker_assignment_at: meta.dropped_from_worker_assignment_at,
                 };
                 filter(&view).then_some(view)
             })

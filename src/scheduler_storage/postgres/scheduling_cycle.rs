@@ -1,23 +1,46 @@
 //! Phase helpers for [`PostgresStorage::run_scheduling_cycle`], run inside the
 //! cycle's transaction, plus the post-commit [`build_worker_assignment`] read.
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::BTreeMap;
 
 use anyhow::{Context, Result};
+use futures::TryStreamExt;
 use semver::Version;
 use sqlx::postgres::PgConnection;
-use sqlx::{Postgres, Row, Transaction};
+use sqlx::{Postgres, Transaction};
 
 use crate::metrics::{PhaseTimer, Timer};
+use crate::scheduler_storage::algorithm::CurrentPlacement;
 use crate::scheduler_storage::{
-    AssignmentId, AssignmentWorker, ChunkPk, WorkerAssignment, WorkerPk,
+    AlgoChunk, AssignmentId, AssignmentWorker, ChunkPk, WorkerAssignment, WorkerAssignmentChunk,
+    WorkerPk,
 };
-use crate::types::{Chunk, Worker};
+use crate::types::Worker;
 
 use super::rows::{
-    ChunkRow, DatasetInterner, IdealChunkWorkersRow, StaleWorkerRow, WorkerRow,
+    ActiveChunkRow, AlgoChunkRow, DatasetInterner, WorkerRow, algo_chunk_from_row,
     assignment_worker_from_row, chunk_from_row, tick_to_i64,
 };
+
+/// Per-chunk stale holders aggregated once, for `LEFT JOIN stale_agg st` — pairs with
+/// [`PLACEMENT_MERGE`].
+const STALE_AGG_CTE: &str = "\
+        WITH stale_agg AS (
+            SELECT chunk_pk, array_agg(worker_id) AS extra
+            FROM sched_stale_mappings
+            GROUP BY chunk_pk
+        )";
+
+/// Placement = ideal ∪ stale. The ideal already stores each chunk's holders as a (sorted) array,
+/// so it passes through untouched; only chunks that actually have a stale row pay the unnest+merge
+/// — the whole ideal isn't decomposed and re-aggregated every read.
+const PLACEMENT_MERGE: &str = "\
+               CASE
+                   WHEN st.extra IS NULL THEN i.worker_ids
+                   WHEN i.worker_ids IS NULL
+                       THEN (SELECT array_agg(DISTINCT v ORDER BY v) FROM unnest(st.extra) AS v)
+                   ELSE (SELECT array_agg(DISTINCT v ORDER BY v) FROM unnest(i.worker_ids || st.extra) AS v)
+               END AS worker_ids";
 
 pub(super) async fn open_worker_assignment(
     tx: &mut Transaction<'_, Postgres>,
@@ -35,10 +58,9 @@ pub(super) async fn open_worker_assignment(
     Ok(id)
 }
 
-/// Tombstone chunks whose portal-drop landed at least `m_ticks` ago.
+/// Tombstone chunks whose portal-drop landed at least `m_ticks` ago, stamping the drop tick.
 pub(super) async fn tombstone_expired_chunks(
     tx: &mut Transaction<'_, Postgres>,
-    new_wa_id: AssignmentId,
     now: u64,
     m_ticks: u64,
 ) -> Result<()> {
@@ -46,16 +68,15 @@ pub(super) async fn tombstone_expired_chunks(
     let res = sqlx::query(
         r#"
         UPDATE sched_chunk_metadata
-        SET dropped_at_worker_assignment_id = $1
+        SET dropped_from_worker_assignment_at = $1
         WHERE dropped_at_portal_assignment_id IS NOT NULL
-          AND dropped_at_worker_assignment_id IS NULL
+          AND dropped_from_worker_assignment_at IS NULL
           AND dropped_at_portal_assignment_id IN (
               SELECT id FROM sched_portal_assignments
-              WHERE created_at <= $2 - $3
+              WHERE created_at <= $1 - $2
           )
         "#,
     )
-    .bind(new_wa_id)
     .bind(tick_to_i64(now))
     .bind(tick_to_i64(m_ticks))
     .execute(&mut **tx)
@@ -66,10 +87,14 @@ pub(super) async fn tombstone_expired_chunks(
     // Drop tombstoned chunks' stale mappings. A removed chunk's stale never drains (its
     // superseded_at_worker assignment is never confirmed, so it's never dropped_at_portal/expired);
     // left behind it counts in `ideal ∪ stale` and overcommits a worker. Mirrors the in-memory oracle.
+    // Scoped to chunks tombstoned *this* cycle (the UPDATE above stamped them with $1): prior
+    // cycles already dropped their tombstoned chunks' stale in this same transaction, so the
+    // all-time `IS NOT NULL` set would re-scan every previously tombstoned chunk, every cycle.
     let res = sqlx::query(
         "DELETE FROM sched_stale_mappings WHERE chunk_pk IN \
-         (SELECT chunk_pk FROM sched_chunk_metadata WHERE dropped_at_worker_assignment_id IS NOT NULL)",
+         (SELECT chunk_pk FROM sched_chunk_metadata WHERE dropped_from_worker_assignment_at = $1)",
     )
+    .bind(tick_to_i64(now))
     .execute(&mut **tx)
     .await
     .context("run_scheduling_cycle: drop tombstoned stale mappings")?;
@@ -103,79 +128,50 @@ pub(super) async fn expire_drained_stale_mappings(
     Ok(())
 }
 
-pub(super) async fn fetch_ideal_placement_rows(
+/// Active (not tombstoned/rejected) chunks decoded straight into the algorithm's inputs: the
+/// chunks in (dataset, block) order plus the placement map (ideal ∪ stale; entries only for
+/// placed chunks). Streamed — a buffered row Vec was ~1 GB at 6M chunks.
+pub(super) async fn fetch_active_chunks_with_placement(
     tx: &mut Transaction<'_, Postgres>,
-) -> Result<Vec<IdealChunkWorkersRow>> {
-    let mut timer = PhaseTimer::new("run_scheduling_cycle:fetch_ideal_placement_rows");
-    let rows: Vec<IdealChunkWorkersRow> =
-        sqlx::query_as("SELECT chunk_pk, worker_ids FROM sched_ideal_chunk_workers")
-            .fetch_all(&mut **tx)
-            .await
-            .context("run_scheduling_cycle: fetch ideal placement")?;
-    timer.stmt(rows.len() as u64);
-    Ok(rows)
-}
-
-pub(super) async fn fetch_stale_placement_rows(
-    tx: &mut Transaction<'_, Postgres>,
-) -> Result<Vec<StaleWorkerRow>> {
-    let mut timer = PhaseTimer::new("run_scheduling_cycle:fetch_stale_placement_rows");
-    let rows: Vec<StaleWorkerRow> =
-        sqlx::query_as("SELECT chunk_pk, worker_id FROM sched_stale_mappings")
-            .fetch_all(&mut **tx)
-            .await
-            .context("run_scheduling_cycle: fetch stale placement")?;
-    timer.stmt(rows.len() as u64);
-    Ok(rows)
-}
-
-/// Union of ideal and stale holders per chunk — the placement handed to the algorithm.
-pub(super) fn merge_current_placement(
-    ideal_rows: &[IdealChunkWorkersRow],
-    stale_rows: &[StaleWorkerRow],
-) -> BTreeMap<ChunkPk, Vec<WorkerPk>> {
-    let _timer = Timer::new("run_scheduling_cycle:merge_current_placement");
-    let mut placement_set: BTreeMap<ChunkPk, BTreeSet<WorkerPk>> = BTreeMap::new();
-    for row in ideal_rows {
-        placement_set
-            .entry(row.chunk_pk)
-            .or_default()
-            .extend(row.worker_ids.iter().copied());
-    }
-    for row in stale_rows {
-        placement_set
-            .entry(row.chunk_pk)
-            .or_default()
-            .insert(row.worker_id);
-    }
-    placement_set
-        .into_iter()
-        .map(|(chunk_pk, holders)| (chunk_pk, holders.into_iter().collect()))
-        .collect()
-}
-
-/// Active = not tombstoned.
-pub(super) async fn fetch_active_chunks(
-    tx: &mut Transaction<'_, Postgres>,
-) -> Result<Vec<ChunkRow>> {
-    let mut timer = PhaseTimer::new("run_scheduling_cycle:fetch_active_chunks");
-    let rows: Vec<ChunkRow> = sqlx::query_as(
+) -> Result<(Vec<(ChunkPk, AlgoChunk)>, CurrentPlacement)> {
+    let mut timer = PhaseTimer::new("run_scheduling_cycle:fetch_active_chunks_with_placement");
+    let sql = format!(
         r#"
-        SELECT c.chunk_pk, d.name AS dataset_name, c.chunk_id, c.size, c.files,
-               c.first_block, c.last_block_delta
+        {STALE_AGG_CTE}
+        SELECT c.chunk_pk, d.name AS dataset_name, c.chunk_id, c.size,
+               c.first_block, c.last_block_delta,
+               {PLACEMENT_MERGE}
         FROM chunks c
         JOIN datasets d ON d.id = c.dataset_id
         JOIN sched_chunk_metadata s ON s.chunk_pk = c.chunk_pk
-        WHERE s.dropped_at_worker_assignment_id IS NULL
+        LEFT JOIN sched_ideal_chunk_workers i ON i.chunk_pk = c.chunk_pk
+        LEFT JOIN stale_agg st ON st.chunk_pk = c.chunk_pk
+        WHERE s.dropped_from_worker_assignment_at IS NULL
           AND NOT s.rejected
         ORDER by (d.name, c.first_block)
-        "#,
-    )
-    .fetch_all(&mut **tx)
-    .await
-    .context("run_scheduling_cycle: fetch active chunks")?;
-    timer.stmt(rows.len() as u64);
-    Ok(rows)
+        "#
+    );
+    let mut stream = sqlx::query_as::<_, AlgoChunkRow>(sqlx::AssertSqlSafe(sql)).fetch(&mut **tx);
+
+    let mut datasets = DatasetInterner::new();
+    let mut chunks_for_algo: Vec<(ChunkPk, AlgoChunk)> = Vec::new();
+    let mut current_placement = CurrentPlacement::default();
+    let mut count = 0u64;
+    while let Some(mut row) = stream
+        .try_next()
+        .await
+        .context("run_scheduling_cycle: fetch active chunks with placement")?
+    {
+        let dataset = datasets.intern(&row.dataset_name);
+        let pk = row.chunk_pk;
+        if let Some(holders) = row.worker_ids.take() {
+            current_placement.insert(pk, holders);
+        }
+        chunks_for_algo.push((pk, algo_chunk_from_row(row, dataset)));
+        count += 1;
+    }
+    timer.stmt(count);
+    Ok((chunks_for_algo, current_placement))
 }
 
 pub(super) async fn fetch_workers(tx: &mut Transaction<'_, Postgres>) -> Result<Vec<WorkerRow>> {
@@ -189,249 +185,134 @@ pub(super) async fn fetch_workers(tx: &mut Transaction<'_, Postgres>) -> Result<
     Ok(rows)
 }
 
-/// Chunks with a pending portal-drop; skipped when minting stale mappings.
-pub(super) async fn fetch_being_removed_chunks(
-    tx: &mut Transaction<'_, Postgres>,
-) -> Result<HashSet<ChunkPk>> {
-    let mut timer = PhaseTimer::new("run_scheduling_cycle:fetch_being_removed_chunks");
-    let being_removed_rows = sqlx::query(
-        "SELECT chunk_pk FROM sched_chunk_metadata WHERE dropped_at_portal_assignment_id IS NOT NULL",
-    )
-    .fetch_all(&mut **tx)
-    .await
-    .context("run_scheduling_cycle: fetch being-removed chunks")?;
-    timer.stmt(being_removed_rows.len() as u64);
-    Ok(being_removed_rows
-        .iter()
-        .map(|row| row.get::<ChunkPk, _>("chunk_pk"))
-        .collect())
-}
-
-/// Mint pending stale mappings for `(chunk, worker)` pairs dropped from the
-/// ideal but still holding a draining copy.
-pub(super) async fn mint_superseded_stale_mappings(
+/// Apply all four post-write deltas and promote the new ideal as a single simple-query batch — one
+/// round-trip instead of eight. The statements run sequentially inside the cycle transaction (each
+/// sees the previous one's effects, exactly as when they were separate calls), and the swap is
+/// textually last so the diff/stale statements still read the live (pre-swap) ideal. The phases are
+/// mutually independent — disjoint rows, different target tables — so batching them changes nothing
+/// but the round-trip count; see [`SQL_DELTAS_AND_SWAP`] for the per-section semantics.
+///
+/// The simple protocol takes no bind parameters, so `new_wa_id` (a value we mint, never user input)
+/// is substituted in as a literal — `AssertSqlSafe` acknowledges that. `execute` sums `rows_affected`
+/// across the batch, so the timer still reports the rows touched, just not split per phase.
+pub(super) async fn apply_deltas_and_swap(
     tx: &mut Transaction<'_, Postgres>,
     new_wa_id: AssignmentId,
-    prev_ideal: &BTreeMap<ChunkPk, HashSet<WorkerPk>>,
-    ideal_mappings: &BTreeMap<ChunkPk, HashSet<WorkerPk>>,
-    workers_map: &BTreeMap<WorkerPk, AssignmentWorker>,
-    being_removed: &HashSet<ChunkPk>,
-    batch_size: usize,
 ) -> Result<()> {
-    let mut timer = PhaseTimer::new("run_scheduling_cycle:mint_superseded_stale_mappings");
-    // Survivors: a chunk's previous holders that are still a known worker and dropped from the new
-    // ideal (a worker GC'd from sched_workers holds no draining copy, and a stale row for it would
-    // break the worker_id FK and abort the cycle). Chunks on their way out are skipped.
-    let mut entries: Vec<(ChunkPk, Vec<WorkerPk>)> = Vec::new();
-    for (chunk_pk, prev_workers) in prev_ideal {
-        if being_removed.contains(chunk_pk) {
-            continue;
-        }
-        let new_workers = ideal_mappings.get(chunk_pk);
-        let survivors: Vec<WorkerPk> = prev_workers
-            .iter()
-            .copied()
-            .filter(|w| workers_map.contains_key(w))
-            .filter(|w| !new_workers.is_some_and(|holders| holders.contains(w)))
-            .collect();
-        if !survivors.is_empty() {
-            entries.push((*chunk_pk, survivors));
-        }
-    }
-    for window in entries.chunks(batch_size) {
-        let pairs: usize = window.iter().map(|(_, w)| w.len()).sum();
-        let mut chunk_pks: Vec<ChunkPk> = Vec::with_capacity(pairs);
-        let mut worker_ids: Vec<WorkerPk> = Vec::with_capacity(pairs);
-        for (chunk_pk, holders) in window {
-            for &worker_id in holders {
-                chunk_pks.push(*chunk_pk);
-                worker_ids.push(worker_id);
-            }
-        }
-        let res = sqlx::query(
-            r#"
-            INSERT INTO sched_stale_mappings (chunk_pk, worker_id, superseded_at_worker_assignment_id)
-            SELECT chunk_pk, worker_id, $3
-            FROM UNNEST($1::bigint[], $2::bigint[]) AS p(chunk_pk, worker_id)
-            ON CONFLICT (chunk_pk, worker_id) DO NOTHING
-            "#,
-        )
-        .bind(&chunk_pks)
-        .bind(&worker_ids)
-        .bind(new_wa_id)
+    let mut timer = PhaseTimer::new("run_scheduling_cycle:apply_deltas_and_swap");
+    let sql = SQL_DELTAS_AND_SWAP.replace("$WA", &new_wa_id.to_string());
+    let res = sqlx::raw_sql(sqlx::AssertSqlSafe(sql))
         .execute(&mut **tx)
         .await
-        .context("run_scheduling_cycle: mint stale mappings")?;
-        timer.stmt(res.rows_affected());
-    }
-    Ok(())
-}
-
-/// Record routing diffs: chunks whose holder set changed, plus chunks removed
-/// entirely (empty worker list).
-pub(super) async fn record_routing_diffs(
-    tx: &mut Transaction<'_, Postgres>,
-    new_wa_id: AssignmentId,
-    prev_ideal: &BTreeMap<ChunkPk, HashSet<WorkerPk>>,
-    ideal_mappings: &BTreeMap<ChunkPk, HashSet<WorkerPk>>,
-    batch_size: usize,
-) -> Result<()> {
-    // Diff'd chunks: holder set changed, or removed entirely (recorded as an empty set). `pair_*`
-    // carries the flattened holders, re-aggregated server-side.
-    let mut timer = PhaseTimer::new("run_scheduling_cycle:record_routing_diffs");
-    let empty: HashSet<WorkerPk> = HashSet::new();
-    let mut diffs: Vec<(ChunkPk, &HashSet<WorkerPk>)> = Vec::new();
-    for (chunk_pk, new_workers_set) in ideal_mappings {
-        let changed = prev_ideal.get(chunk_pk) != Some(new_workers_set);
-        if changed {
-            diffs.push((*chunk_pk, new_workers_set));
-        }
-    }
-    for chunk_pk in prev_ideal.keys() {
-        if !ideal_mappings.contains_key(chunk_pk) {
-            diffs.push((*chunk_pk, &empty));
-        }
-    }
-    for window in diffs.chunks(batch_size) {
-        let (diff_pks, pair_chunk_pks, pair_worker_ids) = flatten_holders(window);
-        let res = sqlx::query(
-            r#"
-            INSERT INTO sched_worker_assignment_diffs (worker_assignment_id, chunk_pk, worker_ids)
-            SELECT $1, d.chunk_pk, COALESCE(w.worker_ids, '{}'::bigint[])
-            FROM UNNEST($2::bigint[]) AS d(chunk_pk)
-            LEFT JOIN (
-                SELECT chunk_pk, array_agg(worker_id ORDER BY worker_id) AS worker_ids
-                FROM UNNEST($3::bigint[], $4::bigint[]) AS p(chunk_pk, worker_id)
-                GROUP BY chunk_pk
-            ) w ON w.chunk_pk = d.chunk_pk
-            "#,
-        )
-        .bind(new_wa_id)
-        .bind(&diff_pks)
-        .bind(&pair_chunk_pks)
-        .bind(&pair_worker_ids)
-        .execute(&mut **tx)
-        .await
-        .context("run_scheduling_cycle: insert routing diffs")?;
-        timer.stmt(res.rows_affected());
-    }
-    Ok(())
-}
-
-/// Commit the new ideal: upsert present chunks, delete the ones that left.
-pub(super) async fn commit_new_ideal(
-    tx: &mut Transaction<'_, Postgres>,
-    prev_ideal: &BTreeMap<ChunkPk, HashSet<WorkerPk>>,
-    ideal_mappings: &BTreeMap<ChunkPk, HashSet<WorkerPk>>,
-    batch_size: usize,
-) -> Result<()> {
-    let mut timer = PhaseTimer::new("run_scheduling_cycle:commit_new_ideal");
-
-    // Upsert in chunk windows. `chunk_pks` drives the LEFT JOIN so a chunk with an empty holder set
-    // still upserts '{}'. `IS DISTINCT FROM` skips the UPDATE when the holder set is unchanged — no
-    // dead tuple/WAL for stable chunks; correct because both sides are canonically ordered
-    // (array_agg ORDER BY worker_id), so an unchanged set compares equal.
-    let entries: Vec<(ChunkPk, &HashSet<WorkerPk>)> =
-        ideal_mappings.iter().map(|(k, v)| (*k, v)).collect();
-    for window in entries.chunks(batch_size) {
-        let (chunk_pks, pair_chunk_pks, pair_worker_ids) = flatten_holders(window);
-        let res = sqlx::query(
-            r#"
-            INSERT INTO sched_ideal_chunk_workers (chunk_pk, worker_ids)
-            SELECT c.chunk_pk, COALESCE(w.worker_ids, '{}'::bigint[])
-            FROM UNNEST($1::bigint[]) AS c(chunk_pk)
-            LEFT JOIN (
-                SELECT chunk_pk, array_agg(worker_id ORDER BY worker_id) AS worker_ids
-                FROM UNNEST($2::bigint[], $3::bigint[]) AS p(chunk_pk, worker_id)
-                GROUP BY chunk_pk
-            ) w ON w.chunk_pk = c.chunk_pk
-            ON CONFLICT (chunk_pk) DO UPDATE SET worker_ids = EXCLUDED.worker_ids
-            WHERE sched_ideal_chunk_workers.worker_ids IS DISTINCT FROM EXCLUDED.worker_ids
-            "#,
-        )
-        .bind(&chunk_pks)
-        .bind(&pair_chunk_pks)
-        .bind(&pair_worker_ids)
-        .execute(&mut **tx)
-        .await
-        .context("run_scheduling_cycle: upsert ideal")?;
-        timer.stmt(res.rows_affected());
-    }
-
-    // The table held the previous ideal; delete exactly the chunks that left it, by PK (sargable,
-    // churn-sized) — far cheaper than a `chunk_pk != ALL(<whole new ideal>)` anti-scan.
-    let removed: Vec<ChunkPk> = prev_ideal
-        .keys()
-        .filter(|pk| !ideal_mappings.contains_key(pk))
-        .copied()
-        .collect();
-    for batch in removed.chunks(batch_size) {
-        let res = sqlx::query("DELETE FROM sched_ideal_chunk_workers WHERE chunk_pk = ANY($1)")
-            .bind(batch)
-            .execute(&mut **tx)
-            .await
-            .context("run_scheduling_cycle: delete obsolete ideal")?;
-        timer.stmt(res.rows_affected());
-    }
-    Ok(())
-}
-
-/// A pair re-added to the ideal is no longer stale, so clear any stale row for
-/// it (resolves flip-flops).
-pub(super) async fn resolve_flip_flops(
-    tx: &mut Transaction<'_, Postgres>,
-    ideal_mappings: &BTreeMap<ChunkPk, HashSet<WorkerPk>>,
-    batch_size: usize,
-) -> Result<()> {
-    let mut timer = PhaseTimer::new("run_scheduling_cycle:resolve_flip_flops");
-    let entries: Vec<(ChunkPk, &HashSet<WorkerPk>)> =
-        ideal_mappings.iter().map(|(k, v)| (*k, v)).collect();
-    for window in entries.chunks(batch_size) {
-        // Only the flattened pairs matter here (the DELETE matches on (chunk_pk, worker_id)).
-        let (_, pair_chunk_pks, pair_worker_ids) = flatten_holders(window);
-        if pair_chunk_pks.is_empty() {
-            continue;
-        }
-        let res = sqlx::query(
-            r#"
-            DELETE FROM sched_stale_mappings s
-            USING UNNEST($1::bigint[], $2::bigint[]) AS p(chunk_pk, worker_id)
-            WHERE s.chunk_pk = p.chunk_pk
-              AND s.worker_id = p.worker_id
-            "#,
-        )
-        .bind(&pair_chunk_pks)
-        .bind(&pair_worker_ids)
-        .execute(&mut **tx)
-        .await
-        .context("run_scheduling_cycle: resolve flip-flops")?;
-        timer.stmt(res.rows_affected());
-    }
-    Ok(())
-}
-
-/// Stamp newly entered chunks with this assignment.
-pub(super) async fn stamp_entered_chunks(
-    tx: &mut Transaction<'_, Postgres>,
-    new_wa_id: AssignmentId,
-    ideal_mappings: &BTreeMap<ChunkPk, HashSet<WorkerPk>>,
-) -> Result<()> {
-    let mut timer = PhaseTimer::new("run_scheduling_cycle:stamp_entered_chunks");
-    let ideal_pks: Vec<ChunkPk> = ideal_mappings.keys().copied().collect();
-    let res = sqlx::query(
-        r#"
-        UPDATE sched_chunk_metadata
-        SET applied_at_worker_assignment_id = $1
-        WHERE chunk_pk = ANY($2)
-          AND applied_at_worker_assignment_id IS NULL
-        "#,
-    )
-    .bind(new_wa_id)
-    .bind(&ideal_pks)
-    .execute(&mut **tx)
-    .await
-    .context("run_scheduling_cycle: stamp entered chunks")?;
+        .context("run_scheduling_cycle: apply deltas and swap")?;
     timer.stmt(res.rows_affected());
+    Ok(())
+}
+
+/// The batch run by [`apply_deltas_and_swap`], one round-trip via the simple query protocol. `$WA`
+/// is the new worker-assignment id, substituted before execution. Sections, in execution order:
+///   1. Mint superseded stale: holders the future ideal drops that still hold a draining copy —
+///      known workers only (a GC'd worker holds nothing, and its stale row would break the FK), and
+///      not chunks mid portal-drop. `DO NOTHING` keeps any pre-existing stale row.
+///   2. Record routing diffs: chunks whose holder set changed (emit future holders) or were dropped
+///      (emit `'{}'`). Canonical arrays make `IS DISTINCT FROM` an exact set test; the arms are
+///      disjoint, so no PK conflict.
+///   3. Resolve flip-flops: a pair back in the new ideal is no longer stale.
+///   4. Stamp entered chunks: first-touch the assignment id onto chunks new to the ideal.
+///   5. Swap: truncate the old ideal, then 3-way rename so the future twin becomes live and the old
+///      one is left empty for the next cycle.
+const SQL_DELTAS_AND_SWAP: &str = r#"
+INSERT INTO sched_stale_mappings (chunk_pk, worker_id, superseded_at_worker_assignment_id)
+SELECT c.chunk_pk, u.worker_id, $WA
+FROM sched_ideal_chunk_workers c
+LEFT JOIN sched_future_ideal_chunk_workers f ON f.chunk_pk = c.chunk_pk
+CROSS JOIN LATERAL UNNEST(c.worker_ids) AS u(worker_id)
+WHERE u.worker_id <> ALL (COALESCE(f.worker_ids, '{}'::bigint[]))
+  AND EXISTS (SELECT 1 FROM sched_workers sw WHERE sw.id = u.worker_id)
+  AND NOT EXISTS (
+      SELECT 1 FROM sched_chunk_metadata m
+      WHERE m.chunk_pk = c.chunk_pk
+        AND m.dropped_at_portal_assignment_id IS NOT NULL
+  )
+ON CONFLICT (chunk_pk, worker_id) DO NOTHING;
+
+INSERT INTO sched_worker_assignment_diffs (worker_assignment_id, chunk_pk, worker_ids)
+SELECT $WA, f.chunk_pk, f.worker_ids
+FROM sched_future_ideal_chunk_workers f
+LEFT JOIN sched_ideal_chunk_workers c ON c.chunk_pk = f.chunk_pk
+WHERE f.worker_ids IS DISTINCT FROM c.worker_ids
+UNION ALL
+SELECT $WA, c.chunk_pk, '{}'::bigint[]
+FROM sched_ideal_chunk_workers c
+LEFT JOIN sched_future_ideal_chunk_workers f ON f.chunk_pk = c.chunk_pk
+WHERE f.chunk_pk IS NULL;
+
+DELETE FROM sched_stale_mappings s
+USING sched_future_ideal_chunk_workers f
+WHERE s.chunk_pk = f.chunk_pk
+  AND s.worker_id = ANY (f.worker_ids);
+
+UPDATE sched_chunk_metadata m
+SET applied_at_worker_assignment_id = $WA
+FROM sched_future_ideal_chunk_workers f
+WHERE m.chunk_pk = f.chunk_pk
+  AND m.applied_at_worker_assignment_id IS NULL;
+
+TRUNCATE sched_ideal_chunk_workers;
+ALTER TABLE sched_ideal_chunk_workers RENAME TO sched_ideal_chunk_workers__swap;
+ALTER TABLE sched_future_ideal_chunk_workers RENAME TO sched_ideal_chunk_workers;
+ALTER TABLE sched_ideal_chunk_workers__swap RENAME TO sched_future_ideal_chunk_workers;
+"#;
+
+/// Stage the freshly computed ideal into the (empty) future twin via one `COPY … FROM STDIN`: one
+/// text row per chunk. Holders arrive canonical from `invert_worker_chunks` (sorted by worker_pk,
+/// distinct), so each stored array stays canonical for next cycle's `IS DISTINCT FROM` diff against
+/// the live ideal. (The algorithm emits a chunk only once a worker holds it, so there are no
+/// empty-holder rows.)
+pub(super) async fn write_future_ideal(
+    tx: &mut Transaction<'_, Postgres>,
+    ideal_mappings: &[(ChunkPk, Vec<WorkerPk>)],
+    batch_size: usize,
+) -> Result<()> {
+    use itertools::Itertools as _;
+    use std::fmt::Write as _;
+
+    let mut timer = PhaseTimer::new("run_scheduling_cycle:write_future_ideal");
+    let mut copy = tx
+        .copy_in_raw("COPY sched_future_ideal_chunk_workers (chunk_pk, worker_ids) FROM STDIN")
+        .await
+        .context("run_scheduling_cycle: begin COPY future ideal")?;
+
+    // Text COPY in `batch_size`-row batches to bound memory: `chunk_pk \t {w1,w2,…}` per chunk.
+    // Holders arrive canonical (sorted by worker_pk, distinct) from `invert_worker_chunks`. No field
+    // holds the tab/newline/backslash that text COPY escapes, so they go out raw.
+    let mut buf = String::new();
+    for batch in &ideal_mappings.iter().chunks(batch_size) {
+        buf.clear();
+        for (chunk_pk, holders) in batch {
+            debug_assert!(
+                holders.windows(2).all(|w| w[0].0 < w[1].0),
+                "non-canonical holders for chunk {}",
+                chunk_pk.0
+            );
+            writeln!(
+                buf,
+                "{}\t{{{}}}",
+                chunk_pk.0,
+                holders.iter().map(|w| w.0).format(",")
+            )
+            .expect("writing to a String is infallible");
+        }
+        copy.send(buf.as_bytes())
+            .await
+            .context("run_scheduling_cycle: send COPY batch")?;
+    }
+
+    let rows = copy
+        .finish()
+        .await
+        .context("run_scheduling_cycle: finish COPY future ideal")?;
+    timer.stmt(rows);
     Ok(())
 }
 
@@ -479,58 +360,41 @@ pub(super) async fn build_worker_assignment(
     replication_by_weight: BTreeMap<u16, u16>,
 ) -> Result<WorkerAssignment> {
     let mut timer = PhaseTimer::new("run_scheduling_cycle:build_worker_assignment");
-    let ideal_rows: Vec<IdealChunkWorkersRow> = sqlx::query_as(
+    // The `(i … OR st …)` guard keeps only placed chunks (an active chunk the algorithm left
+    // unplaced is not published).
+    let sql = format!(
         r#"
-        SELECT i.chunk_pk, i.worker_ids
-        FROM sched_ideal_chunk_workers i
-        JOIN sched_chunk_metadata m ON m.chunk_pk = i.chunk_pk
-        WHERE m.dropped_at_worker_assignment_id IS NULL
-          AND NOT m.rejected
-        "#,
-    )
-    .fetch_all(&mut *conn)
-    .await
-    .context("build_worker_assignment: fetch ideal")?;
-    timer.stmt(ideal_rows.len() as u64);
-
-    let stale_rows: Vec<StaleWorkerRow> = sqlx::query_as(
-        r#"
-        SELECT s.chunk_pk, s.worker_id
-        FROM sched_stale_mappings s
-        JOIN sched_chunk_metadata m ON m.chunk_pk = s.chunk_pk
-        WHERE m.dropped_at_worker_assignment_id IS NULL
-          AND NOT m.rejected
-        "#,
-    )
-    .fetch_all(&mut *conn)
-    .await
-    .context("build_worker_assignment: fetch stale")?;
-    timer.stmt(stale_rows.len() as u64);
-
-    let chunk_workers = merge_current_placement(&ideal_rows, &stale_rows);
-
-    // Re-fetch only the placed chunks (bounded by the assignment, not the full active set).
-    let placed_pks: Vec<ChunkPk> = chunk_workers.keys().copied().collect();
-    let chunk_rows: Vec<ChunkRow> = sqlx::query_as(
-        r#"
-        SELECT c.chunk_pk, d.name AS dataset_name, c.chunk_id, c.size, c.files,
-               c.first_block, c.last_block_delta
-        FROM chunks c
+        {STALE_AGG_CTE}
+        SELECT c.chunk_pk, d.name AS dataset_name, c.chunk_id, c.size,
+               c.schema_id, c.tables_present,
+               c.first_block, c.last_block_delta,
+               {PLACEMENT_MERGE}
+        FROM sched_chunk_metadata m
+        JOIN chunks c ON c.chunk_pk = m.chunk_pk
         JOIN datasets d ON d.id = c.dataset_id
-        WHERE c.chunk_pk = ANY($1)
-        "#,
-    )
-    .bind(&placed_pks)
-    .fetch_all(&mut *conn)
-    .await
-    .context("build_worker_assignment: fetch placed chunks")?;
-    timer.stmt(chunk_rows.len() as u64);
+        LEFT JOIN sched_ideal_chunk_workers i ON i.chunk_pk = m.chunk_pk
+        LEFT JOIN stale_agg st ON st.chunk_pk = m.chunk_pk
+        WHERE m.dropped_from_worker_assignment_at IS NULL
+          AND NOT m.rejected
+          AND (i.chunk_pk IS NOT NULL OR st.chunk_pk IS NOT NULL)
+        "#
+    );
+    let rows: Vec<ActiveChunkRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql))
+        .fetch_all(&mut *conn)
+        .await
+        .context("build_worker_assignment: fetch placement and chunks")?;
+    timer.stmt(rows.len() as u64);
 
     let mut datasets = DatasetInterner::new();
-    let mut chunks_out: BTreeMap<ChunkPk, Chunk> = BTreeMap::new();
-    for row in &chunk_rows {
-        let chunk = chunk_from_row(row, datasets.intern(&row.dataset_name))?;
-        chunks_out.insert(row.chunk_pk, chunk);
+    let mut chunk_workers: BTreeMap<ChunkPk, Vec<WorkerPk>> = BTreeMap::new();
+    let mut chunks_out: BTreeMap<ChunkPk, WorkerAssignmentChunk> = BTreeMap::new();
+    for ActiveChunkRow { chunk, worker_ids } in rows {
+        let pk = chunk.chunk_pk;
+        let dataset = datasets.intern(&chunk.dataset_name);
+        chunks_out.insert(pk, chunk_from_row(chunk, dataset));
+        // Placement drives the join, so worker_ids is always present; the default just guards a
+        // NULL we never expect instead of panicking.
+        chunk_workers.insert(pk, worker_ids.unwrap_or_default());
     }
 
     Ok(WorkerAssignment {
@@ -540,24 +404,4 @@ pub(super) async fn build_worker_assignment(
         workers: workers.clone(),
         replication_by_weight,
     })
-}
-
-/// Flatten one window of `(chunk_pk, holders)` into the parallel arrays the full-ideal write phases
-/// bind: the distinct chunk pks, plus the `(chunk_pk, worker_id)` pairs (each worker repeated under
-/// its chunk).
-fn flatten_holders(
-    window: &[(ChunkPk, &HashSet<WorkerPk>)],
-) -> (Vec<ChunkPk>, Vec<ChunkPk>, Vec<WorkerPk>) {
-    let pairs: usize = window.iter().map(|(_, holders)| holders.len()).sum();
-    let mut chunk_pks = Vec::with_capacity(window.len());
-    let mut pair_chunk_pks = Vec::with_capacity(pairs);
-    let mut pair_worker_ids = Vec::with_capacity(pairs);
-    for &(chunk_pk, holders) in window {
-        chunk_pks.push(chunk_pk);
-        for &worker_id in holders {
-            pair_chunk_pks.push(chunk_pk);
-            pair_worker_ids.push(worker_id);
-        }
-    }
-    (chunk_pks, pair_chunk_pks, pair_worker_ids)
 }

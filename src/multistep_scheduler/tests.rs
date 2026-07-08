@@ -7,6 +7,7 @@ use libp2p_identity::PeerId;
 use semver::Version;
 
 use super::{ScheduledChunk, SchedulingConfig, schedule};
+use crate::rings::WorkerRingCache;
 use crate::{
     tests::input::{TestChunks, generate_input, generate_workers},
     types::{Assignment, Worker, WorkerIndex, WorkerStatus},
@@ -106,9 +107,16 @@ fn idempotent_when_fed_its_own_output() {
     };
     let n = chunks.len();
 
-    let a = schedule(&chunks, &workers, config.clone(), &empty(n)).unwrap();
+    let a = schedule(&chunks, &workers, &config, &empty(n), &mut WorkerRingCache::default()).unwrap();
     let cur = chunk_to_peers(&a, n);
-    let b = schedule(&chunks, &workers, config, &to_positions(&cur, &workers)).unwrap();
+    let b = schedule(
+        &chunks,
+        &workers,
+        &config,
+        &to_positions(&cur, &workers),
+        &mut WorkerRingCache::default(),
+    )
+    .unwrap();
 
     assert_eq!(
         a, b,
@@ -130,9 +138,9 @@ fn deterministic_across_worker_order() {
     };
     let n = chunks.len();
 
-    let a = schedule(&chunks, &workers, config.clone(), &empty(n)).unwrap();
+    let a = schedule(&chunks, &workers, &config, &empty(n), &mut WorkerRingCache::default()).unwrap();
     workers.reverse();
-    let b = schedule(&chunks, &workers, config, &empty(n)).unwrap();
+    let b = schedule(&chunks, &workers, &config, &empty(n), &mut WorkerRingCache::default()).unwrap();
 
     assert_eq!(
         a, b,
@@ -156,11 +164,25 @@ fn migration_keeps_floor_and_never_overcommits() {
         ignore_reliability: true,
     };
 
-    let a = schedule(&chunks, &all[..60], config.clone(), &empty(n)).unwrap();
+    let a = schedule(
+        &chunks,
+        &all[..60],
+        &config,
+        &empty(n),
+        &mut WorkerRingCache::default(),
+    )
+    .unwrap();
     let cur = chunk_to_peers(&a, n);
 
     // 20 fresh workers join, shifting the ideal.
-    let b = schedule(&chunks, &all[..80], config, &to_positions(&cur, &all[..80])).unwrap();
+    let b = schedule(
+        &chunks,
+        &all[..80],
+        &config,
+        &to_positions(&cur, &all[..80]),
+        &mut WorkerRingCache::default(),
+    )
+    .unwrap();
 
     // Invariant 4: every existing chunk keeps >= min(MIN, |current|) current copies.
     let b_holders = b.chunk_holders(n);
@@ -199,7 +221,14 @@ fn converges_to_a_fixed_point_staying_above_floor() {
     };
 
     // Settle on 50 workers, then 20 join — sustained migration.
-    let settled = schedule(&chunks, &all[..50], config.clone(), &empty(n)).unwrap();
+    let settled = schedule(
+        &chunks,
+        &all[..50],
+        &config,
+        &empty(n),
+        &mut WorkerRingCache::default(),
+    )
+    .unwrap();
     let mut cur = chunk_to_peers(&settled, n);
 
     let mut prev: Option<Assignment> = None;
@@ -208,8 +237,9 @@ fn converges_to_a_fixed_point_staying_above_floor() {
         let next = schedule(
             &chunks,
             &all[..70],
-            config.clone(),
+            &config,
             &to_positions(&cur, &all[..70]),
+            &mut WorkerRingCache::default(),
         )
         .unwrap();
 
@@ -278,7 +308,14 @@ fn new_chunk_excluded_when_floor_unreachable() {
         ignore_reliability: true,
     };
 
-    let a = schedule(&chunks, &workers, config, &to_positions(&current, &workers)).unwrap();
+    let a = schedule(
+        &chunks,
+        &workers,
+        &config,
+        &to_positions(&current, &workers),
+        &mut WorkerRingCache::default(),
+    )
+    .unwrap();
     let h = a.chunk_holders(n);
 
     assert_eq!(
@@ -309,7 +346,7 @@ fn draining_copies_do_not_accumulate() {
         ignore_reliability: true,
     };
 
-    let ideal = schedule(&chunks, &workers, config.clone(), &empty(n)).unwrap();
+    let ideal = schedule(&chunks, &workers, &config, &empty(n), &mut WorkerRingCache::default()).unwrap();
     let ideal_holders = ideal.chunk_holders(n);
 
     // `current` = ideal plus one extra (draining) copy per chunk on a non-holder.
@@ -323,7 +360,14 @@ fn draining_copies_do_not_accumulate() {
         }
     }
 
-    let out = schedule(&chunks, &workers, config, &to_positions(&current, &workers)).unwrap();
+    let out = schedule(
+        &chunks,
+        &workers,
+        &config,
+        &to_positions(&current, &workers),
+        &mut WorkerRingCache::default(),
+    )
+    .unwrap();
     let out_holders = out.chunk_holders(n);
 
     for ci in 0..n {
@@ -369,7 +413,14 @@ fn degraded_chunk_repaired_not_rolled_back() {
         ignore_reliability: true,
     };
 
-    let out = schedule(&chunks, &workers, config, &to_positions(&current, &workers)).unwrap();
+    let out = schedule(
+        &chunks,
+        &workers,
+        &config,
+        &to_positions(&current, &workers),
+        &mut WorkerRingCache::default(),
+    )
+    .unwrap();
     let h = out.chunk_holders(1);
 
     assert!(
@@ -427,7 +478,7 @@ fn version_restriction_preserved() {
         ignore_reliability: true,
     };
 
-    let out = schedule(&chunks, &workers, config, &empty(n)).unwrap();
+    let out = schedule(&chunks, &workers, &config, &empty(n), &mut WorkerRingCache::default()).unwrap();
 
     for (worker_id, chunk_indexes) in &out.worker_chunks {
         if !eligible.contains(worker_id) {
