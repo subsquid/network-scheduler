@@ -4,11 +4,11 @@
 
 // Only `pg_harness` is reachable under the `pg-testkit` feature (for reshuffle-sim); the rest is
 // test-only.
-pub mod pg_harness;
 #[cfg(test)]
 pub mod correction_oracle;
 #[cfg(test)]
 pub mod inspect;
+pub mod pg_harness;
 #[cfg(test)]
 pub mod utils;
 

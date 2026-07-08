@@ -184,7 +184,8 @@ fn flood_multicopy_light_floor_starved_by_heavy_bonus_unfixed() {
     };
     let heavy =
         |seed: u64, size: u32| new_chunk((mint_key(seed), size, 12, "s3://sim-0".to_string()));
-    let light = |seed: u64, size: u32| new_chunk((mint_key(seed), size, 1, "s3://sim-0".to_string()));
+    let light =
+        |seed: u64, size: u32| new_chunk((mint_key(seed), size, 1, "s3://sim-0".to_string()));
 
     replay_pg(
         &config,

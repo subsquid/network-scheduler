@@ -233,7 +233,9 @@ fn main() -> anyhow::Result<()> {
     let params = SimulationParams {
         steps: run.steps,
         chunk_rate,
-        chunk_size: run.chunk_size.map(|s| s.as_u64().min(u32::MAX as u64) as u32),
+        chunk_size: run
+            .chunk_size
+            .map(|s| s.as_u64().min(u32::MAX as u64) as u32),
         restricted_fraction: run.restricted_fraction,
         restricted_dataset_name: run.restricted_dataset,
         initial_new_fraction: run.initial_new_fraction,

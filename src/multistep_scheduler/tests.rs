@@ -107,7 +107,14 @@ fn idempotent_when_fed_its_own_output() {
     };
     let n = chunks.len();
 
-    let a = schedule(&chunks, &workers, &config, &empty(n), &mut WorkerRingCache::default()).unwrap();
+    let a = schedule(
+        &chunks,
+        &workers,
+        &config,
+        &empty(n),
+        &mut WorkerRingCache::default(),
+    )
+    .unwrap();
     let cur = chunk_to_peers(&a, n);
     let b = schedule(
         &chunks,
@@ -138,9 +145,23 @@ fn deterministic_across_worker_order() {
     };
     let n = chunks.len();
 
-    let a = schedule(&chunks, &workers, &config, &empty(n), &mut WorkerRingCache::default()).unwrap();
+    let a = schedule(
+        &chunks,
+        &workers,
+        &config,
+        &empty(n),
+        &mut WorkerRingCache::default(),
+    )
+    .unwrap();
     workers.reverse();
-    let b = schedule(&chunks, &workers, &config, &empty(n), &mut WorkerRingCache::default()).unwrap();
+    let b = schedule(
+        &chunks,
+        &workers,
+        &config,
+        &empty(n),
+        &mut WorkerRingCache::default(),
+    )
+    .unwrap();
 
     assert_eq!(
         a, b,
@@ -346,7 +367,14 @@ fn draining_copies_do_not_accumulate() {
         ignore_reliability: true,
     };
 
-    let ideal = schedule(&chunks, &workers, &config, &empty(n), &mut WorkerRingCache::default()).unwrap();
+    let ideal = schedule(
+        &chunks,
+        &workers,
+        &config,
+        &empty(n),
+        &mut WorkerRingCache::default(),
+    )
+    .unwrap();
     let ideal_holders = ideal.chunk_holders(n);
 
     // `current` = ideal plus one extra (draining) copy per chunk on a non-holder.
@@ -478,7 +506,14 @@ fn version_restriction_preserved() {
         ignore_reliability: true,
     };
 
-    let out = schedule(&chunks, &workers, &config, &empty(n), &mut WorkerRingCache::default()).unwrap();
+    let out = schedule(
+        &chunks,
+        &workers,
+        &config,
+        &empty(n),
+        &mut WorkerRingCache::default(),
+    )
+    .unwrap();
 
     for (worker_id, chunk_indexes) in &out.worker_chunks {
         if !eligible.contains(worker_id) {
