@@ -66,8 +66,7 @@ fn build_table(metrics: &[ReshuffleMetrics]) -> tabled::Table {
 
     for m in metrics {
         let dm = &m.data_movement;
-        let total_download =
-            dm.new_chunk_bytes + dm.shuffled_bytes + dm.increased_replication_bytes;
+        let total_download = dm.total_download();
         let free_capacity = m.total_capacity_bytes.saturating_sub(m.used_capacity_bytes);
         let used_pct = if m.total_capacity_bytes > 0 {
             m.used_capacity_bytes as f64 / m.total_capacity_bytes as f64 * 100.0
@@ -79,9 +78,7 @@ fn build_table(metrics: &[ReshuffleMetrics]) -> tabled::Table {
         } else {
             0.0
         };
-        let restricted_download = m.restricted_movement.new_chunk_bytes
-            + m.restricted_movement.shuffled_bytes
-            + m.restricted_movement.increased_replication_bytes;
+        let restricted_download = m.restricted_movement.total_download();
         let replication = m
             .replication_by_weight
             .iter()
@@ -95,7 +92,18 @@ fn build_table(metrics: &[ReshuffleMetrics]) -> tabled::Table {
             format!("{} ({})", m.total_chunks, m.total_restricted_chunks),
             replication,
             ByteSize(dm.new_chunk_bytes).to_string(),
-            format!("{} ({})", dm.shuffled_count, ByteSize(dm.shuffled_bytes)),
+            {
+                let mut cell = format!("{} ({})", dm.shuffled_count, ByteSize(dm.shuffled_bytes));
+                if dm.refetched_count > 0 {
+                    // Refetch = re-download onto the same worker after a drain; a kind of shuffle.
+                    cell += &format!(
+                        " +rf {} ({})",
+                        dm.refetched_count,
+                        ByteSize(dm.refetched_bytes)
+                    );
+                }
+                cell
+            },
             format!(
                 "+{} / -{}",
                 ByteSize(dm.increased_replication_bytes),
@@ -130,7 +138,7 @@ fn build_table(metrics: &[ReshuffleMetrics]) -> tabled::Table {
 /// killed mid-way (e.g. OOM) still shows every step it completed, not just the final table.
 pub fn print_step(m: &ReshuffleMetrics) {
     let dm = &m.data_movement;
-    let total_download = dm.new_chunk_bytes + dm.shuffled_bytes + dm.increased_replication_bytes;
+    let total_download = dm.total_download();
     let free_capacity = m.total_capacity_bytes.saturating_sub(m.used_capacity_bytes);
     let pct = |n: u64| {
         if m.total_capacity_bytes > 0 {
@@ -140,7 +148,7 @@ pub fn print_step(m: &ReshuffleMetrics) {
         }
     };
     println!(
-        "step {} | new {} (r{}) | total {} (r{}) | download {} (new {}, shuffled {}/{}, repl +{}/-{}) \
+        "step {} | new {} (r{}) | total {} (r{}) | download {} (new {}, shuffled {}/{}, refetch {}/{}, repl +{}/-{}) \
          | free {} ({:.1}% used) | stale {:.1}% | workers +{}/-{}/{} | upgraded {} | sched {} {}",
         m.step,
         m.new_chunks_in_step,
@@ -151,6 +159,8 @@ pub fn print_step(m: &ReshuffleMetrics) {
         ByteSize(dm.new_chunk_bytes),
         dm.shuffled_count,
         ByteSize(dm.shuffled_bytes),
+        dm.refetched_count,
+        ByteSize(dm.refetched_bytes),
         ByteSize(dm.increased_replication_bytes),
         ByteSize(dm.decreased_replication_bytes),
         ByteSize(free_capacity),

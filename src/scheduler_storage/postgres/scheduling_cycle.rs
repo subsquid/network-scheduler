@@ -102,14 +102,17 @@ pub(super) async fn tombstone_expired_chunks(
     Ok(())
 }
 
-/// Expire stale mappings whose portal-drop landed at least `m_ticks` ago.
+/// Expire stale mappings whose portal-drop landed at least `m_ticks` ago, returning the
+/// `(chunk, worker)` copies physically removed. The reshuffle-sim uses these to score a
+/// drained-then-refetched copy as a real download (a same-worker refetch is invisible to a
+/// plain step-boundary placement diff); production callers ignore the returned rows.
 pub(super) async fn expire_drained_stale_mappings(
     tx: &mut Transaction<'_, Postgres>,
     now: u64,
     m_ticks: u64,
-) -> Result<()> {
+) -> Result<Vec<(ChunkPk, WorkerPk)>> {
     let mut timer = PhaseTimer::new("run_scheduling_cycle:expire_drained_stale_mappings");
-    let res = sqlx::query(
+    let drained: Vec<(ChunkPk, WorkerPk)> = sqlx::query_as(
         r#"
         DELETE FROM sched_stale_mappings
         WHERE dropped_at_portal_assignment_id IS NOT NULL
@@ -117,15 +120,16 @@ pub(super) async fn expire_drained_stale_mappings(
               SELECT id FROM sched_portal_assignments
               WHERE created_at <= $1 - $2
           )
+        RETURNING chunk_pk, worker_id
         "#,
     )
     .bind(tick_to_i64(now))
     .bind(tick_to_i64(m_ticks))
-    .execute(&mut **tx)
+    .fetch_all(&mut **tx)
     .await
     .context("run_scheduling_cycle: expire stale mappings")?;
-    timer.stmt(res.rows_affected());
-    Ok(())
+    timer.stmt(drained.len() as u64);
+    Ok(drained)
 }
 
 /// Active (not tombstoned/rejected) chunks decoded straight into the algorithm's inputs: the

@@ -21,6 +21,14 @@ pub fn generate_html(metrics: &[ReshuffleMetrics], path: &Path) -> anyhow::Resul
         .iter()
         .map(|m| m.data_movement.shuffled_count)
         .collect();
+    let refetched_bytes_raw: Vec<u64> = metrics
+        .iter()
+        .map(|m| m.data_movement.refetched_bytes)
+        .collect();
+    let refetched_count: Vec<u32> = metrics
+        .iter()
+        .map(|m| m.data_movement.refetched_count)
+        .collect();
     let increased_repl_raw: Vec<u64> = metrics
         .iter()
         .map(|m| m.data_movement.increased_replication_bytes)
@@ -31,10 +39,7 @@ pub fn generate_html(metrics: &[ReshuffleMetrics], path: &Path) -> anyhow::Resul
         .collect();
     let total_download_raw: Vec<u64> = metrics
         .iter()
-        .map(|m| {
-            let dm = &m.data_movement;
-            dm.new_chunk_bytes + dm.shuffled_bytes + dm.increased_replication_bytes
-        })
+        .map(|m| m.data_movement.total_download())
         .collect();
     let free_capacity_raw: Vec<u64> = metrics
         .iter()
@@ -76,10 +81,7 @@ pub fn generate_html(metrics: &[ReshuffleMetrics], path: &Path) -> anyhow::Resul
     let scheduled_flags: Vec<u8> = metrics.iter().map(|m| m.scheduled as u8).collect();
     let restricted_download_raw: Vec<u64> = metrics
         .iter()
-        .map(|m| {
-            let r = &m.restricted_movement;
-            r.new_chunk_bytes + r.shuffled_bytes + r.increased_replication_bytes
-        })
+        .map(|m| m.restricted_movement.total_download())
         .collect();
     let schedule_ms: Vec<f64> = metrics
         .iter()
@@ -222,6 +224,7 @@ pub fn generate_html(metrics: &[ReshuffleMetrics], path: &Path) -> anyhow::Resul
 <tr>
   <th>Step</th><th>New chunks</th><th>New restricted</th><th>Total chunks</th><th>Total restricted</th><th>Replication factor</th>
   <th>New chunks download (all replicas)</th><th>Shuffled chunks</th><th>Shuffled chunks download (all replicas)</th>
+  <th>Refetched chunks (drain&rarr;refetch download)</th>
   <th>Replication increase download</th><th>Replication decrease freed</th><th>Total S3 download (all replicas)</th>
   <th>Free capacity</th><th>Used %</th><th>Stale %</th>
   <th>Workers receiving new</th><th>Workers losing</th><th>Workers receiving shuffled</th>
@@ -241,6 +244,8 @@ const totalChunks = {total_chunks:?};
 const newChunkBytes = {new_chunk_bytes_raw:?};
 const shuffledBytes = {shuffled_bytes_raw:?};
 const shuffledCount = {shuffled_count:?};
+const refetchedBytes = {refetched_bytes_raw:?};
+const refetchedCount = {refetched_count:?};
 const increasedRepl = {increased_repl_raw:?};
 const decreasedRepl = {decreased_repl_raw:?};
 const totalDownload = {total_download_raw:?};
@@ -291,6 +296,7 @@ new Chart(document.getElementById('dataBreakdownChart'), {{
     datasets: [
       {{ label: 'New chunks download (all replicas)', data: newChunkBytes, backgroundColor: 'rgba(54,162,235,0.7)' }},
       {{ label: 'Shuffled chunks download (all replicas)', data: shuffledBytes, backgroundColor: 'rgba(255,99,132,0.7)' }},
+      {{ label: 'Refetched (drain→refetch download)', data: refetchedBytes, backgroundColor: 'rgba(153,102,255,0.7)' }},
       {{ label: 'Replication increase download', data: increasedRepl, backgroundColor: 'rgba(255,206,86,0.7)' }}
     ]
   }},
@@ -484,11 +490,11 @@ fn build_table_rows(
         .enumerate()
         .map(|(i, m)| {
             let dm = &m.data_movement;
-            let r = &m.restricted_movement;
-            let restricted_dl = r.new_chunk_bytes + r.shuffled_bytes + r.increased_replication_bytes;
+            let restricted_dl = m.restricted_movement.total_download();
             let scheduled = if m.scheduled { "yes" } else { "NO" };
+            let refetched = format!("{} ({})", dm.refetched_count, ByteSize(dm.refetched_bytes));
             format!(
-                "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+                "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
                 m.step,
                 m.new_chunks_in_step,
                 m.new_restricted_in_step,
@@ -498,6 +504,7 @@ fn build_table_rows(
                 new_chunk_bytes[i],
                 dm.shuffled_count,
                 shuffled_bytes[i],
+                refetched,
                 increased_repl[i],
                 decreased_repl[i],
                 total_download[i],

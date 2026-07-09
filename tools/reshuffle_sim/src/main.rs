@@ -56,6 +56,10 @@ type ChunkId = (Arc<String>, Arc<String>);
 type WorkerIdx = u16;
 type ChunkOwners = BTreeMap<ChunkId, Vec<WorkerIdx>>;
 type ChunkSizeIndex = BTreeMap<ChunkId, u32>;
+/// The `(chunk, worker)` copies the storage physically expired during a cycle's GC, keyed like
+/// [`ChunkOwners`]. A copy re-fetched onto the same worker it drained from is a real download that a
+/// step-boundary placement diff misses, so the metric needs this to attribute it.
+type DrainedOwners = ChunkOwners;
 
 /// Interns worker `PeerId`s to compact [`WorkerIdx`]es, assigned in first-seen order
 /// and never reused, so a worker keeps the same index for the whole run.

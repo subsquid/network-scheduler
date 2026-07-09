@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::time::Duration;
 
 use crate::simulation::StepPlacement;
-use crate::{ChunkId, ChunkOwners, ChunkSizeIndex, WorkerIdx};
+use crate::{ChunkId, ChunkOwners, ChunkSizeIndex, DrainedOwners, WorkerIdx};
 
 /// Metrics for a single simulation step.
 pub struct ReshuffleMetrics {
@@ -32,12 +32,19 @@ pub struct ReshuffleMetrics {
     pub schedule_duration: Duration,
 }
 
-/// Data movement between two assignments, classified by cause.
+/// Data movement between two assignments, classified by cause. Every byte counted here is a real S3
+/// download or a real physical free: a copy that stays on disk while only flipping between the ideal
+/// and stale ledgers contributes nothing.
 #[derive(Default)]
 pub struct DataMovement {
     pub new_chunk_bytes: u64,
     pub shuffled_bytes: u64,
     pub shuffled_count: u32,
+    /// Bytes re-downloaded onto a worker that physically dropped the copy this cycle (drain→refetch),
+    /// then had it re-placed. Distinct from `increased_replication_bytes`: replication did not grow
+    /// (the worker leaves as a stale copy and returns as an ideal one), but the bytes are refetched.
+    pub refetched_bytes: u64,
+    pub refetched_count: u32,
     pub increased_replication_bytes: u64,
     pub decreased_replication_bytes: u64,
     pub workers_receiving_new: usize,
@@ -48,6 +55,15 @@ pub struct DataMovement {
 impl DataMovement {
     pub fn zero() -> Self {
         DataMovement::default()
+    }
+
+    /// Total S3 download this step: every copy a worker had to fetch — brand-new chunks, shuffles
+    /// onto a new worker, net replication increase, and same-worker refetches after a drain.
+    pub fn total_download(&self) -> u64 {
+        self.new_chunk_bytes
+            + self.shuffled_bytes
+            + self.increased_replication_bytes
+            + self.refetched_bytes
     }
 }
 
@@ -72,6 +88,7 @@ pub fn measure_reshuffle(
     let StepPlacement {
         owners: current_owners,
         chunk_sizes,
+        drained,
         replication_by_weight,
         used_capacity_bytes,
         stale_capacity_bytes,
@@ -79,11 +96,13 @@ pub fn measure_reshuffle(
         schedule_duration,
     } = placement;
 
-    let data_movement = compute_data_movement(previous_owners, &current_owners, &chunk_sizes);
+    let data_movement =
+        compute_data_movement(previous_owners, &current_owners, &chunk_sizes, &drained);
     let restricted_movement = compute_data_movement(
         &filter_owners(previous_owners, restricted),
         &filter_owners(&current_owners, restricted),
         &chunk_sizes,
+        &filter_owners(&drained, restricted),
     );
 
     let metrics = ReshuffleMetrics {
@@ -144,24 +163,31 @@ fn filter_owners(owners: &ChunkOwners, restricted: &HashSet<ChunkId>) -> ChunkOw
         .collect()
 }
 
-/// Classifies data movement between two assignments by cause:
+/// Classifies data movement between two assignments by cause. `previous`/`current` are *physical*
+/// holder sets (ideal ∪ stale); `drained` is the copies the cycle physically expired this step.
 /// - a chunk only in `current` is new — all its replicas are downloads;
-/// - a chunk in both may have gained/lost replicas — gains are split into 1:1
-///   swaps (shuffle) and net replication increase;
+/// - a chunk in both: a worker only in `current` gained a copy (download), one only in `previous`
+///   lost it (freed), and one in both that was `drained` this cycle was re-fetched onto the same
+///   worker (a refetch download the raw set-diff can't see);
 /// - a chunk only in `previous` was removed — its replicas are freed.
 fn compute_data_movement(
     previous: &ChunkOwners,
     current: &ChunkOwners,
     chunk_sizes: &ChunkSizeIndex,
+    drained: &DrainedOwners,
 ) -> DataMovement {
     let mut movement = Movement::default();
+    let no_drain: Vec<WorkerIdx> = Vec::new();
 
     for (chunk_id, current_workers) in current {
         let size = chunk_size(chunk_sizes, chunk_id);
         match previous.get(chunk_id) {
-            Some(previous_workers) => {
-                movement.record_existing(size, previous_workers, current_workers)
-            }
+            Some(previous_workers) => movement.record_existing(
+                size,
+                previous_workers,
+                current_workers,
+                drained.get(chunk_id).unwrap_or(&no_drain),
+            ),
             None => movement.record_added(size, current_workers),
         }
     }
@@ -185,6 +211,8 @@ struct Movement {
     new_chunk_bytes: u64,
     shuffled_bytes: u64,
     shuffled_count: u32,
+    refetched_bytes: u64,
+    refetched_count: u32,
     increased_replication_bytes: u64,
     decreased_replication_bytes: u64,
     // Distinct affected workers; only their final `.len()` is read, so unordered.
@@ -194,12 +222,18 @@ struct Movement {
 }
 
 impl Movement {
-    fn record_existing(&mut self, size: u64, previous: &[WorkerIdx], current: &[WorkerIdx]) {
+    fn record_existing(
+        &mut self,
+        size: u64,
+        previous: &[WorkerIdx],
+        current: &[WorkerIdx],
+        drained: &[WorkerIdx],
+    ) {
         // Both holder lists are sorted, so walk them in lockstep: a worker only in
         // `current` gained this chunk, one only in `previous` lost it, matches are
         // unchanged.
         let (mut i, mut j) = (0, 0);
-        let (mut gained, mut lost) = (0u64, 0u64);
+        let (mut gained, mut lost, mut refetched) = (0u64, 0u64, 0u64);
         while i < current.len() && j < previous.len() {
             match current[i].cmp(&previous[j]) {
                 Ordering::Less => {
@@ -213,11 +247,20 @@ impl Movement {
                     j += 1;
                 }
                 Ordering::Equal => {
+                    // A holder in both prev and cur normally means "unchanged, already on disk".
+                    // But if that copy was physically expired this cycle, the worker had to
+                    // re-download it (the ideal re-placed it onto the same worker) — a real refetch.
+                    if drained.binary_search(&current[i]).is_ok() {
+                        self.workers_shuffled.insert(current[i]);
+                        refetched += 1;
+                    }
                     i += 1;
                     j += 1;
                 }
             }
         }
+        // `current`-only workers (gained) cannot be in `drained`: a drained copy was on disk at the
+        // start of the cycle, so it is in `previous`. `previous`-only workers are lost regardless.
         for &w in &current[i..] {
             self.workers_shuffled.insert(w);
             gained += 1;
@@ -231,6 +274,10 @@ impl Movement {
         if shuffled > 0 {
             self.shuffled_count += 1;
             self.shuffled_bytes += size * shuffled;
+        }
+        if refetched > 0 {
+            self.refetched_count += 1;
+            self.refetched_bytes += size * refetched;
         }
         self.increased_replication_bytes += size * gained.saturating_sub(lost);
         self.decreased_replication_bytes += size * lost.saturating_sub(gained);
@@ -251,6 +298,8 @@ impl Movement {
             new_chunk_bytes: self.new_chunk_bytes,
             shuffled_bytes: self.shuffled_bytes,
             shuffled_count: self.shuffled_count,
+            refetched_bytes: self.refetched_bytes,
+            refetched_count: self.refetched_count,
             increased_replication_bytes: self.increased_replication_bytes,
             decreased_replication_bytes: self.decreased_replication_bytes,
             workers_receiving_new: self.workers_receiving_new.len(),

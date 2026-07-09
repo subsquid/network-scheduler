@@ -73,6 +73,68 @@ fn set_marked_for_removal(storage: &mut PostgresStorage, chunk_pk: ChunkPk, tick
         .unwrap();
 }
 
+/// A cycle physically expires a drained copy, and `take_last_cycle_drains` reports exactly that
+/// `(chunk, worker)` pair — the signal the reshuffle-sim uses to score a same-worker refetch as a
+/// real download. Mirrors the `chunk_migration_through_grace_period` MVCC flow: w1 → w2 with a
+/// grace window, then the holdover on w1 drains once the window elapses.
+#[test]
+fn take_last_cycle_drains_reports_the_expired_copy() {
+    use crate::scheduler_storage::algorithm::IdealMapping;
+
+    let mut storage = fresh_storage("drains_report");
+    let chunk_pk = insert_and_register_chunk(&mut storage, "ds", 1, 100);
+    storage
+        .update_worker_set(&[worker(1, None), worker(2, None)], 0, 1000)
+        .expect("upsert workers");
+    let worker_ids: Vec<WorkerPk> = storage
+        .get_workers(|_| true)
+        .iter()
+        .map(|v| v.worker_id)
+        .collect();
+    let (w1, w2) = (worker_ids[0], worker_ids[1]);
+
+    let grace = 60;
+    // One cycle placing `chunk_pk` on `holder`, confirmed and made portal-visible.
+    let cycle = |storage: &mut PostgresStorage, holder: WorkerPk, at: u64| {
+        let mapping: IdealMapping = [(chunk_pk, vec![holder])].into_iter().collect();
+        let algo = StaticSchedulingAlgorithm { mapping };
+        let wa = storage
+            .run_scheduling_cycle(&algo, &(), at, grace)
+            .expect("scheduling succeeds");
+        confirm(storage, wa.id, at + 10);
+        storage.run_visibility_cycle(at + 50).expect("visibility");
+        wa
+    };
+
+    // Cycles 1-3: place on w1, migrate to w2, hold (300 − 250 < grace).
+    cycle(&mut storage, w1, 100);
+    assert!(
+        storage.take_last_cycle_drains().is_empty(),
+        "no copy has drained yet"
+    );
+    cycle(&mut storage, w2, 200); // supersedes w1 → w1 becomes a draining stale copy
+    cycle(&mut storage, w2, 300);
+    assert!(
+        !storage.get_stale_mappings(|_| true).is_empty(),
+        "w1's copy is still draining inside the grace window",
+    );
+
+    // Cycle 4: 400 − 250 ≥ grace, so w1's holdover expires this cycle.
+    cycle(&mut storage, w2, 400);
+    assert_eq!(
+        storage.take_last_cycle_drains(),
+        vec![(chunk_pk, w1)],
+        "the cycle that expired w1's copy reports it as drained",
+    );
+    assert!(
+        storage.get_stale_mappings(|_| true).is_empty(),
+        "nothing left draining after the grace period",
+    );
+    // Draining is reported once: the next cycle's set is empty (take clears it).
+    cycle(&mut storage, w2, 500);
+    assert!(storage.take_last_cycle_drains().is_empty());
+}
+
 /// Insert an FK-anchor row via `insert_sql` (which must `RETURNING id`), then point
 /// `metadata_column` on the chunk's `sched_chunk_metadata` row at it.
 fn anchor_metadata_column(

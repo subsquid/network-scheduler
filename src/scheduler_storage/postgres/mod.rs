@@ -36,7 +36,7 @@ use crate::metrics::{PhaseTimer, Timer};
 use crate::scheduler_storage::algorithm::{ScheduleOutput, SchedulingAlgorithm};
 use crate::scheduler_storage::{
     AssignmentId, ChunkPk, DatasetId, NewChunk, PortalAssignment, SchedulerStorage, StorageError,
-    Tick, WorkerAssignment,
+    Tick, WorkerAssignment, WorkerPk,
 };
 use crate::types::{DatasetSchema, Worker};
 
@@ -59,6 +59,9 @@ pub struct PostgresStorage {
     rt: tokio::runtime::Runtime,
     conn: std::cell::RefCell<PgConnection>,
     batch_size: usize,
+    /// The `(chunk, worker)` copies the last `run_scheduling_cycle` physically expired. Read (and
+    /// cleared) by the reshuffle-sim to attribute same-worker refetch downloads; ignored elsewhere.
+    last_cycle_drains: Vec<(ChunkPk, WorkerPk)>,
 }
 
 impl PostgresStorage {
@@ -101,7 +104,17 @@ impl PostgresStorage {
             rt,
             conn: std::cell::RefCell::new(conn),
             batch_size: DEFAULT_BATCH_SIZE,
+            last_cycle_drains: Vec::new(),
         })
+    }
+
+    /// The `(chunk, worker)` copies the most recent [`Self::run_scheduling_cycle`] physically
+    /// expired, taken out (left empty). The reshuffle-sim reads this to score a same-worker refetch
+    /// as a real download — a copy re-fetched onto the worker that just dropped it is invisible to a
+    /// step-boundary placement diff (it is present at both boundaries).
+    #[cfg(any(test, feature = "pg-testkit"))]
+    pub fn take_last_cycle_drains(&mut self) -> Vec<(ChunkPk, WorkerPk)> {
+        std::mem::take(&mut self.last_cycle_drains)
     }
 
     /// Run pending sqlx migrations. Call once on startup before the scheduling loop.
@@ -296,7 +309,7 @@ impl SchedulerStorage for PostgresStorage {
         use scheduling_cycle as phase;
 
         let batch_size = self.batch_size;
-        self.with_conn(async move |conn| {
+        let (wa, drains) = self.with_conn(async move |conn| {
             let _timer = Timer::new("run_scheduling_cycle");
             // Phase A — clock-driven GC, committed up front so it survives a Phase B
             // shortage rollback; otherwise stale never drains under a sustained shortage.
@@ -305,7 +318,7 @@ impl SchedulerStorage for PostgresStorage {
                 .await
                 .context("run_scheduling_cycle: begin gc")?;
             phase::tombstone_expired_chunks(&mut gc_tx, now, m_ticks).await?;
-            phase::expire_drained_stale_mappings(&mut gc_tx, now, m_ticks).await?;
+            let drains = phase::expire_drained_stale_mappings(&mut gc_tx, now, m_ticks).await?;
             gc_tx
                 .commit()
                 .await
@@ -363,8 +376,10 @@ impl SchedulerStorage for PostgresStorage {
                 replication_by_weight,
             )
             .await?;
-            Ok::<_, StorageError>(wa)
-        })
+            Ok::<_, StorageError>((wa, drains))
+        })?;
+        self.last_cycle_drains = drains;
+        Ok(wa)
     }
 
     fn confirm_worker_assignment(

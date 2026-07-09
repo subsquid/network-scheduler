@@ -24,15 +24,21 @@ use network_scheduler::{
 };
 
 use crate::{
-    ChunkOwners, ChunkSizeIndex, WorkerIdx, WorkerIndex,
+    ChunkOwners, ChunkSizeIndex, DrainedOwners, WorkerIdx, WorkerIndex,
     baseline::Baseline,
     simulation::{CopyPlan, StepContext, StepOutcome, StepPlacement, StepScheduler},
 };
 
-/// Result of one scheduling cycle: a published assignment with its stale-mapping snapshot, or a
-/// capacity shortage (the run records a failed step and stops).
+/// Result of one scheduling cycle: a published assignment with its stale-mapping snapshot and the
+/// `(chunk, worker)` copies the cycle physically expired, or a capacity shortage (the run records a
+/// failed step and stops).
 enum CycleResult {
-    Scheduled(WorkerAssignment, Vec<(ChunkPk, WorkerPk)>, Duration),
+    Scheduled(
+        WorkerAssignment,
+        Vec<(ChunkPk, WorkerPk)>,
+        Vec<(ChunkPk, WorkerPk)>,
+        Duration,
+    ),
     Shortage(String),
 }
 
@@ -227,7 +233,7 @@ impl MultistepScheduler {
             .run_cycle()
             .context("scheduling baseline placement")?
         {
-            CycleResult::Scheduled(assignment, stale, _) => (assignment, stale),
+            CycleResult::Scheduled(assignment, stale, _drains, _) => (assignment, stale),
             CycleResult::Shortage(reason) => {
                 anyhow::bail!("baseline placement infeasible: {reason}")
             }
@@ -274,6 +280,9 @@ impl MultistepScheduler {
             Err(e) => return Err(anyhow!("scheduling cycle failed: {e}")),
         };
         let schedule_duration = started.elapsed();
+        // The copies this cycle's GC physically expired: a copy re-fetched onto the same worker it
+        // drained from is a real download the placement snapshot alone can't see.
+        let drains = self.backend.storage.take_last_cycle_drains();
         // Before confirm/visibility expire or drain stale, so the snapshot matches `assignment`.
         let stale = self.backend.storage.stale_mappings()?;
         self.clock += CLOCK_STEP;
@@ -286,7 +295,12 @@ impl MultistepScheduler {
             .storage
             .confirm_worker_assignment(watermark, self.clock)?;
         self.backend.storage.run_visibility_cycle(self.clock)?;
-        Ok(CycleResult::Scheduled(assignment, stale, schedule_duration))
+        Ok(CycleResult::Scheduled(
+            assignment,
+            stale,
+            drains,
+            schedule_duration,
+        ))
     }
 
     /// The publication `confirm_lag_steps + portal_lag_steps` cycles back.
@@ -425,8 +439,10 @@ impl StepScheduler for MultistepScheduler {
         self.total_chunks += new_chunks.len();
         self.backend.storage.insert_new_chunks(new_chunks)?;
         self.backend.storage.register_new_chunks()?;
-        let (assignment, stale, schedule_duration) = match self.run_cycle()? {
-            CycleResult::Scheduled(assignment, stale, duration) => (assignment, stale, duration),
+        let (assignment, stale, drains, schedule_duration) = match self.run_cycle()? {
+            CycleResult::Scheduled(assignment, stale, drains, duration) => {
+                (assignment, stale, drains, duration)
+            }
             CycleResult::Shortage(reason) => return Ok(StepOutcome::Failed(reason)),
         };
 
@@ -434,10 +450,12 @@ impl StepScheduler for MultistepScheduler {
 
         let (owners, chunk_sizes, used_capacity_bytes, stale_capacity_bytes) =
             owners_from_assignment(&assignment, &stale, &mut self.worker_index);
+        let drained = drained_owners(&assignment, &drains, &mut self.worker_index);
         self.retain_replace_targets(&assignment);
         Ok(StepOutcome::Scheduled(StepPlacement {
             owners,
             chunk_sizes,
+            drained,
             replication_by_weight: assignment.replication_by_weight.clone(),
             used_capacity_bytes,
             stale_capacity_bytes,
@@ -470,15 +488,20 @@ fn log_table_sizes(storage: &PostgresStorage) {
     }
 }
 
-/// Returns the ideal owners we diff between steps (`chunk_workers` minus stale, which is exact since
-/// ideal and stale are disjoint per chunk), per-chunk sizes, total physical bytes, and stale bytes.
+/// Returns the *physical* owners we diff between steps — every worker that holds a copy of the chunk,
+/// whether it's the live ideal copy or a superseded one still draining (stale). Also returns
+/// per-chunk sizes, total physical bytes, and stale bytes.
+///
+/// Diffing physical placement (`chunk_workers`, i.e. ideal ∪ stale) rather than the ideal alone
+/// means a copy that only flips between the ideal and stale ledgers — superseded, then later
+/// re-promoted — never leaves disk and so never shows up as a free or a download. A same-worker
+/// drain→refetch is the one physical move a boundary diff still misses; the `drained` set carried
+/// alongside these owners recovers it (see [`drained_owners`]).
 fn owners_from_assignment(
     assignment: &WorkerAssignment,
     stale: &[(ChunkPk, WorkerPk)],
     worker_index: &mut WorkerIndex,
 ) -> (ChunkOwners, ChunkSizeIndex, u64, u64) {
-    let stale: HashSet<(ChunkPk, WorkerPk)> = stale.iter().copied().collect();
-
     let mut owners: ChunkOwners = BTreeMap::new();
     let mut sizes: ChunkSizeIndex = BTreeMap::new();
     let mut used_bytes = 0u64;
@@ -490,17 +513,14 @@ fn owners_from_assignment(
         sizes.insert(key.clone(), chunk.size);
         used_bytes += chunk.size as u64 * worker_pks.len() as u64;
 
-        let holders: Vec<WorkerIdx> = worker_index.intern_holders(
-            worker_pks
-                .iter()
-                .filter(|worker_pk| !stale.contains(&(*chunk_pk, **worker_pk)))
-                .filter_map(|worker_pk| {
-                    assignment
-                        .workers
-                        .get(worker_pk)
-                        .map(|worker| worker.peer_id)
-                }),
-        );
+        // Intern every physical holder (ideal ∪ stale); `chunk_workers` already merges both.
+        let holders: Vec<WorkerIdx> =
+            worker_index.intern_holders(worker_pks.iter().filter_map(|worker_pk| {
+                assignment
+                    .workers
+                    .get(worker_pk)
+                    .map(|worker| worker.peer_id)
+            }));
         owners.insert(key, holders);
     }
 
@@ -516,6 +536,36 @@ fn owners_from_assignment(
         .sum();
 
     (owners, sizes, used_bytes, stale_bytes)
+}
+
+/// Translate the storage's drained `(chunk_pk, worker_pk)` pairs into `(ChunkId, WorkerIdx)`, interned
+/// with the SAME `worker_index` as [`owners_from_assignment`] so indices line up in the diff. Pairs
+/// whose chunk or worker is absent from the published assignment (a chunk that fully drained away, a
+/// departed worker) are skipped: they never appear in the current owners, so they can never be scored
+/// as a refetch download — `freed = prev \ cur` already accounts for them.
+fn drained_owners(
+    assignment: &WorkerAssignment,
+    drains: &[(ChunkPk, WorkerPk)],
+    worker_index: &mut WorkerIndex,
+) -> DrainedOwners {
+    let mut out: DrainedOwners = BTreeMap::new();
+    for (chunk_pk, worker_pk) in drains {
+        let (Some(chunk), Some(worker)) = (
+            assignment.chunks.get(chunk_pk),
+            assignment.workers.get(worker_pk),
+        ) else {
+            continue;
+        };
+        out.entry((chunk.dataset.clone(), chunk.id.clone()))
+            .or_default()
+            .push(worker_index.intern(worker.peer_id));
+    }
+    // `compute_data_movement` binary-searches these, so keep each holder list sorted and deduped.
+    for holders in out.values_mut() {
+        holders.sort_unstable();
+        holders.dedup();
+    }
+    out
 }
 
 /// Storage-boundary conversion: the sim models chunks as the legacy `types::Chunk`; the MVCC
@@ -582,7 +632,7 @@ mod tests {
     }
 
     #[test]
-    fn owners_are_ideal_only_and_stale_bytes_are_the_overhang() {
+    fn owners_are_physical_and_stale_bytes_are_the_overhang() {
         let c1 = ChunkPk(1);
         let c2 = ChunkPk(2);
         let (worker1_pk, worker1) = worker(1);
@@ -600,7 +650,7 @@ mod tests {
             workers: BTreeMap::from([
                 (worker1_pk, worker1.clone()),
                 (worker2_pk, worker2),
-                (worker3_pk, worker3),
+                (worker3_pk, worker3.clone()),
             ]),
             replication_by_weight: BTreeMap::new(),
         };
@@ -610,14 +660,135 @@ mod tests {
         let (owners, _sizes, used_bytes, stale_bytes) =
             owners_from_assignment(&assignment, &stale, &mut worker_index);
 
-        // c1's ideal holders exclude the stale worker 3. `intern` is idempotent, so
-        // re-interning worker 1 yields the same index the owners list stored.
+        // c1's PHYSICAL holders include the draining copy on worker 3: a diff must see it as still
+        // present so re-promoting it later is not mis-scored as a fresh download. `intern` is
+        // idempotent and `intern_holders` sorts, so the list is both indices in order.
         let c1_key = (Arc::new("ds".to_string()), Arc::new("c1".to_string()));
-        assert_eq!(owners[&c1_key], vec![worker_index.intern(worker1.peer_id)]);
+        let mut expected = vec![
+            worker_index.intern(worker1.peer_id),
+            worker_index.intern(worker3.peer_id),
+        ];
+        expected.sort_unstable();
+        assert_eq!(owners[&c1_key], expected);
         assert_eq!(owners.len(), 2);
 
         // Physical use counts the stale copy (100*2 + 50); the overhang is c1's extra copy (100).
         assert_eq!(used_bytes, 100 * 2 + 50);
         assert_eq!(stale_bytes, 100);
+    }
+
+    /// End-to-end guard for "only real downloads count", walking the full metric pipeline
+    /// (`owners_from_assignment` → `measure_reshuffle` → `compute_data_movement`) through the exact
+    /// lifecycle that produced the heavy-profile artifacts:
+    ///   phase 1  supersede: a copy leaves the ideal but stays on disk (stale)  → must NOT read as freed
+    ///   phase 2  lag hold:  nothing moves                                       → no-op
+    ///   phase 3  drain + same-worker refetch: the copy is expired then re-placed → a REAL download
+    /// Without the drained set a step-boundary diff would miss phase 3 entirely (the copy is present
+    /// at both boundaries); the `drained` input is what recovers it.
+    #[test]
+    fn superseded_copy_is_not_freed_and_a_drained_refetch_is_a_real_download() {
+        use std::time::Duration;
+
+        use crate::ChunkId;
+        use crate::metrics::{self, DataMovement, StepStats};
+
+        let c1 = ChunkPk(1);
+        let c1_key: ChunkId = (Arc::new("ds".to_string()), Arc::new("c1".to_string()));
+        let (a_pk, a) = worker(1); // stable holder
+        let (b_pk, b) = worker(2); // rides supersede → drain → same-worker refetch
+
+        // One chunk (size 100). `owners_from_assignment` returns PHYSICAL owners (ideal ∪ stale).
+        let assignment = |holders: Vec<WorkerPk>| WorkerAssignment {
+            id: 1,
+            chunk_workers: BTreeMap::from([(c1, holders)]),
+            chunks: BTreeMap::from([(c1, chunk("ds", "c1", 100))]),
+            workers: BTreeMap::from([(a_pk, a.clone()), (b_pk, b.clone())]),
+            replication_by_weight: BTreeMap::new(),
+        };
+        let placement =
+            |owners: ChunkOwners, sizes: ChunkSizeIndex, drained: DrainedOwners| StepPlacement {
+                owners,
+                chunk_sizes: sizes,
+                drained,
+                replication_by_weight: BTreeMap::new(),
+                used_capacity_bytes: 0,
+                stale_capacity_bytes: 0,
+                total_chunks: 1,
+                schedule_duration: Duration::ZERO,
+            };
+        let restricted: HashSet<ChunkId> = HashSet::new();
+        let stats = || StepStats {
+            step: 1,
+            new_chunks: 0,
+            new_restricted: 0,
+            eligible_workers: 2,
+        };
+        let diff = |prev: &ChunkOwners, place: StepPlacement| -> (DataMovement, ChunkOwners) {
+            let (m, owners) =
+                metrics::measure_reshuffle(prev, place, &restricted, stats(), 1_000_000);
+            (m.data_movement, owners)
+        };
+
+        let mut wi = WorkerIndex::default();
+
+        // Baseline: c1 physically on {A, B}, nothing stale.
+        let (owners0, ..) = owners_from_assignment(&assignment(vec![a_pk, b_pk]), &[], &mut wi);
+        let idx_b = wi.intern(b.peer_id); // idempotent; names B's drained copy in phase 3
+
+        // PHASE 1 — supersede: ideal={A}, stale={B}; physical still {A,B}.
+        let (phys1, s1, ..) =
+            owners_from_assignment(&assignment(vec![a_pk, b_pk]), &[(c1, b_pk)], &mut wi);
+        let (dm1, owners1) = diff(&owners0, placement(phys1, s1, ChunkOwners::new()));
+        assert_eq!(
+            dm1.decreased_replication_bytes, 0,
+            "a superseded-but-on-disk copy must NOT read as freed"
+        );
+        assert_eq!(dm1.total_download(), 0, "nothing was fetched");
+
+        // PHASE 2 — lag hold: unchanged.
+        let (phys2, s2, ..) =
+            owners_from_assignment(&assignment(vec![a_pk, b_pk]), &[(c1, b_pk)], &mut wi);
+        let (dm2, owners2) = diff(&owners1, placement(phys2, s2, ChunkOwners::new()));
+        assert_eq!(
+            dm2.total_download() + dm2.decreased_replication_bytes,
+            0,
+            "hold is a no-op"
+        );
+
+        // PHASE 3 — drain + same-worker refetch: B's copy is expired this cycle, then the ring
+        // re-places c1 back on B. Published ideal={A,B}, stale={}; drained={(c1,B)}.
+        let (phys3, s3, ..) = owners_from_assignment(&assignment(vec![a_pk, b_pk]), &[], &mut wi);
+
+        // (a) WITHOUT the drained set a boundary diff HIDES the refetch (documents the bug).
+        let (dm3_hidden, _) = diff(
+            &owners2,
+            placement(phys3.clone(), s3.clone(), ChunkOwners::new()),
+        );
+        assert_eq!(
+            dm3_hidden.total_download(),
+            0,
+            "without the drained set the same-worker refetch is invisible"
+        );
+
+        // (b) WITH drained {c1:[B]}: the refetch is scored as a genuine S3 download.
+        let drained = BTreeMap::from([(c1_key.clone(), vec![idx_b])]);
+        let (dm3, _) = diff(&owners2, placement(phys3, s3, drained));
+        assert_eq!(
+            dm3.refetched_bytes, 100,
+            "a drained-then-refetched copy is a real download"
+        );
+        assert_eq!(
+            dm3.total_download(),
+            100,
+            "and it counts toward total download"
+        );
+        assert_eq!(
+            dm3.increased_replication_bytes, 0,
+            "replication did NOT grow — B leaves as stale and returns as ideal"
+        );
+        assert_eq!(
+            dm3.decreased_replication_bytes, 0,
+            "c1 survives with the same holders"
+        );
     }
 }
