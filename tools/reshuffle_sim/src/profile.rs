@@ -26,6 +26,8 @@ pub(crate) struct Profile {
     pub(crate) upgrade_schedule: Option<String>,
     pub(crate) initial_new_fraction: Option<f64>,
     pub(crate) lift_restriction_at_step: Option<u32>,
+    pub(crate) confirm_lag_steps: Option<u32>,
+    pub(crate) portal_lag_steps: Option<u32>,
     #[serde(default)]
     pub(crate) copy: Vec<CopyEntry>,
     #[serde(default)]

@@ -213,6 +213,8 @@ fn main() -> anyhow::Result<()> {
             (run.restricted_fraction > 0.0).then(|| format!("s3://{}", run.restricted_dataset)),
             run.replaces,
             run.copies,
+            run.confirm_lag_steps,
+            run.portal_lag_steps,
             ingestion,
         )? {
             Some(scheduler) => Box::new(scheduler),
@@ -258,6 +260,12 @@ fn main() -> anyhow::Result<()> {
         "Worker version distribution: {}",
         util::format_version_distribution(simulation.workers())
     );
+    if run.scheduler == Scheduler::Multistep {
+        println!(
+            "Confirmation lag: {} worker step(s) + {} portal step(s) before superseded copies drain",
+            run.confirm_lag_steps, run.portal_lag_steps
+        );
+    }
 
     let all_metrics = simulation.run(|metrics| {
         if let Some(m) = metrics.last() {
@@ -289,6 +297,8 @@ struct RunConfig {
     upgrade_schedule: String,
     initial_new_fraction: f64,
     lift_restriction_at_step: Option<u32>,
+    confirm_lag_steps: u32,
+    portal_lag_steps: u32,
     copies: Vec<CopyPlan>,
     replaces: Vec<ReplacePlan>,
 }
@@ -328,6 +338,8 @@ impl RunConfig {
             upgrade_schedule: p.upgrade_schedule.unwrap_or_default(),
             initial_new_fraction: p.initial_new_fraction.unwrap_or(0.0),
             lift_restriction_at_step: p.lift_restriction_at_step,
+            confirm_lag_steps: p.confirm_lag_steps.unwrap_or(0),
+            portal_lag_steps: p.portal_lag_steps.unwrap_or(0),
             copies,
             replaces,
         };
@@ -365,6 +377,12 @@ impl RunConfig {
         anyhow::ensure!(
             self.replaces.is_empty() || self.scheduler == Scheduler::Multistep,
             "replace requires the multistep scheduler"
+        );
+        anyhow::ensure!(
+            (self.confirm_lag_steps == 0 && self.portal_lag_steps == 0)
+                || self.scheduler == Scheduler::Multistep,
+            "confirm_lag_steps/portal_lag_steps require the multistep scheduler (the stateless \
+             path rebuilds the placement each step and has no confirmation watermark)"
         );
         for r in &self.replaces {
             anyhow::ensure!(
