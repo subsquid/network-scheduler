@@ -139,6 +139,113 @@ fn expiring_stale_mappings_matches_what_the_cycle_deletes() {
     );
 }
 
+/// The phenomenon the reshuffle-sim's drained set exists to catch: under the real algorithm, a bonus
+/// replica shed by capacity pressure drains off its worker, then — because the deterministic ring
+/// re-selects that worker and its copy is already gone (expire runs before placement) — is
+/// re-downloaded onto the *same* worker. Drives replication down then up via the capacity lever and
+/// checks the shed worker drains and is re-selected.
+#[test]
+fn a_shed_bonus_replica_drains_then_refetches_onto_the_same_worker() {
+    use std::collections::BTreeSet;
+
+    use semver::Version;
+
+    use crate::multistep_scheduler::SchedulingConfig;
+    use crate::scheduler_storage::WorkerAssignment;
+    use crate::scheduler_storage::algorithm::MultistepAlgorithm;
+    use crate::types::ChunkWeight;
+    use crate::weight::{SchedulingChunk, WeightStrategy};
+
+    struct UniformWeight;
+    impl WeightStrategy for UniformWeight {
+        fn prepare<T: SchedulingChunk>(
+            &self,
+            chunks: Vec<T>,
+        ) -> Vec<(T, ChunkWeight, Option<Version>)> {
+            chunks.into_iter().map(|c| (c, 1, None)).collect()
+        }
+    }
+    let cfg = |cap: u64| SchedulingConfig {
+        worker_capacity: cap,
+        saturation: 1.0,
+        min_replication: 1,
+        ignore_reliability: true,
+    };
+    let grace = 60u64;
+
+    let mut storage = fresh_storage("refetch");
+    // 1 target + 2 fillers of size 100 over 5 workers. R = clamp(floor(cap·5/300), 1, 5): cap 270 →
+    // R=4 (target on 4 of 5), cap 210 → R=3 (sheds one). Per-worker load stays under capacity.
+    let target = insert_and_register_chunk(&mut storage, "ds", 1, 100);
+    insert_and_register_chunk(&mut storage, "ds", 2, 100);
+    insert_and_register_chunk(&mut storage, "ds", 3, 100);
+    let workers: Vec<Worker> = (1..=5).map(|s| worker(s, None)).collect();
+    storage.update_worker_set(&workers, 0, 1000).unwrap();
+
+    let cycle = |storage: &mut PostgresStorage, cap: u64, at: u64| -> WorkerAssignment {
+        storage.register_new_chunks().unwrap();
+        let wa = storage
+            .run_scheduling_cycle(
+                &MultistepAlgorithm::new(UniformWeight),
+                &cfg(cap),
+                at,
+                grace,
+            )
+            .expect("scheduling succeeds");
+        confirm(storage, wa.id, at + 10);
+        storage.run_visibility_cycle(at + 50).unwrap();
+        wa
+    };
+    let physical = |wa: &WorkerAssignment| -> BTreeSet<WorkerPk> {
+        wa.chunk_workers
+            .get(&target)
+            .into_iter()
+            .flatten()
+            .copied()
+            .collect()
+    };
+    let ideal = |storage: &PostgresStorage, wa: &WorkerAssignment| -> BTreeSet<WorkerPk> {
+        let stale: HashSet<(ChunkPk, WorkerPk)> =
+            storage.stale_mappings().unwrap().into_iter().collect();
+        physical(wa)
+            .into_iter()
+            .filter(|w| !stale.contains(&(target, *w)))
+            .collect()
+    };
+
+    let wa_r4 = cycle(&mut storage, 270, 100); // R=4
+    let ideal_r4 = ideal(&storage, &wa_r4);
+    let wa_r3 = cycle(&mut storage, 210, 200); // R=3 — target sheds one
+    let ideal_r3 = ideal(&storage, &wa_r3);
+    let shed: Vec<WorkerPk> = ideal_r4.difference(&ideal_r3).copied().collect();
+    assert_eq!(shed.len(), 1, "one bonus replica shed going R=4→3");
+    let shed = shed[0];
+
+    // The shed copy is due to drain, and the cycle at t=400 physically removes it from that worker.
+    assert!(
+        storage
+            .expiring_stale_mappings(400, grace)
+            .unwrap()
+            .contains(&(target, shed)),
+        "the shed copy is reported as about to expire",
+    );
+    let wa_drain = cycle(&mut storage, 210, 400);
+    let physical_after_drain = physical(&wa_drain);
+    assert!(
+        !physical_after_drain.contains(&shed),
+        "the shed worker physically dropped the chunk (drained)",
+    );
+
+    // Replication restored: the ring re-selects the same worker, which no longer holds the bytes.
+    let wa_r4_again = cycle(&mut storage, 270, 500);
+    let ideal_r4_again = ideal(&storage, &wa_r4_again);
+    assert_eq!(ideal_r4_again, ideal_r4, "the same placement is restored");
+    assert!(
+        ideal_r4_again.contains(&shed),
+        "the drained worker is re-selected — it re-downloads the chunk it just dropped",
+    );
+}
+
 /// Insert an FK-anchor row via `insert_sql` (which must `RETURNING id`), then point
 /// `metadata_column` on the chunk's `sched_chunk_metadata` row at it.
 fn anchor_metadata_column(
