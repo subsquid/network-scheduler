@@ -43,8 +43,9 @@ Accept the candidates that overlap neither the `existing` set nor each other, pe
 one batch can't both win.
 
 - **Postgres** does this without loading `existing`: one indexed `EXISTS` per candidate, riding the
-  `chunks(dataset_id, (first_block + last_block_delta))` index so it touches only chunks whose range
-  reaches the candidate; a short Rust pass then settles overlaps within the batch.
+  `chunks_dataset_range_gist` GiST index (dataset, then range-overlap `&&`) so it touches only
+  chunks that actually intersect the candidate; a short Rust pass then settles overlaps within the
+  batch.
 - **In-memory** (test oracle): scan the map for `existing` and run the brute-force
   `select_non_overlapping` (O(n²), obviously correct).
 

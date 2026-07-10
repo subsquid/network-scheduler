@@ -108,7 +108,7 @@ flowchart LR
 Each state maps to a column on `sched_chunk_metadata`: `applied_at_worker_assignment_id`
 (assigned) → confirmation watermark (confirmed) → `applied_at_portal_assignment_id` (visible) →
 `marked_for_removal` (retiring) → `dropped_at_portal_assignment_id` then, M ticks later,
-`dropped_at_worker_assignment_id` (removed — the row is retained as a **tombstone**, not deleted). The `rejected` flag is the terminal off-ramp: a chunk
+`dropped_from_worker_assignment_at` (removed — the row is retained as a **tombstone**, not deleted). The `rejected` flag is the terminal off-ramp: a chunk
 refused at registration for overlapping a live chunk in its dataset gets a row with `rejected = TRUE`
 and never enters the chain — never scheduled, never reconsidered (see
 [nonoverlap-promotion-gate.md](nonoverlap-promotion-gate.md)).
@@ -333,7 +333,7 @@ what advances the confirmed routing portals read; it is **not** part of the visi
    confirmation watermark — i.e. whose removal the replay has already applied — stamp
    `dropped_at_portal_assignment_id = $new_portal_assignment_id` to start the M-tick drain.
 
-When a chunk is removed entirely via the chunk-level mechanism (`dropped_at_worker_assignment_id`
+When a chunk is removed entirely via the chunk-level mechanism (`dropped_from_worker_assignment_at`
 set — gate A), its stale rows and ideal row go too; the whole-chunk removal supersedes any per-pair
 holdover.
 

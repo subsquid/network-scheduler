@@ -1,36 +1,25 @@
 //! Tests for [`PostgresStorage::register_correction`] and the correction-aware
 //! visibility cycle. Each test gets a fresh database so cases run concurrently.
 
-use std::collections::HashSet;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::collections::{BTreeMap, HashSet};
 
 use claims::assert_matches;
 use proptest::prelude::*;
 
+use super::{current_schema_id, fresh_storage, register_chunk};
 use crate::scheduler_storage::algorithm::IdealMapping;
 use crate::scheduler_storage::postgres::PostgresStorage;
 use crate::scheduler_storage::test_harness::assert_portal_chunks_exact;
 use crate::scheduler_storage::test_harness::inspect::StorageInspect;
-use crate::scheduler_storage::test_harness::pg_harness::fresh_db;
 use crate::scheduler_storage::test_harness::utils::{
     StaticSchedulingAlgorithm, chunk, chunk_with_blocks, dataset, worker,
 };
 use crate::scheduler_storage::{AssignmentId, ChunkPk, SchedulerStorage, StorageError, WorkerPk};
-use crate::types::Worker;
-
-static TEST_ID: AtomicU64 = AtomicU64::new(0);
-
-fn next_id() -> u64 {
-    TEST_ID.fetch_add(1, Ordering::Relaxed)
-}
+use crate::types::{DatasetSchema, TableSchema, Worker};
 
 // ---------------------------------------------------------------------------
 // Test helpers
 // ---------------------------------------------------------------------------
-
-fn fresh_storage(name: &str) -> PostgresStorage {
-    fresh_db(name, next_id())
-}
 
 fn insert_and_register_chunk(
     storage: &mut PostgresStorage,
@@ -39,12 +28,8 @@ fn insert_and_register_chunk(
     size: u32,
 ) -> ChunkPk {
     // Ignore already-exists errors for shared dataset names.
-    let _ = storage.insert_new_datasets(vec![dataset(dataset_name)]);
-    storage
-        .insert_new_chunks(vec![chunk(dataset_name, id_seed, size)])
-        .expect("insert chunk");
-    let pks = storage.register_new_chunks().expect("register chunks");
-    *pks.last().expect("at least one pk registered")
+    let _ = storage.insert_new_datasets(vec![(dataset(dataset_name), DatasetSchema::default())]);
+    register_chunk(storage, dataset_name, id_seed, size)
 }
 
 fn schedule_all(
@@ -56,7 +41,7 @@ fn schedule_all(
     // Mirror the scheduler loop: discover new chunks (incl. correction replacements, whose
     // sched_chunk_metadata is no longer created by register_correction) before scheduling.
     storage.register_new_chunks().expect("register new chunks");
-    let workers: HashSet<WorkerPk> = worker_ids.iter().copied().collect();
+    let workers: Vec<WorkerPk> = worker_ids.to_vec();
     let mapping: IdealMapping = chunk_pks.iter().map(|&pk| (pk, workers.clone())).collect();
     let algorithm = StaticSchedulingAlgorithm { mapping };
     storage
@@ -125,14 +110,21 @@ fn set_dropped_at_portal(storage: &mut PostgresStorage, chunk_pk: ChunkPk) {
     );
 }
 
-/// Simulate a tombstoned chunk; inserts a worker assignment row to satisfy the FK.
+/// Simulate a tombstoned chunk by stamping the drop tick (a bare tick, no FK anchor needed).
 fn set_tombstoned(storage: &mut PostgresStorage, chunk_pk: ChunkPk) {
-    anchor_metadata_column(
-        storage,
-        chunk_pk,
-        "INSERT INTO sched_worker_assignments (created_at) VALUES (1) RETURNING id",
-        "dropped_at_worker_assignment_id",
-    );
+    storage
+        .with_conn(async move |conn| {
+            sqlx::query(
+                "UPDATE sched_chunk_metadata SET dropped_from_worker_assignment_at = 1 \
+                 WHERE chunk_pk = $1",
+            )
+            .bind(chunk_pk)
+            .execute(&mut *conn)
+            .await
+            .unwrap();
+            Ok::<_, StorageError>(())
+        })
+        .unwrap();
 }
 
 /// Reach the underlying `DatabaseError` behind a `StorageError::Database`, so tests can assert the
@@ -155,7 +147,7 @@ fn pg_db_error(result: &Result<ChunkPk, StorageError>) -> &dyn sqlx::error::Data
 #[test]
 fn register_correction_rejects_unknown_old_pk() {
     let mut storage = fresh_storage("rc_unknown_old");
-    let _ = storage.insert_new_datasets(vec![dataset("ds")]);
+    let _ = storage.insert_new_datasets(vec![(dataset("ds"), DatasetSchema::default())]);
 
     // An unknown old chunk is rejected by the chunk_corrections FK on old_chunk_pk — a DB error,
     // not an application pre-check.
@@ -212,6 +204,43 @@ fn register_correction_rejects_duplicate_old_pk() {
 }
 
 #[test]
+fn register_correction_preserves_replacement_schema_metadata() {
+    let mut storage = fresh_storage("rc_schema_metadata");
+    let schema = DatasetSchema::new(BTreeMap::from([
+        ("blocks".to_owned(), TableSchema::default()),
+        ("logs".to_owned(), TableSchema::default()),
+    ]));
+    storage
+        .insert_new_datasets(vec![(dataset("ds"), schema)])
+        .expect("insert dataset");
+    let old_pk = insert_and_register_chunk(&mut storage, "ds", 1, 100);
+    let schema_id = current_schema_id(&mut storage, dataset("ds"));
+
+    let mut replacement = chunk_with_blocks("ds", 2, 100, 2..=3);
+    replacement.schema_id = Some(schema_id);
+    replacement.tables_present = Some(bit_vec::BitVec::from_fn(2, |i| i == 0));
+
+    let new_pk = storage
+        .register_correction(old_pk, replacement, 1)
+        .expect("registration succeeds");
+    let (stored_schema_id, tables_present) = storage
+        .with_conn(async move |conn| {
+            let row = sqlx::query_as::<_, (Option<i32>, Option<String>)>(
+                "SELECT schema_id, tables_present::text FROM chunks WHERE chunk_pk = $1",
+            )
+            .bind(new_pk)
+            .fetch_one(&mut *conn)
+            .await
+            .unwrap();
+            Ok::<_, StorageError>(row)
+        })
+        .unwrap();
+
+    assert_eq!(stored_schema_id, Some(schema_id.0));
+    assert_eq!(tables_present.as_deref(), Some("10"));
+}
+
+#[test]
 fn register_correction_rejects_old_pk_marked_for_removal() {
     let mut storage = fresh_storage("rc_old_marked");
     let old_pk = insert_and_register_chunk(&mut storage, "ds", 1, 100);
@@ -247,7 +276,7 @@ fn register_correction_rejects_old_pk_tombstoned() {
 #[test]
 fn register_correction_rejects_rejected_old_chunk() {
     let mut storage = fresh_storage("rc_old_rejected");
-    let _ = storage.insert_new_datasets(vec![dataset("ds")]);
+    let _ = storage.insert_new_datasets(vec![(dataset("ds"), DatasetSchema::default())]);
     // Two overlapping chunks registered together: the higher (first_block, pk) one is rejected.
     storage
         .insert_new_chunks(vec![
@@ -285,6 +314,92 @@ fn register_correction_rejects_range_change() {
         reason.contains("does not match"),
         "expected a range-change rejection, got: {reason}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Batch registration (register_corrections)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn register_corrections_batch_registers_all_and_swaps() {
+    let mut storage = fresh_storage("rc_batch_swap");
+    let pk_a = insert_and_register_chunk(&mut storage, "ds", 1, 100);
+    let pk_b = insert_and_register_chunk(&mut storage, "ds", 2, 100);
+
+    storage
+        .update_worker_set(&[worker(1, None)], 0, 1000)
+        .expect("upsert worker");
+    let worker_ids: Vec<WorkerPk> = storage
+        .get_workers(|_| true)
+        .iter()
+        .map(|v| v.worker_id)
+        .collect();
+
+    let new_pks = storage
+        .register_corrections(
+            vec![
+                (pk_a, chunk_with_blocks("ds", 3, 100, 2..=3)),
+                (pk_b, chunk_with_blocks("ds", 4, 100, 4..=5)),
+            ],
+            1,
+        )
+        .expect("batch register");
+    assert_eq!(new_pks.len(), 2);
+
+    // The batch behaves like per-item registration end to end: once confirmed, both swaps fire.
+    let all = [pk_a, pk_b, new_pks[0], new_pks[1]];
+    let wa = schedule_all(&mut storage, &all, &worker_ids, 100);
+    confirm(&mut storage, wa, 110);
+    let portal = storage.run_visibility_cycle(150).expect("visibility cycle");
+    assert_portal_chunks_exact(
+        &portal,
+        &[new_pks[0], new_pks[1]],
+        "replacements swap in, old chunks drop",
+    );
+}
+
+#[test]
+fn register_corrections_batch_is_atomic() {
+    let mut storage = fresh_storage("rc_batch_atomic");
+    let pk_a = insert_and_register_chunk(&mut storage, "ds", 1, 100);
+    let pk_b = insert_and_register_chunk(&mut storage, "ds", 2, 100);
+
+    // pk_b's replacement changes range (4..=5 -> 6..=7), so the whole batch is rejected...
+    let result = storage.register_corrections(
+        vec![
+            (pk_a, chunk_with_blocks("ds", 3, 100, 2..=3)),
+            (pk_b, chunk_with_blocks("ds", 4, 100, 6..=7)),
+        ],
+        1,
+    );
+    assert_matches!(result, Err(StorageError::CorrectionRejected { .. }));
+
+    // ...and nothing landed: the same replacement id registers per-item afterwards, which a
+    // leaked chunks row or correction link would refuse as a duplicate.
+    storage
+        .register_correction(pk_a, chunk_with_blocks("ds", 3, 100, 2..=3), 2)
+        .expect("batch rolled back fully");
+}
+
+#[test]
+fn register_corrections_batch_rejects_unavailable_old() {
+    let mut storage = fresh_storage("rc_batch_unavail");
+    let pk_a = insert_and_register_chunk(&mut storage, "ds", 1, 100);
+    set_marked_for_removal(&mut storage, pk_a, 42);
+
+    let result =
+        storage.register_corrections(vec![(pk_a, chunk_with_blocks("ds", 2, 100, 2..=3))], 1);
+    assert_matches!(result, Err(StorageError::CorrectionRejected { .. }));
+}
+
+#[test]
+fn register_corrections_batch_rejects_unknown_dataset() {
+    let mut storage = fresh_storage("rc_batch_unknown_ds");
+    let pk_a = insert_and_register_chunk(&mut storage, "ds", 1, 100);
+
+    let result =
+        storage.register_corrections(vec![(pk_a, chunk_with_blocks("nope", 2, 100, 2..=3))], 1);
+    assert_matches!(result, Err(StorageError::CorrectionRejected { .. }));
 }
 
 // ---------------------------------------------------------------------------
@@ -435,7 +550,7 @@ proptest! {
             .get_chunks_metadata(|meta| {
                 meta.marked_for_removal
                     || meta.dropped_at_portal_assignment_id.is_some()
-                    || meta.dropped_at_worker_assignment_id.is_some()
+                    || meta.dropped_from_worker_assignment_at.is_some()
             })
             .into_iter()
             .map(|meta| meta.chunk_pk)

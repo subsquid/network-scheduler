@@ -1,10 +1,9 @@
-//! Test harness: one shared Postgres container per test binary, a migrated
-//! template database, and a fresh per-case database cloned from it.
+//! One Postgres container per process, a migrated template database, and a fresh per-case database
+//! cloned from it.
 //!
-//! Runtime-nesting rule: `PostgresStorage::connect`/`migrate` `block_on` their
-//! own runtime, and nested `block_on` panics — so container ops and admin SQL
-//! run inside `shared().rt.block_on(...)` while connect/migrate are called from
-//! plain sync context.
+//! `PostgresStorage::connect`/`migrate` `block_on` their own runtime, and nested `block_on` panics —
+//! so container ops and admin SQL run inside `shared().rt.block_on(...)`, while connect/migrate run
+//! from plain sync context.
 
 use std::sync::{Mutex, OnceLock};
 
@@ -14,14 +13,13 @@ use testcontainers_modules::testcontainers::core::Mount;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use testcontainers_modules::testcontainers::{ContainerAsync, ImageExt};
 
-use crate::scheduler_storage::postgres::PostgresStorage;
+use crate::scheduler_storage::postgres::{PostgresStorage, explain};
 
 /// Process-wide state: the container lives until process exit, `rt` drives all admin SQL.
 struct Shared {
-    /// Held only to keep the container running for the whole test binary. `SHARED` is a
-    /// never-dropped static, so `ContainerAsync`'s own `Drop`-based reaping never fires —
-    /// `reap_container_at_exit` takes the container out and `rm()`s it on process exit
-    /// instead. `Mutex<Option<…>>` because `rm()` consumes the owned container.
+    /// `SHARED` is a never-dropped static, so `ContainerAsync`'s own `Drop` reaping never fires —
+    /// `reap_container_at_exit` `rm()`s it at process exit instead. `Mutex<Option<…>>` lets the reaper
+    /// take the owned container (`rm()` consumes it) out of the shared static.
     container: Mutex<Option<ContainerAsync<Postgres>>>,
     rt: tokio::runtime::Runtime,
     admin_url: String,
@@ -30,21 +28,25 @@ struct Shared {
 
 static SHARED: OnceLock<Shared> = OnceLock::new();
 
-/// Remove the shared container at process exit — it lives in a never-dropped static, so
-/// `ContainerAsync`'s own `Drop`-based reaping never fires and it would otherwise leak.
-/// `rm()` goes through testcontainers' docker client (same daemon, honors `DOCKER_HOST`).
-/// Signal termination (e.g. Ctrl-C) bypasses exit hooks — covered by the `watchdog` feature.
+/// `rm()` the shared container at process exit — the never-dropped static means its `Drop` won't.
+/// Signal termination bypasses exit hooks; the `watchdog` feature covers that.
 ///
-/// `#[dtor]`'s `unsafe` marker only acknowledges its run-after-`main` contract; the body is FFI-free.
+/// `#[dtor]`'s `unsafe` only acknowledges its run-after-`main` contract; the body is FFI-free.
 #[dtor(unsafe)]
 fn reap_container_at_exit() {
     let Some(shared) = SHARED.get() else { return };
     let container = shared.container.lock().ok().and_then(|mut g| g.take());
     if let Some(container) = container {
-        // Remove on a spawned thread, not the main one: this `#[dtor]` runs after `main`,
-        // when the main thread's TLS is gone, and tokio's `block_on` panics there (it parks
-        // via `std::thread::current()`) — a panic in a `#[dtor]` aborts. `rm()` needs the
-        // tokio reactor, so it must still run inside the runtime, just on a fresh thread.
+        if explain::enabled() {
+            // Leave it running so its postgres log survives. `mem::forget` skips `ContainerAsync`'s
+            // `Drop` reaping.
+            eprintln!("{}", explain::left_running_notice(container.id()));
+            std::mem::forget(container);
+            return;
+        }
+        // On a fresh thread, not this one: a `#[dtor]` runs after `main`, where the main thread's TLS
+        // is gone and `block_on` panics — and a panic in a `#[dtor]` aborts. `rm()` still needs the
+        // runtime, so drive it on a spawned thread.
         std::thread::scope(|s| {
             s.spawn(|| {
                 let _ = shared.rt.block_on(container.rm());
@@ -53,7 +55,22 @@ fn reap_container_at_exit() {
     }
 }
 
-fn shared() -> &'static Shared {
+/// PGDATA storage backing for the harness container.
+#[derive(Clone, Copy)]
+pub enum PgData {
+    /// On a tmpfs of `size` (e.g. `"2g"`) — fast, for small per-case DBs.
+    Tmpfs { size: &'static str },
+    /// On the container's disk — for large DBs that overflow a tmpfs (the mainnet-scale
+    /// reshuffle-sim).
+    Disk,
+}
+
+/// Backing the test suite uses: tiny per-case DBs in RAM.
+#[cfg(test)]
+const TEST_PGDATA: PgData = PgData::Tmpfs { size: "2g" };
+
+/// The process-wide container, built on first call with `pgdata` (the first call wins).
+fn shared(pgdata: PgData) -> &'static Shared {
     SHARED.get_or_init(|| {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -61,31 +78,45 @@ fn shared() -> &'static Shared {
             .expect("build harness runtime");
 
         let (container, admin_url) = rt.block_on(async {
-            let container = Postgres::default()
-                // The image is pre-pulled; the tag is pinned for speed/determinism.
-                .with_tag("18.4-alpine")
-                // Durability is pointless for a throwaway cluster; skipping WAL flushes is a
-                // large speedup for the sim's many tiny transactions.
-                .with_cmd([
-                    "postgres",
-                    "-c",
-                    "fsync=off",
-                    "-c",
-                    "synchronous_commit=off",
-                    "-c",
-                    "full_page_writes=off",
-                ])
-                // Keep the cluster (postgres:18 puts PGDATA under /var/lib/postgresql/<ver>)
-                // in memory: per-case databases are tiny and shrink replays clone many.
-                .with_mount(Mount::tmpfs_mount("/var/lib/postgresql").with_size("2g"))
-                .start()
-                .await
-                .expect("start postgres container");
+            // Throwaway cluster — skip WAL flushes (a big speedup for the many tiny transactions), and
+            // back dynamic shared memory with mmap'd PGDATA files instead of `/dev/shm`, so
+            // parallel-query DSM segments over the full placement can't overflow the container's fixed
+            // tmpfs `/dev/shm` (hot pages stay in the page cache, so mmap ≈ posix when RAM is free).
+            let mut cmd: Vec<String> = [
+                "postgres",
+                "-c",
+                "fsync=off",
+                "-c",
+                "synchronous_commit=off",
+                "-c",
+                "full_page_writes=off",
+                "-c",
+                "dynamic_shared_memory_type=mmap",
+            ]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+            if explain::enabled() {
+                for &setting in explain::SESSION_SETTINGS {
+                    cmd.push("-c".to_string());
+                    cmd.push(setting.to_string());
+                }
+            }
+            // Tag pinned for speed/determinism.
+            let image = Postgres::default().with_tag("18.4-alpine").with_cmd(cmd);
+            let image = match pgdata {
+                // postgres:18 keeps PGDATA under /var/lib/postgresql/<ver>; tmpfs puts it in RAM.
+                PgData::Tmpfs { size } => {
+                    image.with_mount(Mount::tmpfs_mount("/var/lib/postgresql").with_size(size))
+                }
+                PgData::Disk => image,
+            };
+            let container = image.start().await.expect("start postgres container");
             let port = container
                 .get_host_port_ipv4(5432)
                 .await
                 .expect("postgres host port");
-            // The module defaults to user/password/db all `postgres`.
+            // The module's default user/password/db are all `postgres`.
             let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
             (container, url)
         });
@@ -97,8 +128,8 @@ fn shared() -> &'static Shared {
             &format!("CREATE DATABASE {template}"),
         ));
 
-        // Migrate OUTSIDE block_on (see module docs). Drop releases the advisory lock and
-        // leaves the template connection-free — Postgres refuses to clone a DB with open conns.
+        // Migrate outside `block_on` (nested-runtime rule). Dropping `storage` releases the advisory
+        // lock and closes the connection — Postgres won't clone a DB that has open connections.
         let template_url = url_with_db(&admin_url, &template);
         let mut storage = PostgresStorage::connect(&template_url).expect("connect template");
         storage.migrate().expect("migrate template");
@@ -120,7 +151,7 @@ async fn admin_exec(admin_url: &str, sql: &str) {
     let mut conn = sqlx::PgConnection::connect(admin_url)
         .await
         .expect("admin connect");
-    // Test-only admin DDL (e.g. CREATE DATABASE), not user input. sqlx 0.9 gates dynamic SQL.
+    // In-crate admin DDL (CREATE DATABASE), never user input — hence `AssertSqlSafe`.
     sqlx::query(sqlx::AssertSqlSafe(sql))
         .execute(&mut conn)
         .await
@@ -134,10 +165,18 @@ fn url_with_db(url: &str, db: &str) -> String {
     format!("{base}/{db}")
 }
 
-/// A fresh database cloned from the migrated template. The caller must ensure
-/// `prefix`+`id` is unique within the test binary (a duplicate `CREATE DATABASE` panics).
+/// A fresh database cloned from the migrated template, on the default test backing. `prefix`+`id`
+/// must be unique within the process (a duplicate `CREATE DATABASE` panics).
+#[cfg(test)]
 pub(crate) fn fresh_db(prefix: &str, id: u64) -> PostgresStorage {
-    let s = shared();
+    fresh_db_with(TEST_PGDATA, prefix, id)
+}
+
+/// [`fresh_db`] with an explicit container backing, for callers whose DB won't fit the test tmpfs —
+/// the mainnet-scale reshuffle-sim passes [`PgData::Disk`]. The first call in a process fixes the
+/// backing for the shared container; later calls reuse it.
+pub fn fresh_db_with(pgdata: PgData, prefix: &str, id: u64) -> PostgresStorage {
+    let s = shared(pgdata);
     let name = format!("{prefix}_{id}");
     s.rt.block_on(admin_exec(
         &s.admin_url,

@@ -47,7 +47,7 @@ built.
 | Two-phase publish (worker assignment confirmed → portal promotion) | ✅ | Gated on the confirmation watermark. |
 | Chunk corrections (1-to-1 same-range swaps) | ✅ | Both backends; property-tested. |
 | Deferred removal / stale mappings (`ideal ∪ stale`) | ✅ | Both backends. |
-| Capacity-aware placement (footprint charge, credit-held-free, skip-don't-spill, essentials-first) | ✅ | `Reconcile` in `multistep_scheduler/mod.rs`. |
+| Capacity-aware placement (footprint charge, credit-held-free, bounded-load spill, essentials-first) | ✅ | `Reconcile` in `multistep_scheduler/mod.rs`. |
 | X% promotion threshold (quorum) | 🧪 | Computed by the sim's worker fleet; the storage core only consumes a precomputed confirmation watermark. No production quorum logic. |
 | Replica-sufficiency **drain gate** (capacity-aware "rule 2") | 📐 | Drains expire on the M-tick timer only. |
 | Replica-sufficiency **promotion gate** (capacity-aware "rule 3") | 📐 | Promotion is gated on assignment confirmation, not on a confirmed-copy count. |

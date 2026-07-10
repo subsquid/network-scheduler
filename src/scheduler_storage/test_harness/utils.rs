@@ -9,9 +9,11 @@ use std::sync::Arc;
 use libp2p_identity::PeerId;
 use semver::Version;
 
-use crate::scheduler_storage::algorithm::{IdealMapping, ScheduleOutput, SchedulingAlgorithm};
-use crate::scheduler_storage::{ChunkPk, WorkerPk};
-use crate::types::{Chunk, Worker, WorkerStatus};
+use crate::scheduler_storage::algorithm::{
+    CurrentPlacement, IdealMapping, ScheduleOutput, SchedulingAlgorithm,
+};
+use crate::scheduler_storage::{AlgoChunk, ChunkPk, NewChunk, WorkerPk};
+use crate::types::{Worker, WorkerStatus};
 
 /// Deterministic peer id derived from a small seed.
 pub fn peer(seed: u8) -> PeerId {
@@ -36,9 +38,9 @@ pub fn dataset(name: &str) -> String {
 /// Build a `Chunk` without `Chunk::new`, so tests don't depend on `DataChunk` id parsing. `id_seed`
 /// sets the id and a two-block range `[2·seed, 2·seed+1]`, so distinct seeds give distinct,
 /// non-overlapping chunks.
-pub fn chunk(dataset_name: &str, id_seed: u32, size: u32) -> Chunk {
+pub fn chunk(dataset_name: &str, id_seed: u32, size: u32) -> NewChunk {
     let first = id_seed as u64 * 2;
-    Chunk {
+    NewChunk {
         dataset: Arc::new(dataset(dataset_name)),
         id: Arc::new(format!(
             "0000000000/{:010}-{:010}-{:08x}",
@@ -48,8 +50,8 @@ pub fn chunk(dataset_name: &str, id_seed: u32, size: u32) -> Chunk {
         )),
         size,
         blocks: first..=first + 1,
-        files: Arc::new(Vec::new()),
-        summary: None,
+        schema_id: None,
+        tables_present: None,
     }
 }
 
@@ -61,8 +63,8 @@ pub fn chunk_with_blocks(
     id_seed: u32,
     size: u32,
     blocks: std::ops::RangeInclusive<u64>,
-) -> Chunk {
-    Chunk {
+) -> NewChunk {
+    NewChunk {
         blocks,
         ..chunk(dataset_name, id_seed, size)
     }
@@ -79,9 +81,9 @@ impl SchedulingAlgorithm for StaticSchedulingAlgorithm {
 
     fn schedule(
         &self,
-        _chunks: Vec<(ChunkPk, Chunk)>,
+        _chunks: Vec<(ChunkPk, AlgoChunk)>,
         _workers: Vec<(WorkerPk, Worker)>,
-        _current_placement: &BTreeMap<ChunkPk, Vec<WorkerPk>>,
+        _current_placement: &CurrentPlacement,
         _config: &(),
     ) -> anyhow::Result<ScheduleOutput> {
         Ok(ScheduleOutput {

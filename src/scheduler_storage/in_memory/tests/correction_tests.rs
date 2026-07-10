@@ -39,7 +39,7 @@ fn corrections_safety_ok(storage: &InMemoryStorage) -> Result<(), String> {
         .get_chunks_metadata(|meta| {
             meta.marked_for_removal
                 || meta.dropped_at_portal_assignment_id.is_some()
-                || meta.dropped_at_worker_assignment_id.is_some()
+                || meta.dropped_from_worker_assignment_at.is_some()
         })
         .into_iter()
         .map(|meta| meta.chunk_pk)

@@ -4,8 +4,9 @@
 //! are not expected to optimize them. Production hot paths should use direct,
 //! named queries.
 
+use crate::scheduler_storage::NewChunk;
 use crate::scheduler_storage::{ChunkPk, Tick, WorkerPk};
-use crate::types::{Chunk, Worker};
+use crate::types::Worker;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -27,7 +28,7 @@ pub struct ChunkMetadataView {
     pub marked_for_removal: bool,
     pub rejected: bool,
     pub dropped_at_portal_assignment_id: Option<u64>,
-    pub dropped_at_worker_assignment_id: Option<u64>,
+    pub dropped_from_worker_assignment_at: Option<u64>,
 }
 
 /// One row of `sched_stale_mappings`.
@@ -120,7 +121,7 @@ pub trait StorageInspect {
 
     /// The storage pk of an inserted chunk, looked up by its `(dataset, id)`. Test convenience
     /// over [`get_chunks`](Self::get_chunks).
-    fn pk_of(&self, chunk: &Chunk) -> ChunkPk {
+    fn pk_of(&self, chunk: &NewChunk) -> ChunkPk {
         self.get_chunks(|view| view.dataset == *chunk.dataset && view.chunk_id == *chunk.id)
             .into_iter()
             .next()
@@ -184,7 +185,7 @@ pub trait StorageInspect {
         self.get_chunks_metadata(|meta| {
             meta.marked_for_removal
                 || meta.dropped_at_portal_assignment_id.is_some()
-                || meta.dropped_at_worker_assignment_id.is_some()
+                || meta.dropped_from_worker_assignment_at.is_some()
         })
         .into_iter()
         .map(|meta| meta.chunk_pk)

@@ -18,20 +18,15 @@ use std::collections::BTreeMap;
 
 use itertools::Itertools;
 use libp2p_identity::PeerId;
-use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use seahash::hash;
-use tracing::instrument;
 
 use semver::Version;
 
+use crate::rings::{Rings, WorkerRingCache, walk_ring_from};
 use crate::{
     replication::{ReplicationError, calc_replication_factors},
     types::{Assignment, ChunkIndex, ChunkWeight, ReplicationFactor, Worker, WorkerIndex},
 };
-
-type RingIndex = u16;
-
-const N_RINGS: usize = 6000;
 
 /// Chunk indices assigned to each worker.
 type WorkerChunks = BTreeMap<PeerId, Vec<ChunkIndex>>;
@@ -60,8 +55,9 @@ pub struct ScheduledChunk<'a> {
 pub fn schedule(
     chunks: &[ScheduledChunk<'_>],
     workers: &[Worker],
-    config: SchedulingConfig,
+    config: &SchedulingConfig,
     current: &[Vec<WorkerIndex>],
+    cache: &mut WorkerRingCache,
 ) -> Result<Assignment, ReplicationError> {
     let _timer = crate::metrics::Timer::new("schedule");
     debug_assert_eq!(chunks.len(), current.len());
@@ -79,7 +75,7 @@ pub fn schedule(
             chunks.len(),
             workers.len()
         );
-        return schedule_to_workers(chunks, &sorted, &config, current);
+        return schedule_to_workers(chunks, &sorted, config, current, cache);
     }
 
     tracing::info!(
@@ -87,7 +83,7 @@ pub fn schedule(
         chunks.len(),
         reliable
     );
-    let mut assignment = schedule_to_workers(chunks, &sorted[..reliable], &config, current)?;
+    let mut assignment = schedule_to_workers(chunks, &sorted[..reliable], config, current, cache)?;
     if reliable == workers.len() {
         return Ok(assignment);
     }
@@ -97,7 +93,7 @@ pub fn schedule(
         chunks.len(),
         workers.len()
     );
-    let all = schedule_to_workers(chunks, &sorted, &config, current)?;
+    let all = schedule_to_workers(chunks, &sorted, config, current, cache)?;
     // Reliable workers keep their assignment; unreliable ones take theirs from `all`.
     for (worker_id, chunk_indexes) in all.worker_chunks {
         assignment
@@ -113,35 +109,47 @@ fn schedule_to_workers(
     workers: &[&Worker],
     config: &SchedulingConfig,
     current: &[Vec<WorkerIndex>],
+    cache: &mut WorkerRingCache,
 ) -> Result<Assignment, ReplicationError> {
     let caps = replication_cap(chunks, workers.len(), config)?;
-    let replicated = to_replicated(chunks, &caps);
+    // Hash every replica once here; Stage 1 and Stage 2 both index these instead of re-hashing.
+    let hashes = hash_chunks(chunks, &caps, config.min_replication);
+    let replicated = to_replicated(chunks, &caps, &hashes);
     tracing::info!("Replication caps by weight: {caps:?}");
 
-    let worker_ids = workers.iter().map(|w| w.id).collect_vec();
-    let rings = hash_workers(&worker_ids);
+    let rings = cache.rings(workers.iter().map(|w| w.id));
 
     // Under `ignore_reliability = true` — the only mode this scheduler is exercised in — the
     // reliable-first sort preserves order, so the caller's positions index `workers` directly.
     let held = current;
 
+    // Version-pinned chunks first: they compete for the scarcest eligible workers, so they claim
+    // capacity before unrestricted ones. `partition` keeps input order, so placement is deterministic.
+    // `placement_order` is the restricted chunks then the unrestricted, split at `restricted_count`.
+    let (restricted, unrestricted): (Vec<usize>, Vec<usize>) =
+        (0..replicated.len()).partition(|&i| replicated[i].minimum_worker_version.is_some());
+    let restricted_count = restricted.len();
+    let placement_order: Vec<usize> = restricted.into_iter().chain(unrestricted).collect();
+
     let ideal = ideal_chunk_workers(
         &replicated,
         workers,
-        &rings,
+        rings,
         config.worker_capacity,
         config.min_replication,
+        &placement_order,
+        restricted_count,
     )?;
 
     let mut reconcile = Reconcile::new(
         &replicated,
         workers,
-        &rings,
+        rings,
         config.worker_capacity,
         &ideal,
         held,
     );
-    let (worker_chunks, achieved) = reconcile.run(config.min_replication);
+    let (worker_chunks, achieved) = reconcile.run(config.min_replication, &placement_order);
 
     Ok(Assignment {
         worker_chunks,
@@ -175,15 +183,18 @@ fn replication_cap(
 fn to_replicated<'a>(
     chunks: &[ScheduledChunk<'a>],
     replication_by_weight: &BTreeMap<ChunkWeight, ReplicationFactor>,
+    hashes: &'a [Vec<u64>],
 ) -> Vec<ReplicatedChunk<'a>> {
     chunks
         .iter()
-        .map(|c| ReplicatedChunk {
+        .zip(hashes)
+        .map(|(c, h)| ReplicatedChunk {
             dataset: c.dataset,
             chunk_id: c.chunk_id,
             replication: replication_by_weight[&c.weight],
             size: c.size,
             minimum_worker_version: c.minimum_worker_version,
+            hashes: h,
         })
         .collect()
 }
@@ -195,64 +206,50 @@ pub(crate) struct ReplicatedChunk<'a> {
     pub(crate) size: u32,
     pub(crate) replication: ReplicationFactor,
     pub(crate) minimum_worker_version: Option<&'a Version>,
+    /// Replica ring hashes by tag, precomputed once (see [`hash_chunks`]) and shared by both stages.
+    pub(crate) hashes: &'a [u64],
 }
 
-#[instrument(skip_all)]
-fn hash_workers(worker_ids: &[PeerId]) -> Vec<Vec<(u64, WorkerIndex)>> {
-    tracing::info!("Hashing workers");
-    let _timer = crate::metrics::Timer::new("schedule:distribute:hash_workers");
-
-    (0..N_RINGS as RingIndex)
-        .into_par_iter()
-        .map(|ring_index| {
-            let mut vec = worker_ids
-                .iter()
-                .enumerate()
-                .map(|(worker_index, worker_id)| {
-                    let buffer = [
-                        worker_id.to_bytes().as_slice(),
-                        b":",
-                        &ring_index.to_le_bytes(),
-                    ]
-                    .concat();
-                    (hash(&buffer), worker_index as WorkerIndex)
+/// Each chunk's replica ring hashes, for tags `0..max(min_replication, weight cap)` — the most any
+/// pass walks — so both placement stages index them rather than hash during the ring walk.
+fn hash_chunks(
+    chunks: &[ScheduledChunk<'_>],
+    caps: &BTreeMap<ChunkWeight, ReplicationFactor>,
+    min_replication: ReplicationFactor,
+) -> Vec<Vec<u64>> {
+    use rayon::prelude::*;
+    // The hash is over a contiguous `dataset/chunk_id:tag`; reuse one buffer per worker, rewriting
+    // only the tag suffix.
+    chunks
+        .par_iter()
+        .map_init(Vec::<u8>::new, |buffer, chunk| {
+            buffer.clear();
+            buffer.extend_from_slice(chunk.dataset.as_bytes());
+            buffer.push(b'/');
+            buffer.extend_from_slice(chunk.chunk_id.as_bytes());
+            buffer.push(b':');
+            let prefix = buffer.len();
+            let tags = min_replication.max(caps[&chunk.weight]);
+            (0..tags)
+                .map(|tag| {
+                    buffer.truncate(prefix);
+                    buffer.extend_from_slice(&tag.to_le_bytes());
+                    hash(buffer)
                 })
-                .collect_vec();
-            vec.sort_unstable();
-            vec
+                .collect()
         })
         .collect()
 }
 
-fn replica_hash(chunk: &ReplicatedChunk, tag: ReplicationFactor) -> u64 {
-    let buffer = [
-        chunk.dataset.as_bytes(),
-        b"/",
-        chunk.chunk_id.as_bytes(),
-        b":",
-        &tag.to_le_bytes(),
-    ]
-    .concat();
-    hash(&buffer)
-}
-
-/// Walk a chunk's hash ring from the home of its `tag`-th replica, offering each worker in ring
-/// order (wrapping) to `accept` until one is claimed. Both stages share this traversal; each
-/// supplies its own eligibility, cost, and commit logic through `accept`.
+/// Walk the `tag`-th replica's ring from its precomputed hash (see [`walk_ring_from`]). Both
+/// placement stages share this; each supplies its own eligibility, cost, and commit logic via `accept`.
 fn walk_ring(
-    rings: &[Vec<(u64, WorkerIndex)>],
+    rings: &Rings,
     chunk: &ReplicatedChunk,
     tag: ReplicationFactor,
-    mut accept: impl FnMut(WorkerIndex) -> bool,
+    accept: impl FnMut(WorkerIndex) -> bool,
 ) -> Option<WorkerIndex> {
-    let chunk_hash = replica_hash(chunk, tag);
-    let ring = &rings[chunk_hash as usize % N_RINGS];
-    let first = ring.partition_point(|(x, _)| *x < chunk_hash);
-    ring[first..]
-        .iter()
-        .chain(&ring[..first])
-        .map(|&(_, worker)| worker)
-        .find(|&worker| accept(worker))
+    walk_ring_from(rings, chunk.hashes[tag as usize], accept)
 }
 
 fn version_eligible(chunk: &ReplicatedChunk, worker: &Worker) -> bool {
@@ -314,21 +311,19 @@ fn min_replication_by_weight(
 fn ideal_chunk_workers(
     chunks: &[ReplicatedChunk],
     workers: &[&Worker],
-    rings: &[Vec<(u64, WorkerIndex)>],
+    rings: &Rings,
     worker_capacity: u64,
     min_replication: ReplicationFactor,
+    placement_order: &[usize],
+    restricted_count: usize,
 ) -> Result<Vec<Vec<WorkerIndex>>, ReplicationError> {
     let mut placement = Placement::new(chunks, workers, rings, worker_capacity);
 
-    // `partition` keeps each group in input order, so placement stays deterministic.
-    let (restricted, unrestricted): (Vec<usize>, Vec<usize>) =
-        (0..chunks.len()).partition(|&i| chunks[i].minimum_worker_version.is_some());
+    // Floor the version-restricted chunks (the `placement_order` prefix) before the unrestricted ones.
+    placement.ensure_minimum(&placement_order[..restricted_count], min_replication)?;
+    placement.ensure_minimum(&placement_order[restricted_count..], min_replication)?;
 
-    placement.ensure_minimum(&restricted, min_replication)?;
-    placement.ensure_minimum(&unrestricted, min_replication)?;
-
-    let order = restricted.into_iter().chain(unrestricted).collect_vec();
-    placement.fill_to_cap(&order, min_replication);
+    placement.fill_to_cap(placement_order, min_replication);
 
     Ok(placement.chunk_workers)
 }
@@ -337,7 +332,7 @@ fn ideal_chunk_workers(
 struct Placement<'a> {
     chunks: &'a [ReplicatedChunk<'a>],
     workers: &'a [&'a Worker],
-    rings: &'a [Vec<(u64, WorkerIndex)>],
+    rings: &'a Rings,
     worker_capacity: u64,
     /// Bytes assigned to each worker.
     allocated: Vec<u64>,
@@ -351,7 +346,7 @@ impl<'a> Placement<'a> {
     fn new(
         chunks: &'a [ReplicatedChunk<'a>],
         workers: &'a [&'a Worker],
-        rings: &'a [Vec<(u64, WorkerIndex)>],
+        rings: &'a Rings,
         worker_capacity: u64,
     ) -> Self {
         Self {
@@ -431,7 +426,7 @@ impl FillToCap for Placement<'_> {
 struct Reconcile<'a> {
     chunks: &'a [ReplicatedChunk<'a>],
     workers: &'a [&'a Worker],
-    rings: &'a [Vec<(u64, WorkerIndex)>],
+    rings: &'a Rings,
     worker_capacity: u64,
     /// Bytes physically on each worker (footprint plus new downloads this cycle). Never
     /// decreased: removal is asynchronous, so dropped bytes still occupy disk this cycle.
@@ -444,8 +439,6 @@ struct Reconcile<'a> {
     ideal: &'a [Vec<WorkerIndex>],
     /// Current holders per chunk, in input order; draining copies included.
     held: &'a [Vec<WorkerIndex>],
-    /// `held` sorted for binary search (`is_held`). Already a set, so no dedup.
-    held_sorted: Vec<Vec<WorkerIndex>>,
     /// New chunks excluded this cycle because they couldn't reach the floor.
     excluded: Vec<bool>,
 }
@@ -454,21 +447,17 @@ impl<'a> Reconcile<'a> {
     fn new(
         chunks: &'a [ReplicatedChunk<'a>],
         workers: &'a [&'a Worker],
-        rings: &'a [Vec<(u64, WorkerIndex)>],
+        rings: &'a Rings,
         worker_capacity: u64,
         ideal: &'a [Vec<WorkerIndex>],
         held: &'a [Vec<WorkerIndex>],
     ) -> Self {
         let n_chunks = chunks.len();
-        let mut held_sorted = vec![Vec::new(); n_chunks];
         let mut allocated = vec![0u64; workers.len()];
         for ci in 0..n_chunks {
-            let mut holders = held[ci].clone();
-            holders.sort_unstable();
-            for &w in &holders {
+            for &w in &held[ci] {
                 allocated[w as usize] += chunks[ci].size as u64;
             }
-            held_sorted[ci] = holders;
         }
         Self {
             chunks,
@@ -480,7 +469,6 @@ impl<'a> Reconcile<'a> {
             chunk_workers: vec![Vec::new(); n_chunks],
             ideal,
             held,
-            held_sorted,
             excluded: vec![false; n_chunks],
         }
     }
@@ -488,23 +476,18 @@ impl<'a> Reconcile<'a> {
     fn run(
         &mut self,
         min_replication: ReplicationFactor,
+        placement_order: &[usize],
     ) -> (WorkerChunks, Vec<ReplicationFactor>) {
         let _timer = crate::metrics::Timer::new("schedule:reconcile");
-
-        // Version-pinned chunks first: scarcest eligible workers, so they claim capacity
-        // before unrestricted ones.
-        let (restricted, unrestricted): (Vec<usize>, Vec<usize>) =
-            (0..self.chunks.len()).partition(|&i| self.chunks[i].minimum_worker_version.is_some());
-        let order = restricted.into_iter().chain(unrestricted).collect_vec();
 
         // Phase A — floors. Established chunks walk tag-outer (load balance, held copies free).
         // New chunks are placed greedily, one whole chunk to its full floor at a time: tag-outer
         // would let two new chunks competing for the same room each grab a partial floor and
         // *both* roll back to zero, leaving placeable capacity unused.
-        let (new_chunks, held_chunks): (Vec<usize>, Vec<usize>) = order
+        let (new_chunks, held_chunks): (Vec<usize>, Vec<usize>) = placement_order
             .iter()
             .copied()
-            .partition(|&i| self.held_sorted[i].is_empty());
+            .partition(|&i| self.held[i].is_empty());
 
         for tag in 0..min_replication {
             for &chunk_index in &held_chunks {
@@ -532,11 +515,11 @@ impl<'a> Reconcile<'a> {
         // once every floor lands, bonuses regrow, so the converged fixed point is unchanged.
         let floor_unmet = self.excluded.iter().any(|&excluded| excluded);
         if !floor_unmet {
-            self.fill_to_cap(&order, min_replication);
+            self.fill_to_cap(placement_order, min_replication);
         }
 
         // Phase C — floor add-back (invariant 4).
-        for &chunk_index in &order {
+        for &chunk_index in placement_order {
             self.floor_add_back(chunk_index, min_replication);
         }
 
@@ -563,7 +546,7 @@ impl<'a> Reconcile<'a> {
         let workers = self.workers;
         let rings = self.rings;
         let worker_capacity = self.worker_capacity;
-        let held_sorted = &self.held_sorted[chunk_index];
+        let held = &self.held[chunk_index];
         let allocated = &mut self.allocated;
         let worker_chunks = &mut self.worker_chunks;
         let chunk_workers = &mut self.chunk_workers;
@@ -575,7 +558,7 @@ impl<'a> Reconcile<'a> {
                 return false;
             }
             // Held copies are already charged in `allocated`; keeping one costs 0.
-            let cost = if held_sorted.binary_search(&worker).is_ok() {
+            let cost = if held.contains(&worker) {
                 0
             } else {
                 chunk.size as u64
@@ -594,7 +577,7 @@ impl<'a> Reconcile<'a> {
     /// added back free in preference order (ideal positions first). New/excluded chunks are
     /// skipped — their floor is owned by Phase A.
     fn floor_add_back(&mut self, chunk_index: usize, min_replication: ReplicationFactor) {
-        if self.held_sorted[chunk_index].is_empty() || self.excluded[chunk_index] {
+        if self.held[chunk_index].is_empty() || self.excluded[chunk_index] {
             return;
         }
         let mut current_in_pub = self.chunk_workers[chunk_index]
@@ -655,7 +638,7 @@ impl<'a> Reconcile<'a> {
 
     /// Whether worker `w` physically holds chunk `chunk_index` right now.
     fn is_held(&self, chunk_index: usize, w: WorkerIndex) -> bool {
-        self.held_sorted[chunk_index].binary_search(&w).is_ok()
+        self.held[chunk_index].contains(&w)
     }
 
     fn achieved_replication(&self) -> Vec<ReplicationFactor> {

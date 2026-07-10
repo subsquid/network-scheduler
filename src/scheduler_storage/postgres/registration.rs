@@ -7,17 +7,15 @@ use sqlx::postgres::{PgConnection, PgRow};
 use sqlx::{Connection, Row};
 
 use crate::metrics::PhaseTimer;
-use crate::scheduler_storage::{ChunkPk, StorageError};
-use crate::types::Chunk;
+use crate::scheduler_storage::{ChunkPk, NewChunk, StorageError};
 
 use super::nonoverlap::Candidate;
-use super::rows::{block_range_columns, is_unique_violation};
+use super::rows::{ChunkInsertArrays, is_unique_violation};
 
-/// Insert raw chunk rows, batched in one transaction. Each chunk has its own list of files, which
-/// the flat `UNNEST` the cycle uses can't carry, so the payload is jsonb.
+/// Insert raw chunk rows, batched in one transaction; one `UNNEST` statement per batch.
 pub(super) async fn insert_chunks(
     conn: &mut PgConnection,
-    chunks: &[Chunk],
+    chunks: &[NewChunk],
     batch_size: usize,
 ) -> Result<(), StorageError> {
     let mut timer = PhaseTimer::new("insert_new_chunks");
@@ -26,19 +24,26 @@ pub(super) async fn insert_chunks(
     }
     let mut tx = conn.begin().await.context("insert_new_chunks: begin")?;
     for batch in chunks.chunks(batch_size) {
-        let payload = insert_payload(batch)?;
+        let p = ChunkInsertArrays::from_chunks(batch.iter());
         let inserted = sqlx::query(
             r#"
-            INSERT INTO chunks (dataset_id, chunk_id, size, files, first_block, last_block_delta)
-            SELECT d.id, x.chunk_id, x.size, x.files, x.first_block, x.last_block_delta
-            FROM jsonb_to_recordset($1::jsonb)
-                 AS x(dataset text, chunk_id text, size int, files text[],
-                       first_block bigint, last_block_delta int)
+            INSERT INTO chunks (dataset_id, chunk_id, size, schema_id, tables_present, first_block, last_block_delta)
+            SELECT d.id, x.chunk_id, x.size, COALESCE(x.schema_id, cur.id), x.tables_present, x.first_block, x.last_block_delta
+            FROM UNNEST($1::text[], $2::text[], $3::int[], $4::int[], $5::varbit[], $6::bigint[], $7::int[])
+                 AS x(dataset, chunk_id, size, schema_id, tables_present, first_block, last_block_delta)
             JOIN datasets d ON d.name = x.dataset
+            -- No explicit pin -> stamp the dataset's current schema.
+            LEFT JOIN schemas cur ON cur.dataset_id = d.id AND cur.superseded_at IS NULL
             RETURNING 1
             "#,
         )
-        .bind(&payload)
+        .bind(&p.datasets)
+        .bind(&p.chunk_ids)
+        .bind(&p.sizes)
+        .bind(&p.schema_ids)
+        .bind(&p.tables_present)
+        .bind(&p.first_blocks)
+        .bind(&p.last_block_deltas)
         .fetch_all(&mut *tx)
         .await;
         match inserted {
@@ -56,35 +61,6 @@ pub(super) async fn insert_chunks(
     }
     tx.commit().await.context("insert_new_chunks: commit")?;
     Ok(())
-}
-
-fn insert_payload(batch: &[Chunk]) -> Result<String, StorageError> {
-    let rows_json: Vec<ChunkInsertJson> = batch
-        .iter()
-        .map(|chunk| {
-            let (first_block, last_block_delta) = block_range_columns(&chunk.blocks);
-            ChunkInsertJson {
-                dataset: chunk.dataset.as_str(),
-                chunk_id: chunk.id.as_str(),
-                size: chunk.size as i32,
-                files: chunk.files.iter().map(|s| s.as_str()).collect(),
-                first_block,
-                last_block_delta,
-            }
-        })
-        .collect();
-    Ok(serde_json::to_string(&rows_json).context("insert_new_chunks: serialize")?)
-}
-
-/// `insert_chunks` payload row; field names must match the `jsonb_to_recordset` columns.
-#[derive(serde::Serialize)]
-struct ChunkInsertJson<'a> {
-    dataset: &'a str,
-    chunk_id: &'a str,
-    size: i32,
-    files: Vec<&'a str>,
-    first_block: i64,
-    last_block_delta: i32,
 }
 
 /// New chunks (no metadata row yet) with their range and whether they're a pending correction's

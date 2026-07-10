@@ -3,6 +3,7 @@
 
 use super::super::utils::{chunk_pk, new_chunk};
 use super::*;
+use crate::scheduler_storage::NewChunk as StorageNewChunk;
 
 #[cfg(test)]
 impl<D: SimStorage> SimUnderTest<D> {
@@ -48,7 +49,7 @@ fn multiple_weights_coexist_in_one_dataset() {
 
     // pk sort order mirrors a real cycle.
     record_weights(&weights, &chunks);
-    let mut storage_chunks: Vec<Chunk> = chunks.iter().map(storage_chunk).collect();
+    let mut storage_chunks: Vec<StorageNewChunk> = chunks.iter().map(storage_chunk).collect();
     storage_chunks.sort_by_key(|c| ((*c.dataset).clone(), (*c.id).clone()));
     let prepared = weights.prepare(storage_chunks);
 
@@ -213,7 +214,7 @@ fn over_subscription_yields_typed_storage_error_shortage() {
     // `InMemoryStorage` has inherent methods of the same name, so drive the trait explicitly.
     let burst = uniform_chunks(base, 255);
     record_weights(&sim.weights, &burst); // the scheduler reads each chunk's weight back
-    let storage_chunks: Vec<Chunk> = burst.iter().map(storage_chunk).collect();
+    let storage_chunks: Vec<StorageNewChunk> = burst.iter().map(storage_chunk).collect();
     SchedulerStorage::insert_new_chunks(&mut sim.storage, storage_chunks)
         .expect("chunks name registered datasets");
     SchedulerStorage::register_new_chunks(&mut sim.storage)

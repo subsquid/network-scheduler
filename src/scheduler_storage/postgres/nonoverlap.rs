@@ -6,15 +6,16 @@
 //! 1. an indexed SQL probe rejects candidates that overlap an existing chunk, then
 //! 2. a small Rust pass settles overlaps *within* the batch (two new chunks covering the same range).
 //!
-//! The probe rides the `chunks(dataset_id, (first_block + last_block_delta))` index, so it touches
-//! only the few chunks whose range reaches up to a candidate — not the dataset's whole history.
+//! The probe rides the `chunks_dataset_range_gist` GiST index, which covers both range endpoints,
+//! so each candidate touches only the chunks that actually intersect it — not the dataset's whole
+//! history, and (unlike a btree walk) not the candidate's own not-yet-live batch-mates.
 //! See `docs/nonoverlap-promotion-gate.md`.
 
 use std::collections::{BTreeMap, HashSet};
 
 use anyhow::{Context, Result};
-use sqlx::postgres::PgRow;
-use sqlx::{PgExecutor, Row};
+use sqlx::Row;
+use sqlx::postgres::{PgConnection, PgRow};
 
 use crate::scheduler_storage::{ChunkPk, DatasetId};
 
@@ -45,32 +46,17 @@ impl Candidate {
 /// The chunks a *new* candidate must not overlap: admitted, not rejected, not leaving. No
 /// `applied_at_worker` gate — a chunk claims its range from admission, so a not-yet-scheduled (or
 /// shortage-stuck) one must still block an overlapping newcomer.
-const LIVE_ADMITTED: &str = "NOT s.rejected \
+pub(super) const LIVE_ADMITTED: &str = "NOT s.rejected \
      AND s.marked_for_removal IS NULL \
      AND s.dropped_at_portal_assignment_id IS NULL \
-     AND s.dropped_at_worker_assignment_id IS NULL";
-
-/// The chunks a *promotable* candidate must not overlap: visible now and staying visible. Excluding
-/// `marked_for_removal` lets a same-range correction replacement promote past the chunk it supersedes.
-const STILL_VISIBLE: &str = "s.applied_at_portal_assignment_id IS NOT NULL \
-     AND s.dropped_at_portal_assignment_id IS NULL \
-     AND s.marked_for_removal IS NULL";
+     AND s.dropped_from_worker_assignment_at IS NULL";
 
 /// pks of candidates whose range overlaps a live chunk in the same dataset — to reject at registration.
-pub(super) async fn overlapping_live<'e>(
-    executor: impl PgExecutor<'e>,
+pub(super) async fn overlapping_live(
+    conn: &mut PgConnection,
     candidates: &[Candidate],
 ) -> Result<HashSet<ChunkPk>> {
-    overlapping(executor, candidates, LIVE_ADMITTED).await
-}
-
-/// pks of candidates whose range overlaps a still-visible chunk in the same dataset — to hold back at
-/// promotion.
-pub(super) async fn overlapping_visible<'e>(
-    executor: impl PgExecutor<'e>,
-    candidates: &[Candidate],
-) -> Result<HashSet<ChunkPk>> {
-    overlapping(executor, candidates, STILL_VISIBLE).await
+    overlapping(conn, candidates, LIVE_ADMITTED).await
 }
 
 /// From candidates that already cleared the existing-chunk probe, keep the ones that don't overlap
@@ -107,17 +93,6 @@ pub(super) fn report_registration_rejected(rejected: &[Candidate]) {
     );
 }
 
-/// Log + count chunks held back at promotion (should never fire — registration removed overlaps).
-/// Call every cycle so the gauge resets on a clean one.
-pub(super) fn report_promotion_held_back(held: &[Candidate]) {
-    report(
-        held,
-        "chunks held back from portal promotion: block range overlaps a visible chunk in the dataset",
-        "held back from promotion",
-        crate::metrics::report_promotion_held_back,
-    );
-}
-
 fn report(
     chunks: &[Candidate],
     summary: &str,
@@ -139,51 +114,66 @@ fn report(
     emit(counts_by_dataset(chunks));
 }
 
-/// For each candidate (passed as parallel arrays), is there an existing chunk in its dataset that
-/// matches `state` and whose range overlaps it?
-async fn overlapping<'e>(
-    executor: impl PgExecutor<'e>,
+/// Returns the pks of the candidates that overlap an existing chunk in their dataset matching
+/// `chunk_state` (those to reject); candidates with no such overlap are absent from the result.
+async fn overlapping(
+    conn: &mut PgConnection,
     candidates: &[Candidate],
-    state: &str,
+    chunk_state: &str,
 ) -> Result<HashSet<ChunkPk>> {
     if candidates.is_empty() {
         return Ok(HashSet::new());
     }
     let mut timer = crate::metrics::PhaseTimer::new("nonoverlap:overlap_probe");
-    let pks: Vec<ChunkPk> = candidates.iter().map(|c| c.pk).collect();
-    let datasets: Vec<DatasetId> = candidates.iter().map(|c| c.dataset_id).collect();
-    let firsts: Vec<i64> = candidates.iter().map(|c| c.first_block).collect();
-    let lasts: Vec<i64> = candidates.iter().map(|c| c.last_block).collect();
+    let n = candidates.len();
+    let mut pks: Vec<ChunkPk> = Vec::with_capacity(n);
+    let mut datasets: Vec<DatasetId> = Vec::with_capacity(n);
+    let mut firsts: Vec<i64> = Vec::with_capacity(n);
+    let mut lasts: Vec<i64> = Vec::with_capacity(n);
+    for c in candidates {
+        pks.push(c.pk);
+        datasets.push(c.dataset_id);
+        firsts.push(c.first_block);
+        lasts.push(c.last_block);
+    }
 
-    // Inclusive-range overlap: an existing chunk overlaps us if it ends at/after our start and
-    // starts at/before our end (same predicate as the in-memory `ranges_overlap`).
-    // `state` is one of two in-crate const fragments (LIVE_ADMITTED / STILL_VISIBLE), never user
-    // input — safe to interpolate, hence `AssertSqlSafe` on the built string (sqlx 0.9 gates
-    // dynamic SQL behind `SqlSafeStr`).
+    // Per candidate, one search of the chunks_dataset_range_gist index: keep the candidate iff some
+    // live chunk's range intersects its own (`&&`, built with the index's exact expression). The
+    // nearest-left btree walk this replaces had to liveness-check every row it skipped; a dataset
+    // registered whole in one batch has no live row to stop at, so that walk was O(N²) in the
+    // batch. `LIMIT 1` also pins the plan: an un-fenced EXISTS in WHERE may flatten into a semi
+    // join, and a plan that sees the array cardinality picks a merge join sorting every live chunk
+    // — minutes at production scale. A LATERAL with LIMIT can't be flattened, so the probe stays on
+    // the index regardless of stats or plan-cache state.
+    // `chunk_state` is a trusted in-crate const (LIVE_ADMITTED), never user input.
     let sql = format!(
         r#"
         SELECT cand.chunk_pk
         FROM UNNEST($1::bigint[], $2::smallint[], $3::bigint[], $4::bigint[])
                AS cand(chunk_pk, dataset_id, first_block, last_block)
-        WHERE EXISTS (
+        CROSS JOIN LATERAL (
             SELECT 1
             FROM sched_chunk_metadata s
             JOIN chunks c ON c.chunk_pk = s.chunk_pk
             WHERE c.dataset_id = cand.dataset_id
-              AND c.first_block + c.last_block_delta >= cand.first_block
-              AND c.first_block <= cand.last_block
-              AND {state}
-        )
+              AND int8range(c.first_block, c.first_block + c.last_block_delta, '[]')
+                  && int8range(cand.first_block, cand.last_block, '[]')
+              AND {chunk_state}
+            LIMIT 1
+        ) hit
         "#
     );
-    let rows = sqlx::query(sqlx::AssertSqlSafe(sql))
-        .bind(&pks)
-        .bind(&datasets)
-        .bind(&firsts)
-        .bind(&lasts)
-        .fetch_all(executor)
-        .await
-        .context("non-overlap: existing-chunk probe")?;
+    let rows = super::debug::with_explain(conn, async |c| {
+        sqlx::query(sqlx::AssertSqlSafe(sql))
+            .bind(&pks)
+            .bind(&datasets)
+            .bind(&firsts)
+            .bind(&lasts)
+            .fetch_all(c)
+            .await
+    })
+    .await
+    .context("non-overlap: existing-chunk probe")?;
     timer.stmt(rows.len() as u64);
     Ok(rows
         .iter()

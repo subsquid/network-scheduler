@@ -1,12 +1,11 @@
 //! Reshuffle metrics and the assignment diffing that produces them.
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::cmp::Ordering;
+use std::collections::{BTreeMap, HashSet};
 use std::time::Duration;
 
-use libp2p_identity::PeerId;
-
 use crate::simulation::StepPlacement;
-use crate::{ChunkId, ChunkOwners, ChunkSizeIndex};
+use crate::{ChunkId, ChunkOwners, ChunkSizeIndex, WorkerIdx};
 
 /// Metrics for a single simulation step.
 pub struct ReshuffleMetrics {
@@ -21,6 +20,8 @@ pub struct ReshuffleMetrics {
     pub data_movement: DataMovement,
     pub total_capacity_bytes: u64,
     pub used_capacity_bytes: u64,
+    /// Of `used_capacity_bytes`, the bytes held by draining stale copies (0 on the stateless path).
+    pub stale_capacity_bytes: u64,
     pub eligible_workers: usize,
     /// False when scheduling failed at this step; the run stops after.
     pub scheduled: bool,
@@ -73,6 +74,7 @@ pub fn measure_reshuffle(
         chunk_sizes,
         replication_by_weight,
         used_capacity_bytes,
+        stale_capacity_bytes,
         total_chunks,
         schedule_duration,
     } = placement;
@@ -94,6 +96,7 @@ pub fn measure_reshuffle(
         data_movement,
         total_capacity_bytes,
         used_capacity_bytes,
+        stale_capacity_bytes,
         eligible_workers: stats.eligible_workers,
         scheduled: true,
         failure_reason: None,
@@ -123,6 +126,7 @@ pub fn failed_step_metrics(
         data_movement: DataMovement::zero(),
         total_capacity_bytes,
         used_capacity_bytes: 0,
+        stale_capacity_bytes: 0,
         eligible_workers: stats.eligible_workers,
         scheduled: false,
         failure_reason: Some(reason),
@@ -183,41 +187,61 @@ struct Movement {
     shuffled_count: u32,
     increased_replication_bytes: u64,
     decreased_replication_bytes: u64,
-    workers_receiving_new: BTreeSet<PeerId>,
-    workers_losing: BTreeSet<PeerId>,
-    workers_shuffled: BTreeSet<PeerId>,
+    // Distinct affected workers; only their final `.len()` is read, so unordered.
+    workers_receiving_new: HashSet<WorkerIdx>,
+    workers_losing: HashSet<WorkerIdx>,
+    workers_shuffled: HashSet<WorkerIdx>,
 }
 
 impl Movement {
-    fn record_existing(
-        &mut self,
-        size: u64,
-        previous: &BTreeSet<PeerId>,
-        current: &BTreeSet<PeerId>,
-    ) {
-        let gained = current.difference(previous).count();
-        let lost = previous.difference(current).count();
-        let shuffled = gained.min(lost);
+    fn record_existing(&mut self, size: u64, previous: &[WorkerIdx], current: &[WorkerIdx]) {
+        // Both holder lists are sorted, so walk them in lockstep: a worker only in
+        // `current` gained this chunk, one only in `previous` lost it, matches are
+        // unchanged.
+        let (mut i, mut j) = (0, 0);
+        let (mut gained, mut lost) = (0u64, 0u64);
+        while i < current.len() && j < previous.len() {
+            match current[i].cmp(&previous[j]) {
+                Ordering::Less => {
+                    self.workers_shuffled.insert(current[i]);
+                    gained += 1;
+                    i += 1;
+                }
+                Ordering::Greater => {
+                    self.workers_losing.insert(previous[j]);
+                    lost += 1;
+                    j += 1;
+                }
+                Ordering::Equal => {
+                    i += 1;
+                    j += 1;
+                }
+            }
+        }
+        for &w in &current[i..] {
+            self.workers_shuffled.insert(w);
+            gained += 1;
+        }
+        for &w in &previous[j..] {
+            self.workers_losing.insert(w);
+            lost += 1;
+        }
 
+        let shuffled = gained.min(lost);
         if shuffled > 0 {
             self.shuffled_count += 1;
-            self.shuffled_bytes += size * shuffled as u64;
+            self.shuffled_bytes += size * shuffled;
         }
-        self.increased_replication_bytes += size * gained.saturating_sub(lost) as u64;
-        self.decreased_replication_bytes += size * lost.saturating_sub(gained) as u64;
-
-        self.workers_shuffled
-            .extend(current.difference(previous).copied());
-        self.workers_losing
-            .extend(previous.difference(current).copied());
+        self.increased_replication_bytes += size * gained.saturating_sub(lost);
+        self.decreased_replication_bytes += size * lost.saturating_sub(gained);
     }
 
-    fn record_added(&mut self, size: u64, current: &BTreeSet<PeerId>) {
+    fn record_added(&mut self, size: u64, current: &[WorkerIdx]) {
         self.new_chunk_bytes += size * current.len() as u64;
         self.workers_receiving_new.extend(current.iter().copied());
     }
 
-    fn record_removed(&mut self, size: u64, previous: &BTreeSet<PeerId>) {
+    fn record_removed(&mut self, size: u64, previous: &[WorkerIdx]) {
         self.decreased_replication_bytes += size * previous.len() as u64;
         self.workers_losing.extend(previous.iter().copied());
     }

@@ -1,7 +1,10 @@
 use libp2p_identity::PeerId;
 use std::collections::BTreeMap;
+use std::ops::RangeInclusive;
+use std::sync::Arc;
 
-use crate::types::{Chunk, Worker};
+use crate::types::{BlockNumber, DatasetSchema, Worker};
+use crate::weight::SchedulingChunk;
 
 /// Logical integer timestamp; the caller supplies the clock (test ticks, or a monotonic clock
 /// such as wall-clock seconds in production).
@@ -25,8 +28,7 @@ pub enum StorageError {
     #[error("database error: {0:#}")]
     Database(anyhow::Error),
 
-    /// Test-only: `register_correction` rejected invalid inputs or chunks in an
-    /// incompatible state.
+    /// `register_correction` rejected invalid inputs or chunks in an incompatible state.
     #[error("correction rejected: {reason}")]
     CorrectionRejected { reason: String },
 
@@ -45,13 +47,76 @@ impl From<anyhow::Error> for StorageError {
 
 pub mod algorithm;
 pub mod ids;
-pub use ids::{ChunkPk, DatasetId, WorkerPk};
+pub use ids::{ChunkPk, DatasetId, SchemaId, WorkerPk};
 #[cfg(test)]
 pub(crate) mod in_memory;
 pub mod postgres;
 
-#[cfg(test)]
+#[cfg(any(test, feature = "pg-testkit"))]
 pub mod test_harness;
+
+/// The scheduling algorithms' input view of a chunk.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AlgoChunk {
+    pub dataset: Arc<String>,
+    pub id: Arc<String>,
+    pub size: u32,
+    pub blocks: RangeInclusive<BlockNumber>,
+}
+
+impl SchedulingChunk for AlgoChunk {
+    fn dataset(&self) -> &Arc<String> {
+        &self.dataset
+    }
+    fn id(&self) -> &Arc<String> {
+        &self.id
+    }
+    fn blocks(&self) -> &RangeInclusive<BlockNumber> {
+        &self.blocks
+    }
+    fn size(&self) -> u32 {
+        self.size
+    }
+}
+
+/// A chunk to insert ([`SchedulerStorage::insert_new_chunks`] / corrections).
+#[derive(Debug, Clone, PartialEq)]
+pub struct NewChunk {
+    pub dataset: Arc<String>,
+    pub id: Arc<String>,
+    pub size: u32,
+    pub blocks: RangeInclusive<BlockNumber>,
+    /// `None` = stamp with the dataset's current schema.
+    pub schema_id: Option<SchemaId>,
+    /// Table-presence bitmap over `schema_id`'s tables in sorted-name order; `None` = all present.
+    pub tables_present: Option<bit_vec::BitVec>,
+}
+
+/// A chunk as published in an assignment; its file set derives from the schema
+/// (`schema_id` + `tables_present`) at assignment construction.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WorkerAssignmentChunk {
+    pub dataset: Arc<String>,
+    pub id: Arc<String>,
+    pub size: u32,
+    pub blocks: RangeInclusive<BlockNumber>,
+    /// The schema the chunk was written under (stamped at insert).
+    pub schema_id: SchemaId,
+    /// Table-presence bitmap over `schema_id`'s tables in sorted-name order; `None` = all present.
+    pub tables_present: Option<bit_vec::BitVec>,
+}
+
+impl WorkerAssignmentChunk {
+    /// Project the chunk down to what the scheduling algorithms may see.
+    pub fn algo_view(&self) -> AlgoChunk {
+        AlgoChunk {
+            dataset: self.dataset.clone(),
+            id: self.id.clone(),
+            size: self.size,
+            blocks: self.blocks.clone(),
+        }
+    }
+}
 
 /// A worker entry as it appears in a published assignment.
 #[derive(Debug, Clone)]
@@ -65,7 +130,7 @@ pub struct AssignmentWorker {
 pub struct WorkerAssignment {
     pub id: AssignmentId,
     pub chunk_workers: BTreeMap<ChunkPk, Vec<WorkerPk>>,
-    pub chunks: BTreeMap<ChunkPk, Chunk>,
+    pub chunks: BTreeMap<ChunkPk, WorkerAssignmentChunk>,
     pub workers: BTreeMap<WorkerPk, AssignmentWorker>,
     /// Replication factor the scheduler chose per chunk weight (ideal placement; excludes draining
     /// copies in `chunk_workers`).
@@ -77,7 +142,7 @@ pub struct WorkerAssignment {
 pub struct PortalAssignment {
     pub id: AssignmentId,
     pub chunk_workers: BTreeMap<ChunkPk, Vec<WorkerPk>>,
-    pub chunks: BTreeMap<ChunkPk, Chunk>,
+    pub chunks: BTreeMap<ChunkPk, WorkerAssignmentChunk>,
     pub workers: BTreeMap<WorkerPk, AssignmentWorker>,
 }
 
@@ -126,17 +191,36 @@ pub trait SchedulerStorage {
     /// confirmed worker assignment.
     fn mark_for_removal(&mut self, chunk_pk: ChunkPk, now: Tick) -> Result<(), StorageError>;
 
-    // Seeding/ingestion. In production chunks and datasets arrive through other ingestion paths;
-    // these are also the entry points the offline tools (e.g. `reshuffle-sim`) drive directly.
-    fn insert_new_datasets(&mut self, datasets: Vec<String>) -> Result<(), StorageError>;
-    fn insert_new_chunks(&mut self, chunks: Vec<Chunk>) -> Result<(), StorageError>;
+    // Seeding/ingestion entry points (production ingestion and the offline tools). Each dataset
+    // carries its read schema; use `DatasetSchema::default()` when unknown.
+    fn insert_new_datasets(
+        &mut self,
+        datasets: Vec<(String, DatasetSchema)>,
+    ) -> Result<(), StorageError>;
+    fn insert_new_chunks(&mut self, chunks: Vec<NewChunk>) -> Result<(), StorageError>;
+
+    /// Make `schema` the dataset's current read schema (idempotent for identical content).
+    /// Affects chunks inserted afterwards; existing chunks keep the schema they were stamped with.
+    fn set_dataset_schema(
+        &mut self,
+        dataset: &str,
+        schema: DatasetSchema,
+    ) -> Result<(), StorageError>;
+
+    /// Decode schemas for assignment construction: all of them, or those in `schema_ids`.
+    /// Missing ids are omitted.
+    fn load_schemas(
+        &self,
+        schema_ids: Option<&[SchemaId]>,
+    ) -> Result<BTreeMap<SchemaId, DatasetSchema>, StorageError>;
+
     /// Register new chunk replacemet for an old chunk. New chunk must have the same block range as
-    /// the old chunk.
-    #[cfg(test)]
+    /// the old chunk. Also enabled by `pg-testkit` for offline tools (reshuffle-sim).
+    #[cfg(any(test, feature = "pg-testkit"))]
     fn register_correction(
         &mut self,
         old_pk: ChunkPk,
-        new_chunk: Chunk,
+        new_chunk: NewChunk,
         now: Tick,
     ) -> Result<ChunkPk, StorageError>;
 }

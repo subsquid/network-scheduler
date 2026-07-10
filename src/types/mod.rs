@@ -1,6 +1,7 @@
 mod assignment;
 mod chunk;
 mod dataset;
+mod dataset_schema;
 mod status;
 mod summary;
 mod worker;
@@ -14,6 +15,7 @@ pub type BlockNumber = u64;
 pub use assignment::{Assignment, FbVersion};
 pub use chunk::Chunk;
 pub use dataset::Dataset;
+pub use dataset_schema::{DatasetSchema, TableSchema};
 pub use status::{SchedulingStatus, SchedulingStatusConfig};
 pub use summary::ChunkSummary;
 pub use worker::{Worker, WorkerStatus};

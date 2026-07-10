@@ -29,6 +29,9 @@
 //! - `SIM_PG_CASES` — cases per Postgres sweep (default 10; fresh database per case).
 //! - `SIM_SEED` / `SIM_CASE_SEED` — replay a whole run / a single case (printed on failure).
 //! - `SIM_TRACE` — per-operation before→after state trace.
+//! - `SIM_SQL_EXPLAIN` — load `auto_explain` in the Postgres container (off by default; opt in per
+//!   query with `SET LOCAL auto_explain.log_min_duration = 0`) and leave the container running after
+//!   the run so its log survives; the harness prints the `docker logs` command to read the plans.
 //! - `SIM_WORKERS`, `SIM_CHUNKS`, `SIM_WORKER_CAPACITY`, `SIM_RANDOM_SIZES` — world-shape
 //!   overrides for debugging.
 

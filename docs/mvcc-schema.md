@@ -21,10 +21,8 @@ SELECT pg_try_advisory_lock(hashtext('network-scheduler:' || current_database())
 
 ## Shared tables
 
-Shared across the ingester, backfill process, and the scheduler. The scheduler reads `datasets`
-and `chunks` during its cycles but does not write them in production (`insert_new_datasets` /
-`insert_new_chunks` on the `SchedulerStorage` trait are `#[cfg(test)]` seeding methods only).
-Chunk data is immutable after insertion.
+Shared across the ingester, backfill process, and the scheduler. Chunk data is immutable after
+insertion.
 
 ### datasets
 
@@ -34,6 +32,28 @@ Dataset registry; created by the ingester before any of its chunks are inserted.
 CREATE TABLE datasets (
     id   SMALLSERIAL PRIMARY KEY,
     name TEXT        NOT NULL UNIQUE
+);
+```
+
+### schemas
+
+A dataset's data schema: its tables, each table's fields, and per-table default fields, stored as
+jsonb and read/written whole. Scoped to a dataset (`dataset_id`); identical schemas within a dataset
+share one row, deduped by `UNIQUE (dataset_id, hash)` over a **canonical** hash (field order doesn't
+matter). A dataset's **current read schema** is the row with `superseded_at IS NULL` — at most one
+per dataset (the partial unique index); `set_dataset_schema` stamps the old current's `superseded_at`
+and activates the new one, so past schema *contents* are retained (activation history is not:
+reverting to an earlier schema reactivates its row in place, erasing when it was superseded). A
+chunk references the schema it was **written** under (`chunks.schema_id`).
+
+```sql
+CREATE TABLE schemas (
+    id            SERIAL      PRIMARY KEY,
+    dataset_id    SMALLINT    NOT NULL REFERENCES datasets(id),
+    hash          BYTEA       NOT NULL,  -- SHA-256 of the canonical schema json
+    schema        JSONB       NOT NULL,
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    superseded_at TIMESTAMPTZ            -- NULL = current read schema
 );
 ```
 
@@ -50,22 +70,37 @@ CREATE TABLE chunks (
     dataset_id           SMALLINT    NOT NULL REFERENCES datasets(id),
     chunk_id             TEXT        NOT NULL,
     size                 INT         NOT NULL,
-    files                TEXT[]      NOT NULL,
+    schema_id            INTEGER     NOT NULL,  -- schema written under; stamped at insert
+    tables_present       BIT VARYING,            -- which of the schema's tables the chunk carries
     first_block          BIGINT      NOT NULL,
     last_block_delta     INT         NOT NULL,  -- last_block - first_block; the span fits in INT
     last_block_hash      TEXT,
     last_block_timestamp BIGINT,
-    registered_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
-    UNIQUE (dataset_id, chunk_id)
+    registered_at        TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 ```
+
+A chunk's file set is **not** stored. Every chunk carries a schema pin: the insert stamps the
+dataset's current schema unless the writer supplies one, so `set_dataset_schema` affects only
+chunks inserted afterwards. The published/portal reads return the pin plus `tables_present`;
+turning those into the actual `<table>.parquet` list (`schema_files`, fed by the trait's
+`load_schemas`) happens at assignment construction, not in storage (wire format is a follow-up).
+The hot scheduling-cycle read doesn't select either column: it decodes into the slim `AlgoChunk`
+view, so the algorithm never sees schema metadata.
+
+`tables_present` is an optional bitmap over the pinned schema's tables in sorted-name order (bit
+*i*, left-to-right, = table *i*): 1 = `<table>.parquet` is present, 0 = legitimately absent (a
+worker's 404 for it is expected, not data loss). NULL = unknown → all tables present. Ingestion
+populating it is a follow-up.
 
 The block range is stored as `(first_block, last_block_delta)` rather than two `BIGINT`s because a
 chunk's span fits in `INT`. It is a scheduling input: the weight strategy maps each chunk's
 `first_block` to a replication weight, and the range is emitted into the published assignment. The
-scheduler reads `chunk_pk, dataset_id (via name), chunk_id, size, files, first_block,
-last_block_delta` (`ChunkRow` in `postgres/rows.rs`); `last_block_hash`, `last_block_timestamp`,
-and `registered_at` are present in `ChunkRow` but unused by the scheduler.
+published/portal reads decode `chunk_pk, dataset_id (via name), chunk_id, size, first_block,
+last_block_delta` plus `schema_id` and `tables_present` into `WorkerAssignmentChunk` (`ChunkRow`
+in `postgres/rows.rs`); the cycle read decodes the same columns minus the schema pair into
+`AlgoChunk` (`AlgoChunkRow`). `last_block_hash`, `last_block_timestamp`, and `registered_at`
+are not read by the scheduler.
 
 ### chunk_corrections
 
@@ -150,18 +185,18 @@ CREATE TABLE sched_chunk_metadata (
     marked_for_removal              BIGINT,  -- tick when marked; NULL = not marked
     rejected                        BOOLEAN NOT NULL DEFAULT FALSE,  -- rejected at registration; terminal
     dropped_at_portal_assignment_id BIGINT REFERENCES sched_portal_assignments(id),
-    dropped_at_worker_assignment_id BIGINT REFERENCES sched_worker_assignments(id)
+    dropped_from_worker_assignment_at BIGINT  -- tick when tombstoned; NULL = not tombstoned
 );
 
 CREATE INDEX sched_chunk_metadata_portal_drop
     ON sched_chunk_metadata (dropped_at_portal_assignment_id)
     WHERE dropped_at_portal_assignment_id IS NOT NULL
-      AND dropped_at_worker_assignment_id IS NULL;
+      AND dropped_from_worker_assignment_at IS NULL;
 ```
 
 **Lifecycle invariant.** Once a chunk has a `sched_chunk_metadata` row it exists for as long as
 the chunk stays in `chunks`. After a chunk is dropped from the worker assignment its row remains
-as a tombstone (`dropped_at_worker_assignment_id` set) and the chunk is excluded from future
+as a tombstone (`dropped_from_worker_assignment_at` set) and the chunk is excluded from future
 cycles.
 
 `marked_for_removal` is set for two reasons: a confirmed correction's old chunk (driven by
@@ -308,22 +343,31 @@ INSERT INTO sched_chunk_metadata (chunk_pk, rejected) SELECT ..., TRUE;
 
 ### Scheduling cycle (builds the worker assignment)
 
-1. **Open** a new `sched_worker_assignments` row (`created_at = now`).
-2. **Tombstone expired chunks** — whole-chunk removals whose portal-drop is ≥ M ticks old:
+Split across two transactions: a **Phase A** committed up front so the clock-driven GC survives a
+**Phase B** shortage rollback (otherwise stale never drains under a sustained shortage).
+
+Phase A (GC):
+
+1. **Tombstone expired chunks** — whole-chunk removals whose portal-drop is ≥ M ticks old, stamping
+   the drop tick:
    ```sql
    UPDATE sched_chunk_metadata
-   SET dropped_at_worker_assignment_id = $new_wa_id
+   SET dropped_from_worker_assignment_at = $now
    WHERE dropped_at_portal_assignment_id IS NOT NULL
-     AND dropped_at_worker_assignment_id IS NULL
+     AND dropped_from_worker_assignment_at IS NULL
      AND dropped_at_portal_assignment_id IN (
          SELECT id FROM sched_portal_assignments WHERE created_at <= $now - $m_ticks);
    ```
-3. **Expire drained stale mappings** — the per-pair equivalent (`DELETE FROM sched_stale_mappings
+2. **Expire drained stale mappings** — the per-pair equivalent (`DELETE FROM sched_stale_mappings
    WHERE dropped_at_portal_assignment_id` references a portal assignment ≥ M ticks old).
-4. **Load inputs** — active chunks (`dropped_at_worker_assignment_id IS NULL`, joined to
+
+Phase B (placement reconcile):
+
+3. **Load inputs** — active chunks (`dropped_from_worker_assignment_at IS NULL`, joined to
    `datasets` for the name), the worker set, and the current placement
    (`sched_ideal_chunk_workers ∪ sched_stale_mappings`).
-5. **Compute the ideal in Rust** via the `SchedulingAlgorithm`.
+4. **Compute the ideal in Rust** via the `SchedulingAlgorithm`.
+5. **Open** a new `sched_worker_assignments` row (`created_at = now`).
 6. **Mint pending stale mappings** for each `(chunk, worker)` pair the new ideal drops (skipping
    chunks being removed at the chunk level and workers GC'd from `sched_workers`):
    `INSERT INTO sched_stale_mappings (...) ON CONFLICT (chunk_pk, worker_id) DO NOTHING`.

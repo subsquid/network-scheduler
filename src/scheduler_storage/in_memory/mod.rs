@@ -2,13 +2,14 @@
 //! test-only. Serves as the simulation's oracle and a fast backend for the storage suites; it is
 //! not a production storage path.
 
-use crate::scheduler_storage::algorithm::{ScheduleOutput, SchedulingAlgorithm};
+use crate::scheduler_storage::algorithm::{CurrentPlacement, ScheduleOutput, SchedulingAlgorithm};
 use crate::scheduler_storage::{
-    AssignmentId, AssignmentWorker, ChunkPk, PortalAssignment, SchedulerStorage, StorageError,
-    Tick, WorkerAssignment, WorkerPk,
+    AlgoChunk, AssignmentId, AssignmentWorker, ChunkPk, NewChunk, PortalAssignment,
+    SchedulerStorage, SchemaId, StorageError, Tick, WorkerAssignment, WorkerAssignmentChunk,
+    WorkerPk,
 };
-use crate::types::{BlockNumber, Chunk, Worker, WorkerStatus};
-use anyhow::Result;
+use crate::types::{BlockNumber, DatasetSchema, Worker, WorkerStatus};
+use anyhow::{Context, Result};
 use libp2p_identity::PeerId;
 use semver::Version;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -45,7 +46,8 @@ struct SchedulerChunkMetadata {
     /// or reconsidered
     rejected: bool,
     dropped_at_portal_assignment_id: Option<PortalAssignmentId>,
-    dropped_at_worker_assignment_id: Option<WorkerAssignmentId>,
+    /// Tick at which the chunk was tombstoned; NULL = not tombstoned.
+    dropped_from_worker_assignment_at: Option<TimeUnit>,
 }
 
 /// Lifecycle-state predicates over the `sched_chunk_metadata` columns, named after the states in
@@ -101,7 +103,7 @@ impl SchedulerChunkMetadata {
     /// Current/terminal: dropped from the worker assignment. The row is retained as an audit marker
     /// and the chunk leaves every future cycle, so this state never closes.
     fn tombstoned(&self) -> bool {
-        self.dropped_at_worker_assignment_id.is_some()
+        self.dropped_from_worker_assignment_at.is_some()
     }
 
     /// Current: in the removal tail by any of the three removal stamps — marked for removal, or
@@ -109,7 +111,7 @@ impl SchedulerChunkMetadata {
     fn in_removal(&self) -> bool {
         self.marked_for_removal
             || self.dropped_at_portal_assignment_id.is_some()
-            || self.dropped_at_worker_assignment_id.is_some()
+            || self.dropped_from_worker_assignment_at.is_some()
     }
 
     // --- Derived roles: composed from both families ---
@@ -217,12 +219,20 @@ struct Counters {
     worker_id: Counter,
     worker_assignment_id: Counter,
     portal_assignment_id: Counter,
+    schema_id: Counter,
 }
 
 #[derive(Default)]
 pub(crate) struct InMemoryStorage {
     datasets: HashSet<Dataset>,
-    chunks: BTreeMap<ChunkPk, Chunk>,
+    /// Per-dataset current read schema id (mirrors the `schemas` row with `superseded_at IS NULL`)
+    dataset_schemas: HashMap<Dataset, SchemaId>,
+    /// Schema payloads by id, first-seen content kept (mirrors the `schemas` table)
+    schemas: HashMap<SchemaId, DatasetSchema>,
+    /// `(dataset, canonical json)` → id: re-applying a seen schema reuses its id (mirrors
+    /// `UNIQUE (dataset_id, hash)` + reactivation)
+    schema_ids: HashMap<(Dataset, String), SchemaId>,
+    chunks: BTreeMap<ChunkPk, WorkerAssignmentChunk>,
     /// Natural identity → surrogate pk; a duplicate `(dataset, id)` insert is rejected
     /// (mirrors Postgres `UNIQUE (dataset_id, chunk_id)`). Never pruned — chunks
     /// are tombstoned, not deleted.
@@ -296,7 +306,8 @@ impl InMemoryStorage {
             .collect()
     }
 
-    /// Used by the ingester or operator to include datasets in the system.
+    /// Used by the ingester or operator to include datasets in the system. Every dataset gets a
+    /// current schema (the default one), matching Postgres — chunk inserts stamp against it.
     pub fn insert_new_datasets(
         &mut self,
         datasets: Vec<Dataset>,
@@ -305,6 +316,7 @@ impl InMemoryStorage {
             if !self.datasets.insert(dataset.clone()) {
                 return Err(InsertDatasetError::UniqueConstraintViolation { dataset });
             }
+            self.ensure_current_schema(&dataset, DatasetSchema::default());
         }
         Ok(())
     }
@@ -312,7 +324,7 @@ impl InMemoryStorage {
     /// Ingester entry point. Errors if a chunk names an unregistered dataset or duplicates an
     /// existing `(dataset, id)` (mirroring Postgres' UNIQUE constraint). Returns the number
     /// inserted, which on success is all of them.
-    pub fn insert_new_chunks(&mut self, chunks: Vec<Chunk>) -> Result<usize, InsertChunkError> {
+    pub fn insert_new_chunks(&mut self, chunks: Vec<NewChunk>) -> Result<usize, InsertChunkError> {
         let mut added = 0;
         for chunk in chunks {
             let dataset = (*chunk.dataset).clone();
@@ -331,8 +343,22 @@ impl InMemoryStorage {
     /// Shared index/pk bookkeeping behind `insert_new_chunks` and a correction's replacement insert;
     /// callers own the dataset-registered check and the typed error. Returns `None` on a duplicate
     /// `(dataset, id)`.
-    fn insert_one_chunk(&mut self, chunk: Chunk) -> Option<ChunkPk> {
+    fn insert_one_chunk(&mut self, chunk: NewChunk) -> Option<ChunkPk> {
         use std::collections::hash_map::Entry;
+        // Mirror the Postgres insert: no explicit pin -> stamp the dataset's current schema
+        // (registered datasets always have one, like the NOT NULL column).
+        let schema_id = chunk
+            .schema_id
+            .or_else(|| self.dataset_schemas.get(&*chunk.dataset).copied())
+            .expect("registered dataset has a current schema");
+        let chunk = WorkerAssignmentChunk {
+            dataset: chunk.dataset,
+            id: chunk.id,
+            size: chunk.size,
+            blocks: chunk.blocks,
+            schema_id,
+            tables_present: chunk.tables_present,
+        };
         match self
             .chunk_index
             .entry(((*chunk.dataset).clone(), (*chunk.id).clone()))
@@ -353,7 +379,7 @@ impl InMemoryStorage {
     fn register_correction_int(
         &mut self,
         old_pk: ChunkPk,
-        new_chunk: Chunk,
+        new_chunk: NewChunk,
         now: TimeUnit,
     ) -> Result<ChunkPk, CorrectionRejected> {
         let Some(old_chunk) = self.chunks.get(&old_pk) else {
@@ -490,12 +516,7 @@ impl InMemoryStorage {
     /// One-way: the row stays as a permanent tombstone and the chunk leaves all
     /// future cycles. Also clears the chunk's stale mappings — the portal-level
     /// grace has already elapsed, so no worker-level drain is needed.
-    fn tombstone_expired_chunks(
-        &mut self,
-        new_worker_aid: WorkerAssignmentId,
-        now: TimeUnit,
-        m_ticks: TimeUnit,
-    ) {
+    fn tombstone_expired_chunks(&mut self, now: TimeUnit, m_ticks: TimeUnit) {
         let Some(cutoff) = now.checked_sub(m_ticks) else {
             return;
         };
@@ -513,7 +534,7 @@ impl InMemoryStorage {
                 .sched_chunk_metadata
                 .get_mut(pk)
                 .expect("pk came from sched_chunk_metadata");
-            meta.dropped_at_worker_assignment_id = Some(new_worker_aid);
+            meta.dropped_from_worker_assignment_at = Some(now);
             self.sched_stale_mappings
                 .retain(|(stale_pk, _), _| stale_pk != pk);
         }
@@ -621,6 +642,23 @@ impl InMemoryStorage {
             .collect();
     }
 
+    /// Set `dataset`'s current read schema and return its id, reusing the id of previously seen
+    /// identical content — mirrors Postgres' `ensure_current_schema`.
+    fn ensure_current_schema(&mut self, dataset: &str, schema: DatasetSchema) -> SchemaId {
+        use std::collections::hash_map::Entry;
+        let canon = serde_json::to_string(&schema.canonicalized()).expect("schema serializes");
+        let id = match self.schema_ids.entry((dataset.to_owned(), canon)) {
+            Entry::Occupied(occ) => *occ.get(),
+            Entry::Vacant(vac) => {
+                let id = SchemaId(self.counters.schema_id.next() as i32);
+                self.schemas.insert(id, schema);
+                *vac.insert(id)
+            }
+        };
+        self.dataset_schemas.insert(dataset.to_owned(), id);
+        id
+    }
+
     /// Published worker assignment: `ideal ∪ stale` (pending and draining), with
     /// tombstoned chunks excluded and worker lists deduped. Because a stale row
     /// is minted the moment a pair leaves the ideal, this is always a superset of
@@ -640,7 +678,7 @@ impl InMemoryStorage {
                 .is_none_or(|m| m.worker_servable())
         });
 
-        let chunks: BTreeMap<ChunkPk, Chunk> = chunk_workers
+        let chunks: BTreeMap<ChunkPk, WorkerAssignmentChunk> = chunk_workers
             .keys()
             .filter_map(|pk| self.chunks.get(pk).map(|c| (*pk, c.clone())))
             .collect();
@@ -673,13 +711,66 @@ impl InMemoryStorage {
 }
 
 impl SchedulerStorage for InMemoryStorage {
-    fn insert_new_datasets(&mut self, datasets: Vec<String>) -> Result<(), StorageError> {
-        self.insert_new_datasets(datasets)
-            .map_err(anyhow::Error::from)?;
+    fn insert_new_datasets(
+        &mut self,
+        datasets: Vec<(String, DatasetSchema)>,
+    ) -> Result<(), StorageError> {
+        for (name, schema) in &datasets {
+            schema
+                .validate()
+                .with_context(|| format!("invalid schema for dataset {name}"))?;
+        }
+        // All-or-nothing like the Postgres transaction: reject the whole batch up front, so a
+        // duplicate mid-batch can't leave earlier names registered without a schema.
+        let mut incoming = HashSet::new();
+        for (name, _) in &datasets {
+            if self.datasets.contains(name) || !incoming.insert(name.as_str()) {
+                return Err(
+                    anyhow::Error::from(InsertDatasetError::UniqueConstraintViolation {
+                        dataset: name.clone(),
+                    })
+                    .into(),
+                );
+            }
+        }
+        for (name, schema) in datasets {
+            self.datasets.insert(name.clone());
+            self.ensure_current_schema(&name, schema);
+        }
         Ok(())
     }
 
-    fn insert_new_chunks(&mut self, chunks: Vec<Chunk>) -> Result<(), StorageError> {
+    fn set_dataset_schema(
+        &mut self,
+        dataset: &str,
+        schema: DatasetSchema,
+    ) -> Result<(), StorageError> {
+        if !self.datasets.contains(dataset) {
+            return Err(anyhow::anyhow!("set_dataset_schema: dataset {dataset} not found").into());
+        }
+        schema.validate().context("invalid dataset schema")?;
+        self.ensure_current_schema(dataset, schema);
+        Ok(())
+    }
+
+    fn load_schemas(
+        &self,
+        schema_ids: Option<&[crate::scheduler_storage::SchemaId]>,
+    ) -> Result<BTreeMap<crate::scheduler_storage::SchemaId, DatasetSchema>, StorageError> {
+        Ok(match schema_ids {
+            None => self
+                .schemas
+                .iter()
+                .map(|(id, s)| (*id, s.clone()))
+                .collect(),
+            Some(ids) => ids
+                .iter()
+                .filter_map(|id| self.schemas.get(id).cloned().map(|schema| (*id, schema)))
+                .collect(),
+        })
+    }
+
+    fn insert_new_chunks(&mut self, chunks: Vec<NewChunk>) -> Result<(), StorageError> {
         match self.insert_new_chunks(chunks) {
             Ok(_added) => Ok(()),
             // Typed so callers can treat a re-insert as a no-op; a missing dataset stays a DB error.
@@ -772,18 +863,16 @@ impl SchedulerStorage for InMemoryStorage {
     where
         Algo: SchedulingAlgorithm + Send + Sync,
     {
-        // Allocated first so tombstoning below can reference it.
-        let new_worker_aid = self.counters.worker_assignment_id.next();
-        self.sched_worker_assignments.insert(new_worker_aid, now);
-
-        self.tombstone_expired_chunks(new_worker_aid, now, m_ticks);
-
+        // Clock-driven GC runs first; it persists even through the shortage below.
+        self.tombstone_expired_chunks(now, m_ticks);
         self.expire_drained_stale_mappings(now, m_ticks);
 
-        // Snapshot after expiry so the algorithm sees post-expiry placement.
-        let current_placement = self.current_placement();
+        // Snapshot after expiry so the algorithm sees post-expiry placement. The algorithm only
+        // does keyed lookups against it, so hand it a `HashMap` (O(1)) rather than the ordered
+        // `BTreeMap` the snapshot is built as.
+        let current_placement: CurrentPlacement = self.current_placement().into_iter().collect();
 
-        let chunks: Vec<(ChunkPk, Chunk)> = self
+        let chunks: Vec<(ChunkPk, AlgoChunk)> = self
             .chunks
             .iter()
             .filter(|(pk, _)| {
@@ -791,7 +880,7 @@ impl SchedulerStorage for InMemoryStorage {
                     .get(pk)
                     .is_none_or(|m| m.worker_servable())
             })
-            .map(|(pk, chunk)| (*pk, chunk.clone()))
+            .map(|(pk, chunk)| (*pk, chunk.algo_view()))
             .collect();
         let workers: Vec<(WorkerPk, Worker)> = self
             .sched_workers
@@ -810,11 +899,29 @@ impl SchedulerStorage for InMemoryStorage {
 
         // A shortage is surfaced with nothing committed, so a degraded run can be driven through it.
         let ScheduleOutput {
-            mapping: ideal_mappings,
+            mapping,
             replication_by_weight,
         } = algorithm
             .schedule(chunks, workers, &current_placement, config)
             .map_err(|_| StorageError::Shortage)?;
+
+        // This oracle keeps set-based bookkeeping, so index the returned `Vec` into a map once.
+        let ideal_mappings: BTreeMap<ChunkPk, HashSet<WorkerPk>> = mapping
+            .into_iter()
+            .map(|(pk, holders)| {
+                let set: HashSet<WorkerPk> = holders.iter().copied().collect();
+                debug_assert_eq!(
+                    set.len(),
+                    holders.len(),
+                    "duplicate holders for chunk {pk:?}"
+                );
+                (pk, set)
+            })
+            .collect();
+
+        // Open the assignment the records below are written under.
+        let new_worker_aid = self.counters.worker_assignment_id.next();
+        self.sched_worker_assignments.insert(new_worker_aid, now);
 
         self.record_reshuffle_stale_mappings(&ideal_mappings, new_worker_aid);
 
@@ -911,7 +1018,7 @@ impl SchedulerStorage for InMemoryStorage {
             }
         }
 
-        let portal_chunks: BTreeMap<ChunkPk, Chunk> = self
+        let portal_chunks: BTreeMap<ChunkPk, WorkerAssignmentChunk> = self
             .sched_chunk_metadata
             .iter()
             .filter(|(_, meta)| meta.portal_visible())
@@ -951,7 +1058,7 @@ impl SchedulerStorage for InMemoryStorage {
     fn register_correction(
         &mut self,
         old_pk: ChunkPk,
-        new_chunk: Chunk,
+        new_chunk: NewChunk,
         now: Tick,
     ) -> Result<ChunkPk, StorageError> {
         self.register_correction_int(old_pk, new_chunk, now)

@@ -61,7 +61,7 @@ impl StorageInspect for PostgresStorage {
                             applied_at_portal_assignment_id, \
                             (marked_for_removal IS NOT NULL), \
                             dropped_at_portal_assignment_id, \
-                            dropped_at_worker_assignment_id, \
+                            dropped_from_worker_assignment_at, \
                             rejected \
                      FROM sched_chunk_metadata \
                      ORDER BY chunk_pk",
@@ -78,7 +78,7 @@ impl StorageInspect for PostgresStorage {
                     applied_at_portal_assignment_id,
                     marked_for_removal,
                     dropped_at_portal_assignment_id,
-                    dropped_at_worker_assignment_id,
+                    dropped_from_worker_assignment_at,
                     rejected,
                 )| ChunkMetadataView {
                     chunk_pk: ChunkPk(chunk_pk),
@@ -90,7 +90,7 @@ impl StorageInspect for PostgresStorage {
                     rejected,
                     dropped_at_portal_assignment_id: dropped_at_portal_assignment_id
                         .map(|v| v as u64),
-                    dropped_at_worker_assignment_id: dropped_at_worker_assignment_id
+                    dropped_from_worker_assignment_at: dropped_from_worker_assignment_at
                         .map(|v| v as u64),
                 },
             )

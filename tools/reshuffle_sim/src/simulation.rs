@@ -29,6 +29,14 @@ use crate::rate::ChunkRate;
 use crate::upgrade::{self, UpgradeSchedule, WorkerVersionState};
 use crate::{ChunkId, ChunkOwners, ChunkSizeIndex, chunks, metrics};
 
+/// At step `at_step`, clone every current chunk of dataset `src` (bucket) into a new dataset `dst`
+/// (identical ids, ranges and sizes).
+pub struct CopyPlan {
+    pub src: String,
+    pub dst: String,
+    pub at_step: u32,
+}
+
 /// CLI-derived knobs controlling a run.
 pub struct SimulationParams {
     pub steps: u32,
@@ -39,6 +47,7 @@ pub struct SimulationParams {
     pub initial_new_fraction: f64,
     pub upgrade_schedule: UpgradeSchedule,
     pub lift_restriction_at_step: Option<u32>,
+    pub copy: Vec<CopyPlan>,
 }
 
 /// End-of-run totals.
@@ -57,6 +66,8 @@ pub struct StepPlacement {
     pub chunk_sizes: ChunkSizeIndex,
     pub replication_by_weight: BTreeMap<u16, u16>,
     pub used_capacity_bytes: u64,
+    /// Bytes held by draining stale copies (0 for the stateless path).
+    pub stale_capacity_bytes: u64,
     pub total_chunks: usize,
     pub schedule_duration: Duration,
 }
@@ -85,8 +96,10 @@ pub enum StepOutcome {
 /// differs between the stateless and multistep paths.
 pub trait StepScheduler {
     /// Placement that step 1 is diffed against: the input assignment for the
-    /// stateless path, the seeded baseline placement for multistep.
-    fn initial_owners(&self) -> ChunkOwners;
+    /// stateless path, the seeded baseline placement for multistep. Moves the map
+    /// out — the scheduler needs it only to seed step 1's reference, so consuming
+    /// it avoids cloning (and then permanently retaining) the whole 6M-entry map.
+    fn take_initial_owners(&mut self) -> ChunkOwners;
     /// Schedule this step. A returned `Err` is fatal (aborts the run); an
     /// infeasible-but-expected outcome is `Ok(StepOutcome::Failed)`.
     fn step(&mut self, ctx: StepContext) -> anyhow::Result<StepOutcome>;
@@ -119,7 +132,7 @@ impl Simulation {
         mut datasets_config: DatasetsConfig,
         scheduling_config: SchedulingConfig,
         params: SimulationParams,
-        scheduler: Box<dyn StepScheduler>,
+        mut scheduler: Box<dyn StepScheduler>,
         mut rng: StdRng,
     ) -> Self {
         let new_worker_version = upgrade::new_version();
@@ -145,8 +158,10 @@ impl Simulation {
         );
         let restricted_active = restricted_dataset.is_some();
 
-        // The scheduler defines step 1's reference placement.
-        let previous_owners = scheduler.initial_owners();
+        // The scheduler defines step 1's reference placement. Moved out, not cloned:
+        // the baseline owners map is ~5 GB at 6M chunks, and the scheduler never reads
+        // it again, so cloning would both spike and permanently double that footprint.
+        let previous_owners = scheduler.take_initial_owners();
 
         Self {
             params,
@@ -216,6 +231,27 @@ impl Simulation {
             .collect()
     }
 
+    /// Clones every chunk of each `src` (baseline + accumulated) into its `dst` for the copies due at
+    /// `step`. Stateless only: it holds all chunks in memory, so cloning + injecting as new chunks is
+    /// natural. Multistep clones from its Postgres assignment instead, so copy stays per-scheduler.
+    fn copy_chunks_due(&self, step: u32) -> Vec<Chunk> {
+        let mut copied = Vec::new();
+        for copy in self.params.copy.iter().filter(|c| c.at_step == step) {
+            let dst_id = Arc::new(format!("s3://{}", copy.dst));
+            copied.extend(
+                self.baseline_chunks
+                    .iter()
+                    .chain(&self.accumulated_new_chunks)
+                    .filter(|c| bucket_of(&c.dataset) == copy.src)
+                    .map(|c| Chunk {
+                        dataset: dst_id.clone(),
+                        ..c.clone()
+                    }),
+            );
+        }
+        copied
+    }
+
     fn run_step(&mut self, step: u32) -> ReshuffleMetrics {
         self.lift_restrictions_if_due(step);
 
@@ -243,11 +279,16 @@ impl Simulation {
                 self.params.chunk_size,
             ));
         }
-        let new_chunks_count = new_chunks.len() as u32;
-        let new_restricted_count =
-            new_chunks.iter().filter(|c| self.is_restricted(c)).count() as u32;
         let start = self.accumulated_new_chunks.len();
         self.accumulated_new_chunks.extend(new_chunks);
+        // Clone after appending this step's ingest, so a copy reflects src as of this step.
+        let copies = self.copy_chunks_due(step);
+        self.accumulated_new_chunks.extend(copies);
+        let new_chunks_count = (self.accumulated_new_chunks.len() - start) as u32;
+        let new_restricted_count = self.accumulated_new_chunks[start..]
+            .iter()
+            .filter(|c| self.is_restricted(c))
+            .count() as u32;
 
         self.version_state
             .advance(&self.params.upgrade_schedule, step);
