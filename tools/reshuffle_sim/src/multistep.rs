@@ -262,6 +262,13 @@ impl MultistepScheduler {
     /// only assignments the fleet+portal have caught up to let their superseded copies drain.
     fn run_cycle(&mut self) -> anyhow::Result<CycleResult> {
         self.clock += M_TICKS;
+        // The copies this cycle's GC will physically expire, read before the cycle runs (it deletes
+        // them). Same `now`/`m_ticks` the cycle's expire uses; the sim's single connection runs both
+        // sequentially. Lets the metric score a same-worker drain→refetch as a real download.
+        let drains = self
+            .backend
+            .storage
+            .expiring_stale_mappings(self.clock, M_TICKS)?;
         let started = Instant::now();
         let assignment = match self.backend.storage.run_scheduling_cycle(
             &self.algo,
@@ -280,9 +287,6 @@ impl MultistepScheduler {
             Err(e) => return Err(anyhow!("scheduling cycle failed: {e}")),
         };
         let schedule_duration = started.elapsed();
-        // The copies this cycle's GC physically expired: a copy re-fetched onto the same worker it
-        // drained from is a real download the placement snapshot alone can't see.
-        let drains = self.backend.storage.take_last_cycle_drains();
         // Before confirm/visibility expire or drain stale, so the snapshot matches `assignment`.
         let stale = self.backend.storage.stale_mappings()?;
         self.clock += CLOCK_STEP;

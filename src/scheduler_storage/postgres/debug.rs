@@ -77,4 +77,37 @@ impl PostgresStorage {
             Ok::<_, StorageError>(rows)
         })
     }
+
+    /// The stale `(chunk, worker)` copies a scheduling cycle at `(now, m_ticks)` would physically
+    /// expire — the exact predicate [`expire_drained_stale_mappings`](super::scheduling_cycle) runs.
+    /// Read-only, for offline tooling (reshuffle-sim): querying *before* the cycle recovers the set
+    /// of copies about to be deleted, so a copy re-fetched onto the same worker it drained from can
+    /// be scored as a real download — otherwise invisible to a step-boundary placement diff (the
+    /// copy is present at both boundaries). The single sim connection runs this and the cycle
+    /// sequentially, so nothing changes the stale set between the read and the delete.
+    pub fn expiring_stale_mappings(
+        &self,
+        now: u64,
+        m_ticks: u64,
+    ) -> Result<Vec<(ChunkPk, WorkerPk)>, StorageError> {
+        use super::rows::tick_to_i64;
+        self.with_conn_ref(async move |conn| {
+            let rows: Vec<(ChunkPk, WorkerPk)> = sqlx::query_as(
+                r#"
+                SELECT chunk_pk, worker_id
+                FROM sched_stale_mappings
+                WHERE dropped_at_portal_assignment_id IS NOT NULL
+                  AND dropped_at_portal_assignment_id IN (
+                      SELECT id FROM sched_portal_assignments WHERE created_at <= $1 - $2
+                  )
+                "#,
+            )
+            .bind(tick_to_i64(now))
+            .bind(tick_to_i64(m_ticks))
+            .fetch_all(&mut *conn)
+            .await
+            .context("fetch expiring stale mappings")?;
+            Ok::<_, StorageError>(rows)
+        })
+    }
 }
