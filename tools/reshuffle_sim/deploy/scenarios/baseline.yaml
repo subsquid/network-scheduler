@@ -1,4 +1,4 @@
 # Plain 5-step multistep ingest. Pair with production_config.yaml and the mainnet input.
 chunks_per_step: 2000
-steps: 5
+steps: 10
 scheduler: multistep

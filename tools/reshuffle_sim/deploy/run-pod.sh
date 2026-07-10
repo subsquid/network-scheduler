@@ -9,17 +9,29 @@
 set -euo pipefail
 
 DIR="$(cd "$(dirname "$0")" && pwd)"
+
+# Host-side inputs (gitignored, not in the repo); abort early if a run is missing one.
+CONFIG_FILE="${CONFIG_FILE:-./production_config.yaml}"
+INPUT_FILE="${INPUT_FILE:-./mainnet.fb.1.gz}"
+for f in "$CONFIG_FILE" "$INPUT_FILE"; do
+    [ -f "$f" ] || { echo "missing input file: $f" >&2; exit 1; }
+done
+
 # DATABASE_URL, NAMESPACE, ... — gitignored; run ./setup-db.sh first to create it.
+# Capture a caller's DATABASE_URL (run-scenarios.sh) before sourcing — env.sh's unconditional
+# `export DATABASE_URL` would clobber it, pinning every scenario to one database.
+CALLER_DATABASE_URL="${DATABASE_URL:-}"
 # shellcheck source=/dev/null
 source "$DIR/env.sh"
+DATABASE_URL="${CALLER_DATABASE_URL:-$DATABASE_URL}"
 
 POD="${POD:-reshuffle-sim}"
-CONFIG_FILE="${CONFIG_FILE:-./production_config.yaml}"
 PROFILE_FILE="${PROFILE_FILE:-$DIR/scenarios/copy-replace.yaml}"
-INPUT_FILE="${INPUT_FILE:-./mainnet.fb.1.gz}"
-# Image tag to run; the docker workflow pushes :latest and :<12-char commit SHA>. Pin a SHA to run a
-# specific build, else latest.
+# Image tag; docker workflow pushes :latest and :<commit SHA>. Fills pod.yaml's {IMAGE_TAG}.
 IMAGE_TAG="${IMAGE_TAG:-latest}"
+# Durable log path on the /logs PVC; per-run unique names (run-scenarios.sh) avoid overwrites.
+# Fills pod.yaml's {LOG_FILE} — this default is the source of truth.
+LOG_FILE="${LOG_FILE:-/logs/reshuffle-sim.log}"
 
 # MODE (ingest/resume need a multistep profile):
 #   full   — seed and run the whole sim (default).
@@ -41,10 +53,11 @@ kubectl -n "$NAMESPACE" create secret generic reshuffle-sim-db \
 echo "Deleting any existing pod/$POD ..."
 kubectl -n "$NAMESPACE" delete pod "$POD" --ignore-not-found
 
-echo "Applying the pod (mode: $MODE, image tag: $IMAGE_TAG) ..."
-# Rewrite SIM_MODE ("full" is its only occurrence) and the image tag before applying.
-sed -e "s/value: \"full\"/value: \"$MODE\"/" \
-    -e "s|subsquid/reshuffle-sim:[^[:space:]]*|subsquid/reshuffle-sim:$IMAGE_TAG|" \
+echo "Applying the pod (mode: $MODE, image tag: $IMAGE_TAG, log: $LOG_FILE) ..."
+# Fill pod.yaml's placeholders before applying ('|' for the log path — it has slashes).
+sed -e "s/{SIM_MODE}/$MODE/" \
+    -e "s/{IMAGE_TAG}/$IMAGE_TAG/" \
+    -e "s|{LOG_FILE}|$LOG_FILE|" \
     "$DIR/pod.yaml" | kubectl -n "$NAMESPACE" apply -f -
 
 echo "Waiting for pod/$POD to be Ready ..."
@@ -58,4 +71,13 @@ kubectl cp "$INPUT_FILE"   "$NAMESPACE/$POD:/app/mainnet.fb.1.gz"
 echo "Releasing start signal ..."
 kubectl -n "$NAMESPACE" exec "$POD" -- touch /app/START
 
-kubectl -n "$NAMESPACE" logs -f "$POD"
+# FOLLOW=false (run-scenarios.sh) detaches after launch — no hours-long `logs -f` to drop; the sim
+# tees to the /logs PVC regardless. Default true keeps the interactive single-run behaviour.
+if [ "${FOLLOW:-true}" = true ]; then
+    kubectl -n "$NAMESPACE" logs -f "$POD"
+else
+    echo "Detached (FOLLOW=false). Durable log: $LOG_FILE (on the reshuffle-sim-logs PVC)."
+    # Liveness peek only — too early for parse errors/results; use `logs -f` or the durable log.
+    echo "First log lines (liveness peek, not a completion/validation check):"
+    kubectl -n "$NAMESPACE" logs "$POD" --tail=20 || true
+fi

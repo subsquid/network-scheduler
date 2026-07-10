@@ -1,3 +1,5 @@
+# TEMPLATE — not applyable as-is: run-pod.sh fills the {SIM_MODE}/{IMAGE_TAG}/{LOG_FILE} placeholders.
+#
 # One-shot reshuffle-sim pod: waits for $START_SIGNAL, runs the sim, tees output to the /logs PVC so
 # it survives an OOM kill. Blocking on the signal avoids racing a half-copied input. See run-pod.sh.
 #
@@ -25,8 +27,8 @@ spec:
         claimName: reshuffle-sim-logs
   containers:
     - name: reshuffle-sim
-      # Tag defaults to latest; run-pod.sh rewrites it from $IMAGE_TAG (e.g. a 12-char commit SHA).
-      image: gcr.io/bright-meridian-316511/subsquid/reshuffle-sim:latest
+      # {IMAGE_TAG}: run-pod.sh fills it (default latest).
+      image: gcr.io/bright-meridian-316511/subsquid/reshuffle-sim:{IMAGE_TAG}
       imagePullPolicy: Always
       resources:
         requests:
@@ -46,9 +48,9 @@ spec:
         # run-pod.sh copies config/profile/input into /app, then touches $START_SIGNAL to start.
         - name: START_SIGNAL
           value: /app/START
-        # run-pod.sh overrides per launch: full = whole run, ingest = seed and stop, resume = seeded DB.
-        - { name: SIM_MODE, value: "full" }
-        # entrypoint.sh tees stdout+stderr here, on the /logs volume so it outlives the container.
-        - { name: LOG_FILE, value: /logs/reshuffle-sim.log }
+        # {SIM_MODE}: run-pod.sh fills it — full=whole run, ingest=seed+stop, resume=seeded DB.
+        - { name: SIM_MODE, value: "{SIM_MODE}" }
+        # {LOG_FILE}: run-pod.sh fills the durable log path (default /logs/reshuffle-sim.log).
+        - { name: LOG_FILE, value: "{LOG_FILE}" }
         # pg_timing=debug: per-phase SQL timing. multistep=debug: per-step table row counts.
         - { name: RUST_LOG, value: "error,pg_timing=debug,reshuffle_sim::multistep=debug" }

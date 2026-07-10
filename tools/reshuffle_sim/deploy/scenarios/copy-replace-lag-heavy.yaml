@@ -1,0 +1,13 @@
+# Heavy-lag variant: a fast ingest against a slow fleet. Same copy/replace as copy-replace.yaml,
+# but 5 download + 2 portal cycles keep superseded copies resident far longer — the extreme end
+# of the overhang, most likely to bring a capacity shortage forward.
+# Pair with production_config.yaml and the mainnet input.
+chunks_per_step: 2000
+steps: 20
+scheduler: multistep
+confirm_lag_steps: 5
+portal_lag_steps: 2
+copy:
+  - { src: base-mainnet, dst: base-mainnet-2, at_step: 3 }
+replace:
+  - { dataset: binance-mainnet, at_step: 5 }
