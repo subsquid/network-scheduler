@@ -29,9 +29,8 @@ use crate::{
     simulation::{CopyPlan, StepContext, StepOutcome, StepPlacement, StepScheduler},
 };
 
-/// Result of one scheduling cycle: a published assignment with its stale-mapping snapshot and the
-/// `(chunk, worker)` copies the cycle physically expired, or a capacity shortage (the run records a
-/// failed step and stops).
+/// One cycle's result: the published assignment, its stale snapshot, the copies the cycle expired,
+/// and the schedule duration — or a capacity shortage (the run records a failed step and stops).
 enum CycleResult {
     Scheduled(
         WorkerAssignment,
@@ -262,9 +261,8 @@ impl MultistepScheduler {
     /// only assignments the fleet+portal have caught up to let their superseded copies drain.
     fn run_cycle(&mut self) -> anyhow::Result<CycleResult> {
         self.clock += M_TICKS;
-        // The copies this cycle's GC will physically expire, read before the cycle runs (it deletes
-        // them). Same `now`/`m_ticks` the cycle's expire uses; the sim's single connection runs both
-        // sequentially. Lets the metric score a same-worker drain→refetch as a real download.
+        // Copies this cycle's GC will expire, read before it deletes them (same `now`/`m_ticks`).
+        // One connection runs both sequentially. Lets the metric score a same-worker drain→refetch.
         let drains = self
             .backend
             .storage
@@ -492,15 +490,10 @@ fn log_table_sizes(storage: &PostgresStorage) {
     }
 }
 
-/// Returns the *physical* owners we diff between steps — every worker that holds a copy of the chunk,
-/// whether it's the live ideal copy or a superseded one still draining (stale). Also returns
-/// per-chunk sizes, total physical bytes, and stale bytes.
-///
-/// Diffing physical placement (`chunk_workers`, i.e. ideal ∪ stale) rather than the ideal alone
-/// means a copy that only flips between the ideal and stale ledgers — superseded, then later
-/// re-promoted — never leaves disk and so never shows up as a free or a download. A same-worker
-/// drain→refetch is the one physical move a boundary diff still misses; the `drained` set carried
-/// alongside these owners recovers it (see [`drained_owners`]).
+/// Returns the *physical* owners we diff between steps (`chunk_workers` = ideal ∪ stale), per-chunk
+/// sizes, total physical bytes, and stale bytes. Diffing physical (not ideal-only) placement means a
+/// copy that just flips ideal↔stale on disk isn't scored as a free or download; the one physical move
+/// this misses — a same-worker drain→refetch — is recovered via the `drained` set (see [`drained_owners`]).
 fn owners_from_assignment(
     assignment: &WorkerAssignment,
     stale: &[(ChunkPk, WorkerPk)],
@@ -517,7 +510,6 @@ fn owners_from_assignment(
         sizes.insert(key.clone(), chunk.size);
         used_bytes += chunk.size as u64 * worker_pks.len() as u64;
 
-        // Intern every physical holder (ideal ∪ stale); `chunk_workers` already merges both.
         let holders: Vec<WorkerIdx> =
             worker_index.intern_holders(worker_pks.iter().filter_map(|worker_pk| {
                 assignment
@@ -542,11 +534,10 @@ fn owners_from_assignment(
     (owners, sizes, used_bytes, stale_bytes)
 }
 
-/// Translate the storage's drained `(chunk_pk, worker_pk)` pairs into `(ChunkId, WorkerIdx)`, interned
-/// with the SAME `worker_index` as [`owners_from_assignment`] so indices line up in the diff. Pairs
-/// whose chunk or worker is absent from the published assignment (a chunk that fully drained away, a
-/// departed worker) are skipped: they never appear in the current owners, so they can never be scored
-/// as a refetch download — `freed = prev \ cur` already accounts for them.
+/// Translate drained `(chunk_pk, worker_pk)` pairs to `(ChunkId, WorkerIdx)`, interned with the same
+/// `worker_index` as [`owners_from_assignment`] so the diff lines up. Pairs whose chunk/worker is
+/// absent from the assignment are skipped — they never appear in `current`, so `freed = prev \ cur`
+/// already covers them.
 fn drained_owners(
     assignment: &WorkerAssignment,
     drains: &[(ChunkPk, WorkerPk)],
@@ -564,7 +555,7 @@ fn drained_owners(
             .or_default()
             .push(worker_index.intern(worker.peer_id));
     }
-    // `compute_data_movement` binary-searches these, so keep each holder list sorted and deduped.
+    // `compute_data_movement` binary-searches these, so keep them sorted and deduped.
     for holders in out.values_mut() {
         holders.sort_unstable();
         holders.dedup();
@@ -664,9 +655,8 @@ mod tests {
         let (owners, _sizes, used_bytes, stale_bytes) =
             owners_from_assignment(&assignment, &stale, &mut worker_index);
 
-        // c1's PHYSICAL holders include the draining copy on worker 3: a diff must see it as still
-        // present so re-promoting it later is not mis-scored as a fresh download. `intern` is
-        // idempotent and `intern_holders` sorts, so the list is both indices in order.
+        // c1's physical holders include the draining copy on worker 3 (else re-promoting it later
+        // would read as a fresh download). `intern_holders` sorts, so both indices in order.
         let c1_key = (Arc::new("ds".to_string()), Arc::new("c1".to_string()));
         let mut expected = vec![
             worker_index.intern(worker1.peer_id),
@@ -681,14 +671,9 @@ mod tests {
         assert_eq!(stale_bytes, 100);
     }
 
-    /// End-to-end guard for "only real downloads count", walking the full metric pipeline
-    /// (`owners_from_assignment` → `measure_reshuffle` → `compute_data_movement`) through the exact
-    /// lifecycle that produced the heavy-profile artifacts:
-    ///   phase 1  supersede: a copy leaves the ideal but stays on disk (stale)  → must NOT read as freed
-    ///   phase 2  lag hold:  nothing moves                                       → no-op
-    ///   phase 3  drain + same-worker refetch: the copy is expired then re-placed → a REAL download
-    /// Without the drained set a step-boundary diff would miss phase 3 entirely (the copy is present
-    /// at both boundaries); the `drained` input is what recovers it.
+    /// End-to-end guard through the full pipeline: supersede (copy → stale, must not read as freed),
+    /// then drain + same-worker refetch (expired then re-placed, a real download the drained set
+    /// recovers — a boundary diff misses it since the copy is present at both ends).
     #[test]
     fn superseded_copy_is_not_freed_and_a_drained_refetch_is_a_real_download() {
         use std::time::Duration;

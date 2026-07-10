@@ -95,7 +95,6 @@ fn build_table(metrics: &[ReshuffleMetrics]) -> tabled::Table {
             {
                 let mut cell = format!("{} ({})", dm.shuffled_count, ByteSize(dm.shuffled_bytes));
                 if dm.refetched_count > 0 {
-                    // Refetch = re-download onto the same worker after a drain; a kind of shuffle.
                     cell += &format!(
                         " +rf {} ({})",
                         dm.refetched_count,

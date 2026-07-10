@@ -64,8 +64,7 @@ pub struct Summary {
 pub struct StepPlacement {
     pub owners: ChunkOwners,
     pub chunk_sizes: ChunkSizeIndex,
-    /// `(chunk, worker)` copies physically removed during this cycle's GC (empty on the stateless
-    /// path). Lets the metric count a same-worker drain→refetch as a real download.
+    /// `(chunk, worker)` copies the cycle's GC expired (empty on the stateless path).
     pub drained: crate::DrainedOwners,
     pub replication_by_weight: BTreeMap<u16, u16>,
     pub used_capacity_bytes: u64,

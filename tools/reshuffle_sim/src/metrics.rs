@@ -32,17 +32,15 @@ pub struct ReshuffleMetrics {
     pub schedule_duration: Duration,
 }
 
-/// Data movement between two assignments, classified by cause. Every byte counted here is a real S3
-/// download or a real physical free: a copy that stays on disk while only flipping between the ideal
-/// and stale ledgers contributes nothing.
+/// Data movement between two assignments, classified by cause. Only real S3 downloads / physical
+/// frees count; a copy flipping between the ideal and stale ledgers on disk contributes nothing.
 #[derive(Default)]
 pub struct DataMovement {
     pub new_chunk_bytes: u64,
     pub shuffled_bytes: u64,
     pub shuffled_count: u32,
-    /// Bytes re-downloaded onto a worker that physically dropped the copy this cycle (drain→refetch),
-    /// then had it re-placed. Distinct from `increased_replication_bytes`: replication did not grow
-    /// (the worker leaves as a stale copy and returns as an ideal one), but the bytes are refetched.
+    /// Bytes re-downloaded onto a worker that dropped the copy this cycle then had it re-placed. Not
+    /// `increased_replication_bytes`: replication didn't grow (stale copy out, ideal copy back).
     pub refetched_bytes: u64,
     pub refetched_count: u32,
     pub increased_replication_bytes: u64,
@@ -57,8 +55,6 @@ impl DataMovement {
         DataMovement::default()
     }
 
-    /// Total S3 download this step: every copy a worker had to fetch — brand-new chunks, shuffles
-    /// onto a new worker, net replication increase, and same-worker refetches after a drain.
     pub fn total_download(&self) -> u64 {
         self.new_chunk_bytes
             + self.shuffled_bytes
@@ -163,13 +159,10 @@ fn filter_owners(owners: &ChunkOwners, restricted: &HashSet<ChunkId>) -> ChunkOw
         .collect()
 }
 
-/// Classifies data movement between two assignments by cause. `previous`/`current` are *physical*
-/// holder sets (ideal ∪ stale); `drained` is the copies the cycle physically expired this step.
-/// - a chunk only in `current` is new — all its replicas are downloads;
-/// - a chunk in both: a worker only in `current` gained a copy (download), one only in `previous`
-///   lost it (freed), and one in both that was `drained` this cycle was re-fetched onto the same
-///   worker (a refetch download the raw set-diff can't see);
-/// - a chunk only in `previous` was removed — its replicas are freed.
+/// Classifies movement by cause. `previous`/`current` are *physical* holders (ideal ∪ stale);
+/// `drained` is the copies the cycle expired. New chunk → downloads; a gained holder → download, a
+/// lost one → freed; a holder in both that was `drained` was re-fetched onto the same worker; a
+/// removed chunk → freed.
 fn compute_data_movement(
     previous: &ChunkOwners,
     current: &ChunkOwners,
@@ -247,9 +240,7 @@ impl Movement {
                     j += 1;
                 }
                 Ordering::Equal => {
-                    // A holder in both prev and cur normally means "unchanged, already on disk".
-                    // But if that copy was physically expired this cycle, the worker had to
-                    // re-download it (the ideal re-placed it onto the same worker) — a real refetch.
+                    // Unchanged — unless expired this cycle, then re-fetched onto the same worker.
                     if drained.binary_search(&current[i]).is_ok() {
                         self.workers_shuffled.insert(current[i]);
                         refetched += 1;
@@ -259,8 +250,7 @@ impl Movement {
                 }
             }
         }
-        // `current`-only workers (gained) cannot be in `drained`: a drained copy was on disk at the
-        // start of the cycle, so it is in `previous`. `previous`-only workers are lost regardless.
+        // Tails need no drain check: a `current`-only worker can't be in `drained` (⊆ `previous`).
         for &w in &current[i..] {
             self.workers_shuffled.insert(w);
             gained += 1;

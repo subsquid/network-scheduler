@@ -75,7 +75,6 @@ impl StepScheduler for StatelessScheduler {
                 .iter()
                 .map(|c| ((c.dataset.clone(), c.id.clone()), c.size))
                 .collect(),
-            // The stateless path has no MVCC drain lifecycle; every step rebuilds from scratch.
             drained: BTreeMap::new(),
             replication_by_weight: assignment.replication_by_weight,
             used_capacity_bytes,

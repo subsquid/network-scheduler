@@ -78,13 +78,10 @@ impl PostgresStorage {
         })
     }
 
-    /// The stale `(chunk, worker)` copies a scheduling cycle at `(now, m_ticks)` would physically
-    /// expire — the exact predicate [`expire_drained_stale_mappings`](super::scheduling_cycle) runs.
-    /// Read-only, for offline tooling (reshuffle-sim): querying *before* the cycle recovers the set
-    /// of copies about to be deleted, so a copy re-fetched onto the same worker it drained from can
-    /// be scored as a real download — otherwise invisible to a step-boundary placement diff (the
-    /// copy is present at both boundaries). The single sim connection runs this and the cycle
-    /// sequentially, so nothing changes the stale set between the read and the delete.
+    /// The stale `(chunk, worker)` copies a cycle at `(now, m_ticks)` would expire — the same
+    /// predicate [`expire_drained_stale_mappings`](super::scheduling_cycle) runs, as a read. Offline
+    /// tooling (reshuffle-sim) queries it before the cycle to attribute a same-worker drain→refetch
+    /// that a step-boundary placement diff can't see.
     pub fn expiring_stale_mappings(
         &self,
         now: u64,

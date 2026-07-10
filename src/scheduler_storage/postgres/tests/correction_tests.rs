@@ -73,10 +73,8 @@ fn set_marked_for_removal(storage: &mut PostgresStorage, chunk_pk: ChunkPk, tick
         .unwrap();
 }
 
-/// `expiring_stale_mappings(now, m_ticks)` reports exactly the `(chunk, worker)` copies the next
-/// cycle's GC will physically delete — the read the reshuffle-sim issues (before the cycle) to score
-/// a same-worker refetch as a real download. Mirrors the `chunk_migration_through_grace_period` MVCC
-/// flow: w1 → w2 with a grace window, then the holdover on w1 drains once the window elapses.
+/// `expiring_stale_mappings` reports exactly the `(chunk, worker)` copies the next cycle's GC will
+/// delete. Migrate w1 → w2, then let w1's holdover drain once the grace window elapses.
 #[test]
 fn expiring_stale_mappings_matches_what_the_cycle_deletes() {
     let grace = 60;
