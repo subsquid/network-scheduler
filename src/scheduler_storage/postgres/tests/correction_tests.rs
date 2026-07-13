@@ -145,7 +145,7 @@ fn expiring_stale_mappings_matches_what_the_cycle_deletes() {
 /// re-downloaded onto the *same* worker. Drives replication down then up via the capacity lever and
 /// checks the shed worker drains and is re-selected.
 #[test]
-fn a_shed_bonus_replica_drains_then_refetches_onto_the_same_worker() {
+fn shed_bonus_replica_drains_then_refetches_onto_the_same_worker() {
     use std::collections::BTreeSet;
 
     use semver::Version;

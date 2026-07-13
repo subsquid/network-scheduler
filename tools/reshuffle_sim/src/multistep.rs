@@ -32,12 +32,14 @@ use crate::{
 /// One cycle's result: the published assignment, its stale snapshot, the copies the cycle expired,
 /// and the schedule duration — or a capacity shortage (the run records a failed step and stops).
 enum CycleResult {
-    Scheduled(
-        WorkerAssignment,
-        Vec<(ChunkPk, WorkerPk)>,
-        Vec<(ChunkPk, WorkerPk)>,
-        Duration,
-    ),
+    Scheduled {
+        assignment: WorkerAssignment,
+        /// Draining copies in the published placement.
+        stale: Vec<(ChunkPk, WorkerPk)>,
+        /// Copies this cycle physically expired. Same type as `stale`; named to keep them distinct.
+        drains: Vec<(ChunkPk, WorkerPk)>,
+        schedule_duration: Duration,
+    },
     Shortage(String),
 }
 
@@ -232,7 +234,9 @@ impl MultistepScheduler {
             .run_cycle()
             .context("scheduling baseline placement")?
         {
-            CycleResult::Scheduled(assignment, stale, _drains, _) => (assignment, stale),
+            CycleResult::Scheduled {
+                assignment, stale, ..
+            } => (assignment, stale),
             CycleResult::Shortage(reason) => {
                 anyhow::bail!("baseline placement infeasible: {reason}")
             }
@@ -297,12 +301,12 @@ impl MultistepScheduler {
             .storage
             .confirm_worker_assignment(watermark, self.clock)?;
         self.backend.storage.run_visibility_cycle(self.clock)?;
-        Ok(CycleResult::Scheduled(
+        Ok(CycleResult::Scheduled {
             assignment,
             stale,
             drains,
             schedule_duration,
-        ))
+        })
     }
 
     /// The publication `confirm_lag_steps + portal_lag_steps` cycles back.
@@ -442,9 +446,12 @@ impl StepScheduler for MultistepScheduler {
         self.backend.storage.insert_new_chunks(new_chunks)?;
         self.backend.storage.register_new_chunks()?;
         let (assignment, stale, drains, schedule_duration) = match self.run_cycle()? {
-            CycleResult::Scheduled(assignment, stale, drains, duration) => {
-                (assignment, stale, drains, duration)
-            }
+            CycleResult::Scheduled {
+                assignment,
+                stale,
+                drains,
+                schedule_duration,
+            } => (assignment, stale, drains, schedule_duration),
             CycleResult::Shortage(reason) => return Ok(StepOutcome::Failed(reason)),
         };
 
