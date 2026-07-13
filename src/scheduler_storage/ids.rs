@@ -16,7 +16,7 @@ pub struct WorkerPk(pub i64);
 /// Primary key of a dataset row.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, sqlx::Type)]
 #[sqlx(transparent)]
-pub struct DatasetId(pub i16);
+pub struct DatasetPk(pub i16);
 
 /// Primary key of a schema row (`schemas.id`, a 32-bit `SERIAL`).
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, sqlx::Type)]
@@ -35,7 +35,7 @@ impl std::fmt::Display for WorkerPk {
     }
 }
 
-impl std::fmt::Display for DatasetId {
+impl std::fmt::Display for DatasetPk {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.0)
     }

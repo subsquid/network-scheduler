@@ -40,6 +40,49 @@ pub struct Args {
     /// Path to CLI mode state file containing workers and known chunks (required for cli mode)
     #[arg(long, env = "CLI_STATE_FILE", required_if_eq("mode", "cli"))]
     pub cli_state_file: Option<PathBuf>,
+
+    /// Run the multistep (MVCC) scheduling cycle instead of the ordinary scheduler.
+    #[cfg(feature = "mvcc-chunks")]
+    #[arg(long)]
+    pub multistep_scheduler: bool,
+
+    /// Postgres connection string for the multistep scheduler's storage backend.
+    #[cfg(feature = "mvcc-chunks")]
+    #[arg(
+        long,
+        env = "DATABASE_URL",
+        required_if_eq("multistep_scheduler", "true")
+    )]
+    pub database_url: Option<String>,
+
+    /// Multistep drain window (the MVCC "M"): how long a dropped `(chunk, worker)` pair keeps being
+    /// served after leaving the portal assignment.
+    #[cfg(feature = "mvcc-chunks")]
+    #[arg(long, env = "MULTISTEP_DRAIN_WINDOW", default_value = "5m", value_parser = humantime::parse_duration)]
+    pub multistep_drain_window: Duration,
+
+    /// Multistep departed-worker retention: a worker inactive for longer than this is deleted from
+    /// the scheduler's worker set. Must exceed the drain window.
+    #[cfg(feature = "mvcc-chunks")]
+    #[arg(long, env = "MULTISTEP_WORKER_GC", default_value = "24h", value_parser = humantime::parse_duration)]
+    pub multistep_worker_gc: Duration,
+}
+
+impl Args {
+    /// Validate cross-argument invariants clap can't express declaratively.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        // A worker must be retained at least until its dropped pairs finish draining.
+        #[cfg(feature = "mvcc-chunks")]
+        if self.multistep_scheduler {
+            ensure!(
+                self.multistep_worker_gc > self.multistep_drain_window,
+                "--multistep-worker-gc ({:?}) must exceed --multistep-drain-window ({:?})",
+                self.multistep_worker_gc,
+                self.multistep_drain_window,
+            );
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Copy, clap::ValueEnum)]

@@ -7,13 +7,21 @@ use tokio::io::AsyncSeekExt;
 use tracing::instrument;
 
 use crate::metrics;
-use crate::types::Chunk;
+use crate::types::{BlockNumber, Chunk, ChunkId, DatasetWatermark};
 use futures::{
     TryStreamExt,
     stream::{self, StreamExt},
 };
 
 const CONCURRENT_CHUNKS: usize = 4;
+
+/// S3 `start_after` key that resumes listing right after `chunk_id`'s objects. A chunk's files all
+/// live under `{chunk_id}/`; bumping that prefix's trailing `/` (0x2F) to `0` (0x30) yields the
+/// smallest key greater than every `{chunk_id}/…` file, yet still below the next chunk's `{id}/…`
+/// (ids differ earlier, in the zero-padded block numbers). So only the id is needed — not the files.
+fn resume_after(chunk_id: &str) -> String {
+    format!("{chunk_id}0")
+}
 
 /// How many times to attempt downloading a chunk's summary before giving up.
 /// The S3 endpoint occasionally stalls mid-stream (the AWS SDK reports it as
@@ -42,7 +50,7 @@ impl S3Storage {
 
     pub async fn load_newer_chunks(
         &self,
-        datasets: impl IntoIterator<Item = (Arc<String>, Option<&Chunk>)>,
+        datasets: impl IntoIterator<Item = DatasetWatermark>,
         concurrent_downloads: usize,
         dataset_load_timeout: Option<Duration>,
     ) -> anyhow::Result<BTreeMap<Arc<String>, Vec<Chunk>>> {
@@ -50,11 +58,17 @@ impl S3Storage {
         // Log and skip datasets that fail to load instead of aborting: one unreachable bucket
         // must not freeze updates for all datasets.
         let result = stream::iter(datasets)
-            .map(|(dataset, last_chunk)| {
-                let storage = DatasetStorage::new(self.client.clone(), dataset);
+            .map(|watermark| {
+                let DatasetWatermark {
+                    dataset,
+                    last_chunk_id,
+                } = watermark;
+                let last_block = dataset.height;
+                let storage = DatasetStorage::new(self.client.clone(), dataset.id);
                 async move {
+                    let resume = last_block.zip(last_chunk_id.as_ref());
                     let chunks = storage
-                        .list_new_chunks(last_chunk, CONCURRENT_CHUNKS, dataset_load_timeout)
+                        .list_new_chunks(resume, CONCURRENT_CHUNKS, dataset_load_timeout)
                         .await;
                     (storage.dataset, chunks)
                 }
@@ -101,11 +115,10 @@ impl ChunkStream {
         client: s3::Client,
         dataset: Arc<String>,
         bucket: String,
-        last_chunk: Option<&Chunk>,
+        resume: Option<(BlockNumber, &ChunkId)>,
     ) -> Self {
-        let next_expected_block = last_chunk.as_ref().map(|chunk| chunk.blocks.end() + 1);
-        let last_key =
-            last_chunk.map(|chunk| format!("{}/{}", chunk.id, chunk.files.iter().max().unwrap()));
+        let next_expected_block = resume.map(|(block, _)| block + 1);
+        let last_key = resume.map(|(_, id)| resume_after(id));
 
         Self {
             client,
@@ -260,7 +273,7 @@ impl DatasetStorage {
     #[instrument(skip_all, level = "debug", fields(dataset = %self.dataset))]
     pub async fn list_new_chunks(
         &self,
-        last_chunk: Option<&Chunk>,
+        resume: Option<(BlockNumber, &ChunkId)>,
         concurrent_downloads: usize,
         dataset_load_timeout: Option<Duration>,
     ) -> anyhow::Result<Vec<Chunk>> {
@@ -271,7 +284,7 @@ impl DatasetStorage {
             self.client.clone(),
             self.dataset.clone(),
             self.bucket().to_string(),
-            last_chunk,
+            resume,
         );
         let mut chunks = Vec::new();
 
@@ -459,5 +472,21 @@ mod test {
         );
 
         assert_eq!(expected, have);
+    }
+
+    #[test]
+    fn resume_after_skips_chunk_and_precedes_next() {
+        let id = "0018197829/0018246541-0018248424-c7ed95c9";
+        let next = "0018197829/0018248425-0018250000-deadbeef";
+        let start = resume_after(id);
+        // Greater than every file of the chunk, even a high-sorting name.
+        for file in ["blocks.parquet", "transactions.parquet", "~~~.parquet"] {
+            assert!(
+                start.as_str() > format!("{id}/{file}").as_str(),
+                "must skip {file}"
+            );
+        }
+        // Still below the next chunk's objects, so listing resumes exactly at it.
+        assert!(start.as_str() < format!("{next}/blocks.parquet").as_str());
     }
 }

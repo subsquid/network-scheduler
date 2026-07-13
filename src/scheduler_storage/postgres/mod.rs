@@ -35,10 +35,10 @@ use sqlx::postgres::PgConnection;
 use crate::metrics::{PhaseTimer, Timer};
 use crate::scheduler_storage::algorithm::{ScheduleOutput, SchedulingAlgorithm};
 use crate::scheduler_storage::{
-    AssignmentId, ChunkPk, DatasetId, NewChunk, PortalAssignment, SchedulerStorage, StorageError,
+    AssignmentId, ChunkPk, DatasetPk, NewChunk, PortalAssignment, SchedulerStorage, StorageError,
     Tick, WorkerAssignment,
 };
-use crate::types::{DatasetSchema, Worker};
+use crate::types::{Dataset, DatasetSchema, DatasetWatermark, Worker};
 
 use nonoverlap::Candidate;
 use rows::tick_to_i64;
@@ -115,6 +115,39 @@ impl PostgresStorage {
         })
     }
 
+    /// Existing datasets, each with the S3-discovery watermark for its last chunk (its id and end
+    /// block), or `None` when the dataset has no chunks yet. A dataset absent from the result has no
+    /// row yet and must be created before its chunks can be registered.
+    pub fn datasets_with_last_chunk(&self) -> Result<Vec<DatasetWatermark>, StorageError> {
+        self.with_conn_ref(async move |conn| {
+            let rows: Vec<(String, Option<String>, Option<i64>)> = sqlx::query_as(
+                "SELECT d.name, lc.chunk_id, lc.last_block
+                 FROM datasets d
+                 LEFT JOIN LATERAL (
+                     SELECT c.chunk_id, c.first_block + c.last_block_delta AS last_block
+                     FROM chunks c
+                     LEFT JOIN sched_chunk_metadata m ON m.chunk_pk = c.chunk_pk
+                     WHERE c.dataset_id = d.id AND m.rejected IS NOT TRUE
+                     ORDER BY c.first_block DESC
+                     LIMIT 1
+                 ) lc ON true",
+            )
+            .fetch_all(&mut *conn)
+            .await
+            .context("fetch dataset watermarks")?;
+            Ok(rows
+                .into_iter()
+                .map(|(name, chunk_id, last_block)| DatasetWatermark {
+                    dataset: Dataset {
+                        id: std::sync::Arc::new(name),
+                        height: last_block.map(|b| b as u64),
+                    },
+                    last_chunk_id: chunk_id.map(std::sync::Arc::new),
+                })
+                .collect())
+        })
+    }
+
     /// Run an async query closure on the owned runtime with exclusive
     /// connection access. The `AsyncFnOnce` bound lets the future borrow the
     /// `&mut PgConnection` argument, which `FnOnce(_) -> Fut` cannot express.
@@ -166,7 +199,7 @@ impl SchedulerStorage for PostgresStorage {
             let mut timer = PhaseTimer::new("insert_new_datasets");
             let mut tx = conn.begin().await.context("insert_new_datasets: begin")?;
             for (name, dataset_schema) in &datasets {
-                let dataset_id: DatasetId =
+                let dataset_id: DatasetPk =
                     sqlx::query_scalar("INSERT INTO datasets (name) VALUES ($1) RETURNING id")
                         .bind(name)
                         .fetch_one(&mut *tx)
@@ -187,7 +220,7 @@ impl SchedulerStorage for PostgresStorage {
     ) -> Result<(), StorageError> {
         self.with_conn(async move |conn| -> Result<(), StorageError> {
             let mut tx = conn.begin().await.context("set_dataset_schema: begin")?;
-            let dataset_id: Option<DatasetId> =
+            let dataset_id: Option<DatasetPk> =
                 sqlx::query_scalar("SELECT id FROM datasets WHERE name = $1")
                     .bind(dataset)
                     .fetch_optional(&mut *tx)

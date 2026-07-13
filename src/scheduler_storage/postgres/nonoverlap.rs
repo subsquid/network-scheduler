@@ -17,12 +17,12 @@ use anyhow::{Context, Result};
 use sqlx::Row;
 use sqlx::postgres::{PgConnection, PgRow};
 
-use crate::scheduler_storage::{ChunkPk, DatasetId};
+use crate::scheduler_storage::{ChunkPk, DatasetPk};
 
 /// A chunk being considered for admission or promotion, with its inclusive block range.
 pub(super) struct Candidate {
     pub pk: ChunkPk,
-    pub dataset_id: DatasetId,
+    pub dataset_id: DatasetPk,
     pub dataset_name: String,
     pub first_block: i64,
     pub last_block: i64,
@@ -68,7 +68,7 @@ pub(super) fn settle_within_batch(mut clear: Vec<Candidate>) -> (Vec<ChunkPk>, V
     let mut rejected = Vec::new();
     // Sorted by start within a dataset, accepted ranges are non-overlapping with rising ends, so a
     // candidate need only be checked against the last accepted chunk in its dataset.
-    let mut last: Option<(DatasetId, i64)> = None; // (dataset_id, last_block of last accepted)
+    let mut last: Option<(DatasetPk, i64)> = None; // (dataset_id, last_block of last accepted)
     for c in clear {
         match last {
             Some((dataset_id, end)) if dataset_id == c.dataset_id && c.first_block <= end => {
@@ -127,7 +127,7 @@ async fn overlapping(
     let mut timer = crate::metrics::PhaseTimer::new("nonoverlap:overlap_probe");
     let n = candidates.len();
     let mut pks: Vec<ChunkPk> = Vec::with_capacity(n);
-    let mut datasets: Vec<DatasetId> = Vec::with_capacity(n);
+    let mut datasets: Vec<DatasetPk> = Vec::with_capacity(n);
     let mut firsts: Vec<i64> = Vec::with_capacity(n);
     let mut lasts: Vec<i64> = Vec::with_capacity(n);
     for c in candidates {
