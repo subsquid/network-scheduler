@@ -103,8 +103,14 @@ CREATE TABLE IF NOT EXISTS sched_chunk_metadata (
 );
 
 -- What the scheduler currently wants; published worker assignment = this ∪ sched_stale_mappings.
+-- No chunks FK, same as the twin below: the cycle re-stages the whole ideal via COPY, and an FK
+-- would cost a per-row check on every staged row (~6M/cycle). Integrity comes from
+-- sched_worker_assignment_diffs instead — a pk new to the ideal always differs from the live
+-- ideal, so the same cycle transaction diffs it into that table, whose chunks FK validates it:
+-- churn-sized, once per pk. The parent side never fires; chunks rows are never deleted
+-- (sched_chunk_metadata's FK pins them).
 CREATE TABLE IF NOT EXISTS sched_ideal_chunk_workers (
-    chunk_pk    BIGINT   PRIMARY KEY REFERENCES chunks(chunk_pk),
+    chunk_pk    BIGINT   PRIMARY KEY,
     worker_ids  BIGINT[] NOT NULL
 );
 
@@ -114,9 +120,9 @@ CREATE TABLE IF NOT EXISTS sched_ideal_chunk_workers (
 -- empty and sched_ideal_chunk_workers holding the new placement, ready for the next cycle.
 --
 -- Structure must stay identical to sched_ideal_chunk_workers: after a swap this table *is* the old
--- ideal (and vice versa), so both need the same PK + chunks FK to remain a valid drop-in.
+-- ideal (and vice versa), so both need the same bare PK to remain a valid drop-in.
 CREATE TABLE IF NOT EXISTS sched_future_ideal_chunk_workers (
-    chunk_pk    BIGINT   PRIMARY KEY, -- deliberately do not reference chunks
+    chunk_pk    BIGINT   PRIMARY KEY,
     worker_ids  BIGINT[] NOT NULL
 );
 
@@ -145,6 +151,19 @@ CREATE TABLE IF NOT EXISTS sched_stale_mappings (
 
 CREATE INDEX IF NOT EXISTS sched_stale_mappings_worker_id
     ON sched_stale_mappings (worker_id);
+
+-- activate_confirmed_drains flips every pending stale mapping at/under the confirmation watermark
+-- each visibility cycle; keying the watermark column lets the <= bound prune. Rows leave the index
+-- when their portal drop is stamped.
+CREATE INDEX IF NOT EXISTS sched_stale_mappings_pending_drain
+    ON sched_stale_mappings (superseded_at_worker_assignment_id)
+    WHERE dropped_at_portal_assignment_id IS NULL;
+
+-- expire_drained_stale_mappings deletes drained mappings whose portal drop aged out m_ticks ago;
+-- this bounds that DELETE to the drained rolling window instead of the whole holdover table.
+CREATE INDEX IF NOT EXISTS sched_stale_mappings_drained
+    ON sched_stale_mappings (dropped_at_portal_assignment_id)
+    WHERE dropped_at_portal_assignment_id IS NOT NULL;
 
 CREATE INDEX IF NOT EXISTS sched_chunk_metadata_portal_drop
     ON sched_chunk_metadata (dropped_at_portal_assignment_id)
@@ -177,6 +196,14 @@ CREATE INDEX IF NOT EXISTS sched_chunk_metadata_promotable
       AND applied_at_portal_assignment_id IS NULL
       AND dropped_at_portal_assignment_id IS NULL
       AND marked_for_removal IS NULL;
+
+-- The scheduling cycle stamps applied_at_worker_assignment_id onto chunks new to the ideal. The
+-- stamp is first-touch (never reset), so the unapplied set is the new-chunk frontier plus the
+-- never-placed/rejected residue — without this index the stamp joins the full future ideal
+-- (~6M rows) against metadata every cycle to change a few thousand rows.
+CREATE INDEX IF NOT EXISTS sched_chunk_metadata_unapplied
+    ON sched_chunk_metadata (chunk_pk)
+    WHERE applied_at_worker_assignment_id IS NULL;
 
 -- 1-to-1 chunk swap mechanism; applied_at_portal_assignment_id NULL = pending.
 CREATE TABLE chunk_corrections (
