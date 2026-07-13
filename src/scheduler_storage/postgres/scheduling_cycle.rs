@@ -18,7 +18,7 @@ use crate::scheduler_storage::{
 use crate::types::Worker;
 
 use super::rows::{
-    ActiveChunkRow, AlgoChunkRow, DatasetInterner, WorkerRow, algo_chunk_from_row,
+    ActiveChunkRow, DatasetInterner, WorkerRow, algo_chunk_from_assignment_chunk,
     assignment_worker_from_row, chunk_from_row, tick_to_i64,
 };
 
@@ -128,17 +128,31 @@ pub(super) async fn expire_drained_stale_mappings(
     Ok(())
 }
 
-/// Active (not tombstoned/rejected) chunks decoded straight into the algorithm's inputs: the
-/// chunks in (dataset, block) order plus the placement map (ideal ∪ stale; entries only for
-/// placed chunks). Streamed — a buffered row Vec was ~1 GB at 6M chunks.
+/// The scheduling cycle's one streamed read of the active (not tombstoned/rejected) chunk set,
+/// decoded into every in-memory form the rest of the cycle needs.
+pub(super) struct ActiveChunks {
+    /// The algorithm's chunk input, in (dataset, block) order.
+    pub(super) for_algo: Vec<(ChunkPk, AlgoChunk)>,
+    /// ideal ∪ stale; entries only for placed chunks.
+    pub(super) current_placement: CurrentPlacement,
+    /// Full-column decode of the same rows, for the post-commit
+    /// [`build_worker_assignment`] — which therefore needn't re-read the ~6M chunk
+    /// rows. Shares the dataset/id `Arc`s with `for_algo`, so the extra memory is
+    /// the struct + map node per chunk, not a second copy of the strings.
+    pub(super) published: BTreeMap<ChunkPk, WorkerAssignmentChunk>,
+}
+
+/// Active chunks decoded straight into the cycle's in-memory forms ([`ActiveChunks`]).
+/// Streamed — a buffered row Vec was ~1 GB at 6M chunks.
 pub(super) async fn fetch_active_chunks_with_placement(
     tx: &mut Transaction<'_, Postgres>,
-) -> Result<(Vec<(ChunkPk, AlgoChunk)>, CurrentPlacement)> {
+) -> Result<ActiveChunks> {
     let mut timer = PhaseTimer::new("run_scheduling_cycle:fetch_active_chunks_with_placement");
     let sql = format!(
         r#"
         {STALE_AGG_CTE}
         SELECT c.chunk_pk, d.name AS dataset_name, c.chunk_id, c.size,
+               c.schema_id, c.tables_present,
                c.first_block, c.last_block_delta,
                {PLACEMENT_MERGE}
         FROM chunks c
@@ -148,30 +162,39 @@ pub(super) async fn fetch_active_chunks_with_placement(
         LEFT JOIN stale_agg st ON st.chunk_pk = c.chunk_pk
         WHERE s.dropped_from_worker_assignment_at IS NULL
           AND NOT s.rejected
-        ORDER by (d.name, c.first_block)
+        -- Two scalar sort keys, not a ROW() constructor: `(a, b)` would sort on one record-typed
+        -- key via record_cmp and materialize an extra ROW column through the 6M-row sort
+        -- (measured ~2.5x slower, spilling to disk). The row order is identical.
+        ORDER BY d.name, c.first_block
         "#
     );
-    let mut stream = sqlx::query_as::<_, AlgoChunkRow>(sqlx::AssertSqlSafe(sql)).fetch(&mut **tx);
+    let mut stream = sqlx::query_as::<_, ActiveChunkRow>(sqlx::AssertSqlSafe(sql)).fetch(&mut **tx);
 
     let mut datasets = DatasetInterner::new();
-    let mut chunks_for_algo: Vec<(ChunkPk, AlgoChunk)> = Vec::new();
-    let mut current_placement = CurrentPlacement::default();
+    let mut out = ActiveChunks {
+        for_algo: Vec::new(),
+        current_placement: CurrentPlacement::default(),
+        published: BTreeMap::new(),
+    };
     let mut count = 0u64;
     while let Some(mut row) = stream
         .try_next()
         .await
         .context("run_scheduling_cycle: fetch active chunks with placement")?
     {
-        let dataset = datasets.intern(&row.dataset_name);
-        let pk = row.chunk_pk;
+        let dataset = datasets.intern(&row.chunk.dataset_name);
+        let pk = row.chunk.chunk_pk;
         if let Some(holders) = row.worker_ids.take() {
-            current_placement.insert(pk, holders);
+            out.current_placement.insert(pk, holders);
         }
-        chunks_for_algo.push((pk, algo_chunk_from_row(row, dataset)));
+        let chunk = chunk_from_row(row.chunk, dataset);
+        out.for_algo
+            .push((pk, algo_chunk_from_assignment_chunk(&chunk)));
+        out.published.insert(pk, chunk);
         count += 1;
     }
     timer.stmt(count);
-    Ok((chunks_for_algo, current_placement))
+    Ok(out)
 }
 
 pub(super) async fn fetch_workers(tx: &mut Transaction<'_, Postgres>) -> Result<Vec<WorkerRow>> {
@@ -214,9 +237,10 @@ pub(super) async fn apply_deltas_and_swap(
 ///   1. Mint superseded stale: holders the future ideal drops that still hold a draining copy —
 ///      known workers only (a GC'd worker holds nothing, and its stale row would break the FK), and
 ///      not chunks mid portal-drop. `DO NOTHING` keeps any pre-existing stale row.
-///   2. Record routing diffs: chunks whose holder set changed (emit future holders) or were dropped
-///      (emit `'{}'`). Canonical arrays make `IS DISTINCT FROM` an exact set test; the arms are
-///      disjoint, so no PK conflict.
+///   2. Record routing diffs in one FULL JOIN pass (both PKs merge-join): chunks whose holder set
+///      changed or entered (emit future holders) or were dropped (emit `'{}'` via the COALESCE).
+///      Canonical arrays make `IS DISTINCT FROM` an exact set test, and it also covers the
+///      one-sided rows: a NULL side is distinct from any holder set.
 ///   3. Resolve flip-flops: a pair back in the new ideal is no longer stale.
 ///   4. Stamp entered chunks: first-touch the assignment id onto chunks new to the ideal.
 ///   5. Swap: truncate the old ideal, then 3-way rename so the future twin becomes live and the old
@@ -237,15 +261,10 @@ WHERE u.worker_id <> ALL (COALESCE(f.worker_ids, '{}'::bigint[]))
 ON CONFLICT (chunk_pk, worker_id) DO NOTHING;
 
 INSERT INTO sched_worker_assignment_diffs (worker_assignment_id, chunk_pk, worker_ids)
-SELECT $WA, f.chunk_pk, f.worker_ids
+SELECT $WA, COALESCE(f.chunk_pk, c.chunk_pk), COALESCE(f.worker_ids, '{}'::bigint[])
 FROM sched_future_ideal_chunk_workers f
-LEFT JOIN sched_ideal_chunk_workers c ON c.chunk_pk = f.chunk_pk
-WHERE f.worker_ids IS DISTINCT FROM c.worker_ids
-UNION ALL
-SELECT $WA, c.chunk_pk, '{}'::bigint[]
-FROM sched_ideal_chunk_workers c
-LEFT JOIN sched_future_ideal_chunk_workers f ON f.chunk_pk = c.chunk_pk
-WHERE f.chunk_pk IS NULL;
+FULL JOIN sched_ideal_chunk_workers c ON c.chunk_pk = f.chunk_pk
+WHERE f.worker_ids IS DISTINCT FROM c.worker_ids;
 
 DELETE FROM sched_stale_mappings s
 USING sched_future_ideal_chunk_workers f
@@ -269,6 +288,11 @@ ALTER TABLE sched_ideal_chunk_workers__swap RENAME TO sched_future_ideal_chunk_w
 /// distinct), so each stored array stays canonical for next cycle's `IS DISTINCT FROM` diff against
 /// the live ideal. (The algorithm emits a chunk only once a worker holds it, so there are no
 /// empty-holder rows.)
+///
+/// The PK is dropped before the COPY and rebuilt after: one sorted index build beats ~6M
+/// incremental btree inserts. Rebuilt here, before [`apply_deltas_and_swap`], so its diff joins
+/// still see both PKs. The constraint is looked up by catalog, not name: table renames in the swap
+/// carry constraint names along, so after a swap the twin holds the other table's `_pkey` name.
 pub(super) async fn write_future_ideal(
     tx: &mut Transaction<'_, Postgres>,
     ideal_mappings: &[(ChunkPk, Vec<WorkerPk>)],
@@ -278,6 +302,22 @@ pub(super) async fn write_future_ideal(
     use std::fmt::Write as _;
 
     let mut timer = PhaseTimer::new("run_scheduling_cycle:write_future_ideal");
+    sqlx::raw_sql(
+        r#"
+        DO $$
+        DECLARE c name;
+        BEGIN
+            SELECT conname INTO c FROM pg_constraint
+            WHERE conrelid = 'sched_future_ideal_chunk_workers'::regclass AND contype = 'p';
+            IF c IS NOT NULL THEN
+                EXECUTE format('ALTER TABLE sched_future_ideal_chunk_workers DROP CONSTRAINT %I', c);
+            END IF;
+        END $$;
+        "#,
+    )
+    .execute(&mut **tx)
+    .await
+    .context("run_scheduling_cycle: drop future ideal pk")?;
     let mut copy = tx
         .copy_in_raw("COPY sched_future_ideal_chunk_workers (chunk_pk, worker_ids) FROM STDIN")
         .await
@@ -312,6 +352,12 @@ pub(super) async fn write_future_ideal(
         .finish()
         .await
         .context("run_scheduling_cycle: finish COPY future ideal")?;
+    // Auto-named: the preferred `_pkey` name may be held by the live twin after a swap, in which
+    // case Postgres picks a suffixed one — the names ping-pong, nothing depends on them.
+    sqlx::raw_sql("ALTER TABLE sched_future_ideal_chunk_workers ADD PRIMARY KEY (chunk_pk)")
+        .execute(&mut **tx)
+        .await
+        .context("run_scheduling_cycle: rebuild future ideal pk")?;
     timer.stmt(rows);
     Ok(())
 }
@@ -351,51 +397,51 @@ pub(super) fn decode_workers(worker_rows: &[WorkerRow]) -> Result<DecodedWorkers
     })
 }
 
-/// Post-commit read building the published WorkerAssignment: ideal ∪ stale,
-/// excluding tombstoned chunks.
+/// Post-commit assembly of the published WorkerAssignment: ideal ∪ stale, excluding tombstoned
+/// chunks. The ideal is the algorithm output we just committed (byte-for-byte what
+/// [`write_future_ideal`] staged), and the chunk columns were already decoded by the cycle's
+/// active-chunks read — so the only query left is the (churn-sized) post-delta stale set, not a
+/// second ~6M-row pass over chunks.
 pub(super) async fn build_worker_assignment(
     conn: &mut PgConnection,
     id: AssignmentId,
     workers: &BTreeMap<WorkerPk, AssignmentWorker>,
     replication_by_weight: BTreeMap<u16, u16>,
+    ideal_mappings: Vec<(ChunkPk, Vec<WorkerPk>)>,
+    active_chunks: BTreeMap<ChunkPk, WorkerAssignmentChunk>,
 ) -> Result<WorkerAssignment> {
     let mut timer = PhaseTimer::new("run_scheduling_cycle:build_worker_assignment");
-    // The `(i … OR st …)` guard keeps only placed chunks (an active chunk the algorithm left
-    // unplaced is not published).
-    let sql = format!(
-        r#"
-        {STALE_AGG_CTE}
-        SELECT c.chunk_pk, d.name AS dataset_name, c.chunk_id, c.size,
-               c.schema_id, c.tables_present,
-               c.first_block, c.last_block_delta,
-               {PLACEMENT_MERGE}
-        FROM sched_chunk_metadata m
-        JOIN chunks c ON c.chunk_pk = m.chunk_pk
-        JOIN datasets d ON d.id = c.dataset_id
-        LEFT JOIN sched_ideal_chunk_workers i ON i.chunk_pk = m.chunk_pk
-        LEFT JOIN stale_agg st ON st.chunk_pk = m.chunk_pk
-        WHERE m.dropped_from_worker_assignment_at IS NULL
-          AND NOT m.rejected
-          AND (i.chunk_pk IS NOT NULL OR st.chunk_pk IS NOT NULL)
-        "#
-    );
-    let rows: Vec<ActiveChunkRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql))
-        .fetch_all(&mut *conn)
-        .await
-        .context("build_worker_assignment: fetch placement and chunks")?;
-    timer.stmt(rows.len() as u64);
+    // Post-delta stale holders: pre-existing rows plus this cycle's mint, minus resolved
+    // flip-flops and phase-A drops — i.e. exactly what the committed table now holds.
+    let stale: Vec<(ChunkPk, Vec<WorkerPk>)> = sqlx::query_as(
+        "SELECT chunk_pk, array_agg(worker_id) FROM sched_stale_mappings GROUP BY chunk_pk",
+    )
+    .fetch_all(&mut *conn)
+    .await
+    .context("build_worker_assignment: fetch stale holders")?;
+    timer.stmt(stale.len() as u64);
 
-    let mut datasets = DatasetInterner::new();
-    let mut chunk_workers: BTreeMap<ChunkPk, Vec<WorkerPk>> = BTreeMap::new();
-    let mut chunks_out: BTreeMap<ChunkPk, WorkerAssignmentChunk> = BTreeMap::new();
-    for ActiveChunkRow { chunk, worker_ids } in rows {
-        let pk = chunk.chunk_pk;
-        let dataset = datasets.intern(&chunk.dataset_name);
-        chunks_out.insert(pk, chunk_from_row(chunk, dataset));
-        // Placement drives the join, so worker_ids is always present; the default just guards a
-        // NULL we never expect instead of panicking.
-        chunk_workers.insert(pk, worker_ids.unwrap_or_default());
+    let mut chunk_workers: BTreeMap<ChunkPk, Vec<WorkerPk>> = ideal_mappings.into_iter().collect();
+    for (pk, extra) in stale {
+        // Keep holder sets canonical (sorted, distinct), as the SQL merge did.
+        let holders = chunk_workers.entry(pk).or_default();
+        holders.extend(extra);
+        holders.sort_unstable();
+        holders.dedup();
     }
+
+    // Publish only placed chunks (an active chunk the algorithm left unplaced is not published).
+    // A placed pk absent from the active set is a stale row for a chunk tombstoned in an earlier
+    // GC — its holders must not be published either.
+    let mut active_chunks = active_chunks;
+    let mut chunks_out: BTreeMap<ChunkPk, WorkerAssignmentChunk> = BTreeMap::new();
+    chunk_workers.retain(|pk, _| match active_chunks.remove(pk) {
+        Some(chunk) => {
+            chunks_out.insert(*pk, chunk);
+            true
+        }
+        None => false,
+    });
 
     Ok(WorkerAssignment {
         id,

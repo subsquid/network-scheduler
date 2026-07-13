@@ -314,10 +314,13 @@ impl SchedulerStorage for PostgresStorage {
             // Phase B — placement reconcile; rolls back on shortage, leaving Phase A committed.
             let mut tx = conn.begin().await.context("run_scheduling_cycle: begin")?;
 
-            // One streamed round-trip for the algorithm's inputs; build_worker_assignment
-            // re-fetches the (much smaller) placed subset itself.
-            let (chunks_for_algo, current_placement) =
-                phase::fetch_active_chunks_with_placement(&mut tx).await?;
+            // One streamed round-trip decoding the algorithm's inputs and the published chunk
+            // columns together, so the post-commit assignment build needn't re-read them.
+            let phase::ActiveChunks {
+                for_algo: chunks_for_algo,
+                current_placement,
+                published: published_chunks,
+            } = phase::fetch_active_chunks_with_placement(&mut tx).await?;
 
             let worker_rows = phase::fetch_workers(&mut tx).await?;
             let phase::DecodedWorkers {
@@ -361,6 +364,8 @@ impl SchedulerStorage for PostgresStorage {
                 new_wa_id,
                 &workers_map,
                 replication_by_weight,
+                ideal_mappings,
+                published_chunks,
             )
             .await?;
             Ok::<_, StorageError>(wa)

@@ -28,19 +28,6 @@ pub(super) struct ChunkRow {
     pub(super) last_block_delta: i32,
 }
 
-/// Slim row for the hot scheduling-cycle read (no schema columns), decoding into [`AlgoChunk`]
-/// plus the chunk's placement. `worker_ids` is `None` for a never-placed chunk.
-#[derive(sqlx::FromRow)]
-pub(super) struct AlgoChunkRow {
-    pub(super) chunk_pk: ChunkPk,
-    pub(super) dataset_name: String,
-    pub(super) chunk_id: String,
-    pub(super) size: i32,
-    pub(super) first_block: i64,
-    pub(super) last_block_delta: i32,
-    pub(super) worker_ids: Option<Vec<WorkerPk>>,
-}
-
 #[derive(sqlx::FromRow)]
 pub(super) struct WorkerRow {
     pub(super) id: WorkerPk,
@@ -93,12 +80,13 @@ pub(super) fn chunk_from_row(row: ChunkRow, dataset: Arc<String>) -> WorkerAssig
     }
 }
 
-pub(super) fn algo_chunk_from_row(row: AlgoChunkRow, dataset: Arc<String>) -> AlgoChunk {
+/// The algorithm's slim view of a decoded chunk; clones the `Arc`s, not the strings.
+pub(super) fn algo_chunk_from_assignment_chunk(chunk: &WorkerAssignmentChunk) -> AlgoChunk {
     AlgoChunk {
-        dataset,
-        id: Arc::new(row.chunk_id),
-        size: row.size as u32,
-        blocks: block_range_from_columns(row.first_block, row.last_block_delta),
+        dataset: chunk.dataset.clone(),
+        id: chunk.id.clone(),
+        size: chunk.size,
+        blocks: chunk.blocks.clone(),
     }
 }
 
