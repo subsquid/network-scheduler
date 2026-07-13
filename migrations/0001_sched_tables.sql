@@ -68,10 +68,15 @@ CREATE TABLE IF NOT EXISTS sched_worker_assignments (
     scheduler_version TEXT
 );
 
--- One row per visibility cycle. created_at anchors the M-tick drain window.
+-- One row per visibility cycle. created_at anchors the M-tick drain window; confirmed_up_to is
+-- the worker-assignment confirmation watermark read by that cycle. Together they define which
+-- stale mappings are draining -- a mapping superseded at/under some cycle's watermark is draining,
+-- anchored at the first such cycle -- without stamping millions of stale rows per reshuffle (the
+-- per-row stamp was a 245s full-table UPDATE in the correction scenarios).
 CREATE TABLE IF NOT EXISTS sched_portal_assignments (
-    id         BIGSERIAL   PRIMARY KEY,
-    created_at BIGINT NOT NULL
+    id               BIGSERIAL   PRIMARY KEY,
+    created_at       BIGINT NOT NULL,
+    confirmed_up_to  BIGINT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS sched_workers (
@@ -140,30 +145,31 @@ CREATE TABLE IF NOT EXISTS sched_worker_assignment_diffs (
     PRIMARY KEY (worker_assignment_id, chunk_pk)
 );
 
--- Grace-period holdovers for (chunk, worker) pairs removed from the ideal.
+-- Grace-period holdovers for (chunk, worker) pairs removed from the ideal. Whether a mapping is
+-- pending or draining is derived, not stored: it is draining once any portal assignment's
+-- confirmed_up_to covers its superseded_at_worker_assignment_id, anchored at the first such
+-- assignment (see sched_portal_assignments).
 CREATE TABLE IF NOT EXISTS sched_stale_mappings (
     chunk_pk                            BIGINT NOT NULL REFERENCES chunks(chunk_pk),
     worker_id                           BIGINT NOT NULL REFERENCES sched_workers(id),
     superseded_at_worker_assignment_id  BIGINT NOT NULL REFERENCES sched_worker_assignments(id),
-    dropped_at_portal_assignment_id     BIGINT REFERENCES sched_portal_assignments(id),
     PRIMARY KEY (chunk_pk, worker_id)
 );
 
 CREATE INDEX IF NOT EXISTS sched_stale_mappings_worker_id
     ON sched_stale_mappings (worker_id);
 
--- activate_confirmed_drains flips every pending stale mapping at/under the confirmation watermark
--- each visibility cycle; keying the watermark column lets the <= bound prune. Rows leave the index
--- when their portal drop is stamped.
-CREATE INDEX IF NOT EXISTS sched_stale_mappings_pending_drain
-    ON sched_stale_mappings (superseded_at_worker_assignment_id)
-    WHERE dropped_at_portal_assignment_id IS NULL;
+-- The expiry delete prunes by "superseded at/under the aged watermark cutoff" each scheduling
+-- cycle; keying the watermark column keeps an idle cycle to an empty index range scan.
+CREATE INDEX IF NOT EXISTS sched_stale_mappings_superseded
+    ON sched_stale_mappings (superseded_at_worker_assignment_id);
 
--- expire_drained_stale_mappings deletes drained mappings whose portal drop aged out m_ticks ago;
--- this bounds that DELETE to the drained rolling window instead of the whole holdover table.
-CREATE INDEX IF NOT EXISTS sched_stale_mappings_drained
-    ON sched_stale_mappings (dropped_at_portal_assignment_id)
-    WHERE dropped_at_portal_assignment_id IS NOT NULL;
+-- Reshuffles mint and expire millions of stale rows at once; reclaim the dead tuples quickly so
+-- the per-cycle stale reads don't wade through them until a default-threshold autovacuum.
+ALTER TABLE sched_stale_mappings SET (
+    autovacuum_vacuum_scale_factor = 0.02,
+    autovacuum_vacuum_cost_delay = 0
+);
 
 CREATE INDEX IF NOT EXISTS sched_chunk_metadata_portal_drop
     ON sched_chunk_metadata (dropped_at_portal_assignment_id)

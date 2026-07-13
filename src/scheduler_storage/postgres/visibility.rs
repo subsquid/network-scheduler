@@ -123,15 +123,22 @@ pub(super) async fn drop_replayed_diffs(
 // run_visibility_cycle phases
 // ---------------------------------------------------------------------------
 
+/// Open the cycle's portal assignment, recording the confirmation watermark it saw. That one
+/// value is what activates drains: a stale mapping superseded at/under it is draining as of this
+/// assignment — no per-row stamping (a ~245s full-table UPDATE at reshuffle scale); the expiry
+/// delete derives the same window from `(created_at, confirmed_up_to)`.
 pub(super) async fn open_portal_assignment(
     tx: &mut Transaction<'_, Postgres>,
     now: u64,
+    confirmed_up_to: AssignmentId,
 ) -> Result<AssignmentId> {
     let mut timer = PhaseTimer::new("run_visibility_cycle:open_portal_assignment");
     let id = sqlx::query_scalar(
-        "INSERT INTO sched_portal_assignments (created_at) VALUES ($1) RETURNING id",
+        "INSERT INTO sched_portal_assignments (created_at, confirmed_up_to) \
+         VALUES ($1, $2) RETURNING id",
     )
     .bind(tick_to_i64(now))
+    .bind(confirmed_up_to)
     .fetch_one(&mut **tx)
     .await
     .context("run_visibility_cycle: insert portal assignment")?;
@@ -373,30 +380,6 @@ pub(super) async fn drop_marked_chunks(
         "#,
     )
     .bind(new_pa_id)
-    .execute(&mut **tx)
-    .await?;
-    timer.stmt(res.rows_affected());
-    Ok(())
-}
-
-/// Activate drains: stamp pending stale mappings whose superseding worker
-/// assignment is now confirmed.
-pub(super) async fn activate_confirmed_drains(
-    tx: &mut Transaction<'_, Postgres>,
-    new_pa_id: AssignmentId,
-    confirmed_up_to: AssignmentId,
-) -> Result<()> {
-    let mut timer = PhaseTimer::new("run_visibility_cycle:activate_confirmed_drains");
-    let res = sqlx::query(
-        r#"
-        UPDATE sched_stale_mappings
-        SET dropped_at_portal_assignment_id = $1
-        WHERE dropped_at_portal_assignment_id IS NULL
-          AND superseded_at_worker_assignment_id <= $2
-        "#,
-    )
-    .bind(new_pa_id)
-    .bind(confirmed_up_to)
     .execute(&mut **tx)
     .await?;
     timer.stmt(res.rows_affected());
