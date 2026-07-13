@@ -246,8 +246,11 @@ pub(super) async fn apply_ready_corrections(
 
 /// Promote every eligible chunk to portal-visible in one UPDATE: confirmed by a worker assignment
 /// at/under the watermark, not yet visible, not dropped, not marked for removal, and not a pending
-/// correction's replacement (those promote via the correction path). No `rejected` check — rejected
-/// chunks never reach a worker assignment, so the first condition already excludes them. The
+/// correction's replacement (those promote via the correction path). `NOT rejected` is redundant
+/// for correctness — rejected chunks never reach a worker assignment, so the first condition
+/// already excludes them — but the planner can't prove that, and the partial index
+/// `sched_chunk_metadata_promotable` includes it: without the conjunct the index is unusable and
+/// this UPDATE seq-scans all of sched_chunk_metadata every cycle. The
 /// non-overlap gate now lives in [`evict_portal_overlaps`], which settles overlaps in memory over the
 /// visible set we fetch anyway — so this neither fetches the candidates nor probes per chunk.
 pub(super) async fn promote_eligible_chunks(
@@ -259,7 +262,8 @@ pub(super) async fn promote_eligible_chunks(
     let res = sqlx::query(
         r#"
         UPDATE sched_chunk_metadata SET applied_at_portal_assignment_id = $1
-        WHERE applied_at_worker_assignment_id IS NOT NULL
+        WHERE NOT rejected
+          AND applied_at_worker_assignment_id IS NOT NULL
           AND applied_at_worker_assignment_id <= $2
           AND applied_at_portal_assignment_id IS NULL
           AND dropped_at_portal_assignment_id IS NULL
