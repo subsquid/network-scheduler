@@ -236,7 +236,9 @@ pub(super) async fn apply_deltas_and_swap(
 /// is the new worker-assignment id, substituted before execution. Sections, in execution order:
 ///   1. Mint superseded stale: holders the future ideal drops that still hold a draining copy —
 ///      known workers only (a GC'd worker holds nothing, and its stale row would break the FK), and
-///      not chunks mid portal-drop. `DO NOTHING` keeps any pre-existing stale row.
+///      not chunks mid portal-drop. `DO NOTHING` keeps any pre-existing stale row. Only chunks
+///      whose holder set changed enter the lateral unnest — an unchanged chunk cannot mint stale,
+///      and unnesting the whole ideal (~chunks × replication rows) dominated the batch's cost.
 ///   2. Record routing diffs in one FULL JOIN pass (both PKs merge-join): chunks whose holder set
 ///      changed or entered (emit future holders) or were dropped (emit `'{}'` via the COALESCE).
 ///      Canonical arrays make `IS DISTINCT FROM` an exact set test, and it also covers the
@@ -247,15 +249,19 @@ pub(super) async fn apply_deltas_and_swap(
 ///      one is left empty for the next cycle.
 const SQL_DELTAS_AND_SWAP: &str = r#"
 INSERT INTO sched_stale_mappings (chunk_pk, worker_id, superseded_at_worker_assignment_id)
-SELECT c.chunk_pk, u.worker_id, $WA
-FROM sched_ideal_chunk_workers c
-LEFT JOIN sched_future_ideal_chunk_workers f ON f.chunk_pk = c.chunk_pk
-CROSS JOIN LATERAL UNNEST(c.worker_ids) AS u(worker_id)
-WHERE u.worker_id <> ALL (COALESCE(f.worker_ids, '{}'::bigint[]))
+SELECT changed.chunk_pk, u.worker_id, $WA
+FROM (
+    SELECT c.chunk_pk, c.worker_ids, f.worker_ids AS future_ids
+    FROM sched_ideal_chunk_workers c
+    LEFT JOIN sched_future_ideal_chunk_workers f ON f.chunk_pk = c.chunk_pk
+    WHERE c.worker_ids IS DISTINCT FROM f.worker_ids
+) changed
+CROSS JOIN LATERAL UNNEST(changed.worker_ids) AS u(worker_id)
+WHERE u.worker_id <> ALL (COALESCE(changed.future_ids, '{}'::bigint[]))
   AND EXISTS (SELECT 1 FROM sched_workers sw WHERE sw.id = u.worker_id)
   AND NOT EXISTS (
       SELECT 1 FROM sched_chunk_metadata m
-      WHERE m.chunk_pk = c.chunk_pk
+      WHERE m.chunk_pk = changed.chunk_pk
         AND m.dropped_at_portal_assignment_id IS NOT NULL
   )
 ON CONFLICT (chunk_pk, worker_id) DO NOTHING;
