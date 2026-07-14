@@ -63,7 +63,7 @@ CREATE INDEX IF NOT EXISTS chunks_dataset_range_gist ON chunks USING gist (
 
 -- One row per scheduling cycle.
 CREATE TABLE IF NOT EXISTS sched_worker_assignments (
-    id                BIGSERIAL   PRIMARY KEY,
+    id                SERIAL PRIMARY KEY,
     created_at        BIGINT NOT NULL,
     scheduler_version TEXT
 );
@@ -72,13 +72,13 @@ CREATE TABLE IF NOT EXISTS sched_worker_assignments (
 -- the worker-assignment confirmation watermark the cycle saw (drain derivation: see
 -- sched_stale_mappings).
 CREATE TABLE IF NOT EXISTS sched_portal_assignments (
-    id               BIGSERIAL   PRIMARY KEY,
+    id               SERIAL PRIMARY KEY,
     created_at       BIGINT NOT NULL,
-    confirmed_up_to  BIGINT NOT NULL
+    confirmed_up_to  INT    NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS sched_workers (
-    id             BIGSERIAL   PRIMARY KEY,
+    id             SERIAL      PRIMARY KEY,
     peer_id        TEXT        NOT NULL UNIQUE,
     version        TEXT,               -- semver e.g. '2.8.0'; NULL = unknown
     inactive_since BIGINT              -- NULL = currently active
@@ -86,20 +86,20 @@ CREATE TABLE IF NOT EXISTS sched_workers (
 
 -- Highest worker assignment confirmed by workers.
 CREATE TABLE IF NOT EXISTS sched_worker_confirmations (
-    assignment_id  BIGINT      PRIMARY KEY REFERENCES sched_worker_assignments(id),
+    assignment_id  INT    PRIMARY KEY REFERENCES sched_worker_assignments(id),
     confirmed_at   BIGINT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS sched_chunk_metadata (
     chunk_pk                        BIGINT PRIMARY KEY REFERENCES chunks(chunk_pk),
-    applied_at_worker_assignment_id BIGINT REFERENCES sched_worker_assignments(id),
-    applied_at_portal_assignment_id BIGINT REFERENCES sched_portal_assignments(id),
-    marked_for_removal              BIGINT,
+    applied_at_worker_assignment_id INT    REFERENCES sched_worker_assignments(id),
+    applied_at_portal_assignment_id INT    REFERENCES sched_portal_assignments(id),
+    marked_for_removal              BIGINT,  -- a tick, not an id: stays 64-bit
     -- True if the chunk was rejected at registration for overlapping a live chunk in its dataset;
     -- such a chunk is never scheduled or reconsidered. (A bool, not a tick: registration has no
     -- clock.)
     rejected                        BOOLEAN NOT NULL DEFAULT FALSE,
-    dropped_at_portal_assignment_id BIGINT REFERENCES sched_portal_assignments(id),
+    dropped_at_portal_assignment_id INT    REFERENCES sched_portal_assignments(id),
     -- Tick at which the chunk was tombstoned (pulled from the worker layer), m_ticks after its
     -- portal drop. NULL = not tombstoned.
     dropped_from_worker_assignment_at BIGINT
@@ -112,8 +112,8 @@ CREATE TABLE IF NOT EXISTS sched_chunk_metadata (
 -- diffs it into that table, whose chunks FK validates it once per pk. The parent side never fires;
 -- chunks rows are never deleted (sched_chunk_metadata's FK pins them).
 CREATE TABLE IF NOT EXISTS sched_ideal_chunk_workers (
-    chunk_pk    BIGINT   PRIMARY KEY,
-    worker_ids  BIGINT[] NOT NULL
+    chunk_pk    BIGINT PRIMARY KEY,
+    worker_ids  INT[]  NOT NULL
 );
 
 -- Twin of sched_ideal_chunk_workers. run_scheduling_cycle stages the freshly computed ideal here,
@@ -122,21 +122,21 @@ CREATE TABLE IF NOT EXISTS sched_ideal_chunk_workers (
 -- to sched_ideal_chunk_workers: after a swap this table *is* the old ideal (and vice versa), so both
 -- need the same bare PK to remain a valid drop-in.
 CREATE TABLE IF NOT EXISTS sched_future_ideal_chunk_workers (
-    chunk_pk    BIGINT   PRIMARY KEY,
-    worker_ids  BIGINT[] NOT NULL
+    chunk_pk    BIGINT PRIMARY KEY,
+    worker_ids  INT[]  NOT NULL
 );
 
 -- What portals route by; lags the ideal until the confirmation watermark advances.
 CREATE TABLE IF NOT EXISTS sched_confirmed_chunk_workers (
-    chunk_pk    BIGINT   PRIMARY KEY, -- deliberately do not reference chunks
-    worker_ids  BIGINT[] NOT NULL
+    chunk_pk    BIGINT PRIMARY KEY, -- deliberately do not reference chunks
+    worker_ids  INT[]  NOT NULL
 );
 
 -- Per-cycle routing deltas waiting to be replayed into sched_confirmed_chunk_workers.
 CREATE TABLE IF NOT EXISTS sched_worker_assignment_diffs (
-    worker_assignment_id  BIGINT   NOT NULL REFERENCES sched_worker_assignments(id),
-    chunk_pk              BIGINT   NOT NULL REFERENCES chunks(chunk_pk),
-    worker_ids            BIGINT[] NOT NULL,  -- empty array = remove from confirmed routing
+    worker_assignment_id  INT    NOT NULL REFERENCES sched_worker_assignments(id),
+    chunk_pk              BIGINT NOT NULL REFERENCES chunks(chunk_pk),
+    worker_ids            INT[]  NOT NULL,  -- empty array = remove from confirmed routing
     PRIMARY KEY (worker_assignment_id, chunk_pk)
 );
 
@@ -144,8 +144,8 @@ CREATE TABLE IF NOT EXISTS sched_worker_assignment_diffs (
 -- once a portal assignment's confirmed_up_to covers superseded_at_worker_assignment_id.
 CREATE TABLE IF NOT EXISTS sched_stale_mappings (
     chunk_pk                            BIGINT NOT NULL REFERENCES chunks(chunk_pk),
-    worker_id                           BIGINT NOT NULL REFERENCES sched_workers(id),
-    superseded_at_worker_assignment_id  BIGINT NOT NULL REFERENCES sched_worker_assignments(id),
+    worker_id                           INT    NOT NULL REFERENCES sched_workers(id),
+    superseded_at_worker_assignment_id  INT    NOT NULL REFERENCES sched_worker_assignments(id),
     PRIMARY KEY (chunk_pk, worker_id)
 );
 
@@ -205,8 +205,8 @@ CREATE TABLE chunk_corrections (
     old_chunk_pk                    BIGINT   PRIMARY KEY REFERENCES chunks(chunk_pk),
     new_chunk_pk                    BIGINT   NOT NULL    REFERENCES chunks(chunk_pk),
     dataset_id                      SMALLINT NOT NULL    REFERENCES datasets(id),
-    created_at                      BIGINT   NOT NULL,
-    applied_at_portal_assignment_id BIGINT   REFERENCES sched_portal_assignments(id),
+    created_at                      BIGINT   NOT NULL,  -- a tick, not an id: stays 64-bit
+    applied_at_portal_assignment_id INT      REFERENCES sched_portal_assignments(id),
     CHECK (old_chunk_pk <> new_chunk_pk)
 );
 

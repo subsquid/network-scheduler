@@ -529,7 +529,7 @@ impl<D: SimStorage> SimUnderTest<D> {
             .iter()
             .copied()
             .enumerate()
-            .map(|(i, worker)| (WorkerPk(i as i64 + 1), worker.clone()))
+            .map(|(i, worker)| (WorkerPk(i as i32 + 1), worker.clone()))
             .collect();
         let excluded = self.chunks_excluded_from_floor();
         let mut chunk_pairs: Vec<(ChunkPk, AlgoChunk)> = self

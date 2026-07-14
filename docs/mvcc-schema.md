@@ -9,6 +9,20 @@ drain/GC predicate is integer arithmetic (`created_at <= $now - $m_ticks`), not
 `now() - INTERVAL`. The in-memory backend uses the same `u64` tick model. "M ticks" throughout is
 a logical grace window, not minutes.
 
+**Column widths.** Three rules, since these tables are sized in the millions of rows:
+
+- **Ticks are `BIGINT`.** They carry a caller-supplied clock (wall-clock seconds in production), so
+  they get the full 64 bits.
+- **Assignment and worker ids are `INT`.** Assignment ids are minted one per cycle — a 10s cycle
+  takes ~600 years to exhaust `INT` — and worker ids only by distinct peers ever seen (which is why
+  `update_worker_set` must not burn ids on re-sync; see `postgres/workers.rs`). Both are referenced
+  far more often than they are minted: an assignment id sits in three `sched_chunk_metadata`
+  columns, in every stale mapping and every diff row, and a worker id is repeated once *per replica*
+  inside each routing row's `worker_ids`. That multiplication is what the width buys back.
+- **`chunks.chunk_pk` stays `BIGSERIAL`.** Chunk rows are never deleted, so its sequence only ever
+  climbs; narrowing it would save ~4% of what the other two do and puts an unrecoverable wrap at
+  the end of the road.
+
 **Single scheduler.** Only one scheduler instance may operate at a time, enforced by a Postgres
 advisory lock acquired at startup:
 
@@ -115,7 +129,7 @@ CREATE TABLE chunk_corrections (
     new_chunk_pk                    BIGINT   NOT NULL    REFERENCES chunks(chunk_pk),
     dataset_id                      SMALLINT NOT NULL    REFERENCES datasets(id),
     created_at                      BIGINT   NOT NULL,
-    applied_at_portal_assignment_id BIGINT   REFERENCES sched_portal_assignments(id),  -- NULL while pending
+    applied_at_portal_assignment_id INT      REFERENCES sched_portal_assignments(id),  -- NULL while pending
     CHECK (old_chunk_pk <> new_chunk_pk)
 );
 
@@ -161,17 +175,17 @@ structural and visible in the schema; ids are never compared across kinds in cod
 ```sql
 -- One row per scheduling cycle.
 CREATE TABLE sched_worker_assignments (
-    id                BIGSERIAL PRIMARY KEY,
-    created_at        BIGINT    NOT NULL,
+    id                SERIAL PRIMARY KEY,
+    created_at        BIGINT NOT NULL,
     scheduler_version TEXT
 );
 
 -- One row per visibility cycle. created_at anchors the M-tick drain window; confirmed_up_to is
 -- the worker-assignment confirmation watermark the cycle saw.
 CREATE TABLE sched_portal_assignments (
-    id              BIGSERIAL PRIMARY KEY,
-    created_at      BIGINT    NOT NULL,
-    confirmed_up_to BIGINT    NOT NULL
+    id              SERIAL PRIMARY KEY,
+    created_at      BIGINT NOT NULL,
+    confirmed_up_to INT    NOT NULL
 );
 ```
 
@@ -182,11 +196,11 @@ Per-chunk lifecycle state, separated from immutable chunk metadata to avoid writ
 ```sql
 CREATE TABLE sched_chunk_metadata (
     chunk_pk                        BIGINT PRIMARY KEY REFERENCES chunks(chunk_pk),
-    applied_at_worker_assignment_id BIGINT REFERENCES sched_worker_assignments(id),
-    applied_at_portal_assignment_id BIGINT REFERENCES sched_portal_assignments(id),
+    applied_at_worker_assignment_id INT    REFERENCES sched_worker_assignments(id),
+    applied_at_portal_assignment_id INT    REFERENCES sched_portal_assignments(id),
     marked_for_removal              BIGINT,  -- tick when marked; NULL = not marked
     rejected                        BOOLEAN NOT NULL DEFAULT FALSE,  -- rejected at registration; terminal
-    dropped_at_portal_assignment_id BIGINT REFERENCES sched_portal_assignments(id),
+    dropped_at_portal_assignment_id INT    REFERENCES sched_portal_assignments(id),
     dropped_from_worker_assignment_at BIGINT  -- tick when tombstoned; NULL = not tombstoned
 );
 
@@ -234,10 +248,10 @@ ahead of the eventual GC of the worker row.
 
 ```sql
 CREATE TABLE sched_workers (
-    id             BIGSERIAL PRIMARY KEY,
-    peer_id        TEXT      NOT NULL UNIQUE,
-    version        TEXT,            -- semver, e.g. '2.8.0'; NULL = unknown
-    inactive_since BIGINT           -- NULL = currently active
+    id             SERIAL PRIMARY KEY,
+    peer_id        TEXT   NOT NULL UNIQUE,
+    version        TEXT,          -- semver, e.g. '2.8.0'; NULL = unknown
+    inactive_since BIGINT         -- NULL = currently active
 );
 ```
 
@@ -249,7 +263,7 @@ by the caller, not here (see [mvcc-storage.md](mvcc-storage.md), Invariant 3).
 
 ```sql
 CREATE TABLE sched_worker_confirmations (
-    assignment_id BIGINT PRIMARY KEY REFERENCES sched_worker_assignments(id),
+    assignment_id INT    PRIMARY KEY REFERENCES sched_worker_assignments(id),
     confirmed_at  BIGINT NOT NULL
 );
 ```
@@ -266,13 +280,13 @@ churn-sized, by the diffs table's FK (see the migration).
 
 ```sql
 CREATE TABLE sched_ideal_chunk_workers (
-    chunk_pk   BIGINT   PRIMARY KEY,
-    worker_ids BIGINT[] NOT NULL
+    chunk_pk   BIGINT PRIMARY KEY,
+    worker_ids INT[]  NOT NULL
 );
 
 CREATE TABLE sched_confirmed_chunk_workers (
-    chunk_pk   BIGINT   PRIMARY KEY,
-    worker_ids BIGINT[] NOT NULL
+    chunk_pk   BIGINT PRIMARY KEY,
+    worker_ids INT[]  NOT NULL
 );
 ```
 
@@ -282,8 +296,6 @@ computed ideal; the cycle derives its deltas by joining live vs future, then ren
 
 The published worker assignment is `sched_ideal_chunk_workers ∪ sched_stale_mappings` — it does
 **not** read the confirmed routing (see [mvcc-storage.md](mvcc-storage.md), "Deferred removal").
-
-Sizing: ~7M chunks × ~350 bytes ≈ 2.5 GB each.
 
 ### sched_worker_assignment_diffs
 
@@ -295,9 +307,9 @@ order and deleted. Bounded by confirmation lag — empty in steady state.
 
 ```sql
 CREATE TABLE sched_worker_assignment_diffs (
-    worker_assignment_id BIGINT   NOT NULL REFERENCES sched_worker_assignments(id),
-    chunk_pk             BIGINT   NOT NULL REFERENCES chunks(chunk_pk),
-    worker_ids           BIGINT[] NOT NULL,  -- empty = remove from confirmed routing
+    worker_assignment_id INT    NOT NULL REFERENCES sched_worker_assignments(id),
+    chunk_pk             BIGINT NOT NULL REFERENCES chunks(chunk_pk),
+    worker_ids           INT[]  NOT NULL,  -- empty = remove from confirmed routing
     PRIMARY KEY (worker_assignment_id, chunk_pk)
 );
 ```
@@ -311,8 +323,8 @@ only; newly *added* pairs ride in `sched_ideal_chunk_workers`.
 ```sql
 CREATE TABLE sched_stale_mappings (
     chunk_pk                           BIGINT NOT NULL REFERENCES chunks(chunk_pk),
-    worker_id                          BIGINT NOT NULL REFERENCES sched_workers(id),
-    superseded_at_worker_assignment_id BIGINT NOT NULL REFERENCES sched_worker_assignments(id),
+    worker_id                          INT    NOT NULL REFERENCES sched_workers(id),
+    superseded_at_worker_assignment_id INT    NOT NULL REFERENCES sched_worker_assignments(id),
     PRIMARY KEY (chunk_pk, worker_id)
 );
 

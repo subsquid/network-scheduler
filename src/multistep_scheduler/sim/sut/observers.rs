@@ -150,7 +150,7 @@ impl Portal {
 mod tests {
     use super::*;
 
-    fn w(id: i64) -> WorkerPk {
+    fn w(id: i32) -> WorkerPk {
         WorkerPk(id)
     }
 

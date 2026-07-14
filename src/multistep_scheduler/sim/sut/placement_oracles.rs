@@ -322,14 +322,14 @@ fn can_host_after_dropping_bonuses(
 mod tests {
     use super::*;
 
-    fn wk(ids: &[i64]) -> Vec<WorkerPk> {
+    fn wk(ids: &[i32]) -> Vec<WorkerPk> {
         ids.iter().map(|&w| WorkerPk(w)).collect()
     }
 
     /// Hand-built snapshot: `sizes[i]` is chunk `i`'s byte size; `ideal[i]` / `stale[i]` are its
     /// holders.
-    fn snap(sizes: &[u32], ideal: &[&[i64]], stale: &[&[i64]]) -> Snapshot {
-        let holders = |sets: &[&[i64]]| -> Vec<BTreeSet<WorkerPk>> {
+    fn snap(sizes: &[u32], ideal: &[&[i32]], stale: &[&[i32]]) -> Snapshot {
+        let holders = |sets: &[&[i32]]| -> Vec<BTreeSet<WorkerPk>> {
             sets.iter()
                 .map(|workers| workers.iter().map(|&w| WorkerPk(w)).collect())
                 .collect()
@@ -344,14 +344,14 @@ mod tests {
         }
     }
 
-    fn held(entries: &[(i64, &[i64])]) -> BTreeMap<ChunkPk, BTreeSet<WorkerPk>> {
+    fn held(entries: &[(i64, &[i32])]) -> BTreeMap<ChunkPk, BTreeSet<WorkerPk>> {
         entries
             .iter()
             .map(|(pk, workers)| (ChunkPk(*pk), workers.iter().map(|&w| WorkerPk(w)).collect()))
             .collect()
     }
 
-    fn portal(routing: &[(i64, &[i64])]) -> PortalAssignment {
+    fn portal(routing: &[(i64, &[i32])]) -> PortalAssignment {
         PortalAssignment {
             id: 1,
             chunk_workers: routing
@@ -363,7 +363,7 @@ mod tests {
         }
     }
 
-    fn worker_assignment(routing: &[(i64, &[i64])]) -> WorkerAssignment {
+    fn worker_assignment(routing: &[(i64, &[i32])]) -> WorkerAssignment {
         WorkerAssignment {
             id: 1,
             chunk_workers: routing

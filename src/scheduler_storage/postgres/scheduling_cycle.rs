@@ -250,7 +250,7 @@ SELECT c.chunk_pk, u.worker_id, $WA
 FROM sched_ideal_chunk_workers c
 LEFT JOIN sched_future_ideal_chunk_workers f ON f.chunk_pk = c.chunk_pk
 CROSS JOIN LATERAL UNNEST(c.worker_ids) AS u(worker_id)
-WHERE u.worker_id <> ALL (COALESCE(f.worker_ids, '{}'::bigint[]))
+WHERE u.worker_id <> ALL (COALESCE(f.worker_ids, '{}'::int[]))
   AND EXISTS (SELECT 1 FROM sched_workers sw WHERE sw.id = u.worker_id)
   AND NOT EXISTS (
       SELECT 1 FROM sched_chunk_metadata m
@@ -260,7 +260,7 @@ WHERE u.worker_id <> ALL (COALESCE(f.worker_ids, '{}'::bigint[]))
 ON CONFLICT (chunk_pk, worker_id) DO NOTHING;
 
 INSERT INTO sched_worker_assignment_diffs (worker_assignment_id, chunk_pk, worker_ids)
-SELECT $WA, COALESCE(f.chunk_pk, c.chunk_pk), COALESCE(f.worker_ids, '{}'::bigint[])
+SELECT $WA, COALESCE(f.chunk_pk, c.chunk_pk), COALESCE(f.worker_ids, '{}'::int[])
 FROM sched_future_ideal_chunk_workers f
 FULL JOIN sched_ideal_chunk_workers c ON c.chunk_pk = f.chunk_pk
 WHERE f.worker_ids IS DISTINCT FROM c.worker_ids;

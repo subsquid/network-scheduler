@@ -68,7 +68,7 @@ fn anchor_metadata_column(
         format!("UPDATE sched_chunk_metadata SET {metadata_column} = $2 WHERE chunk_pk = $1");
     storage
         .with_conn(async move |conn| {
-            let anchor_id: i64 = sqlx::query_scalar(insert_sql)
+            let anchor_id: i32 = sqlx::query_scalar(insert_sql)
                 .fetch_one(&mut *conn)
                 .await
                 .unwrap();

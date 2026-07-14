@@ -22,7 +22,7 @@ The two streams are non-1:1, so each has its **own monotonic id sequence**
 kinds** — ordering is used only within a kind (e.g. the confirmation watermark over worker ids),
 and cross-kind links are always explicit foreign-key references (e.g. a drain anchored on the
 portal assignment that dropped a pair). The schema does not *enforce* the no-cross-kind-compare
-rule — both sequences are `BIGSERIAL` from 1, so the same numeric value can exist in both — but it
+rule — both sequences are `SERIAL` from 1, so the same numeric value can exist in both — but it
 makes the distinction structural and visible: every referencing column targets exactly one of the
 two id tables, so a mix-up is caught at code-review time, not by the engine.
 

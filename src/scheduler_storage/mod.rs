@@ -11,7 +11,7 @@ use crate::weight::SchedulingChunk;
 pub type Tick = u64;
 
 /// Monotonic assignment version (matches sched_worker_assignments.id / sched_portal_assignments.id).
-pub type AssignmentId = i64;
+pub type AssignmentId = i32;
 
 /// Errors returned across the [`SchedulerStorage`] boundary.
 #[derive(Debug, thiserror::Error)]

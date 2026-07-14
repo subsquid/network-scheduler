@@ -47,10 +47,10 @@ impl StorageInspect for PostgresStorage {
         #[allow(clippy::type_complexity)]
         let rows: Vec<(
             i64,
-            Option<i64>,
-            Option<i64>,
+            Option<i32>,
+            Option<i32>,
             bool,
-            Option<i64>,
+            Option<i32>,
             Option<i64>,
             bool,
         )> = self
@@ -103,7 +103,7 @@ impl StorageInspect for PostgresStorage {
         F: FnMut(&StaleMappingView) -> bool,
     {
         // Derived drain anchor: the first portal assignment whose watermark covers the row.
-        let rows: Vec<(i64, i64, i64, Option<i64>)> = self
+        let rows: Vec<(i64, i32, i32, Option<i32>)> = self
             .with_conn_ref(async move |conn| {
                 sqlx::query_as(
                     "SELECT s.chunk_pk, s.worker_id, \
@@ -143,7 +143,7 @@ impl StorageInspect for PostgresStorage {
     where
         F: FnMut(&WorkerView) -> bool,
     {
-        let rows: Vec<(i64, String, Option<String>, Option<i64>)> = self
+        let rows: Vec<(i32, String, Option<String>, Option<i64>)> = self
             .with_conn_ref(async move |conn| {
                 sqlx::query_as(
                     "SELECT id, peer_id, version, inactive_since \
@@ -169,7 +169,7 @@ impl StorageInspect for PostgresStorage {
     where
         F: FnMut(&ChunkPk, &[WorkerPk]) -> bool,
     {
-        let rows: Vec<(i64, Vec<i64>)> = self
+        let rows: Vec<(i64, Vec<i32>)> = self
             .with_conn_ref(async move |conn| {
                 sqlx::query_as(
                     "SELECT chunk_pk, worker_ids \
@@ -195,7 +195,7 @@ impl StorageInspect for PostgresStorage {
     where
         F: FnMut(&WorkerAssignmentDiffView) -> bool,
     {
-        let rows: Vec<(i64, i64, Vec<i64>)> = self
+        let rows: Vec<(i32, i64, Vec<i32>)> = self
             .with_conn_ref(async move |conn| {
                 sqlx::query_as(
                     "SELECT worker_assignment_id, chunk_pk, worker_ids \
@@ -222,7 +222,7 @@ impl StorageInspect for PostgresStorage {
     where
         F: FnMut(&CorrectionView) -> bool,
     {
-        let rows: Vec<(i64, i64, String, i64, Option<i64>)> = self
+        let rows: Vec<(i64, i64, String, i64, Option<i32>)> = self
             .with_conn_ref(async move |conn| {
                 sqlx::query_as(
                     "SELECT cc.old_chunk_pk, cc.new_chunk_pk, d.name, cc.created_at, \
@@ -252,7 +252,7 @@ impl StorageInspect for PostgresStorage {
         let result: Option<i64> = self
             .with_conn_ref(async move |conn| {
                 sqlx::query_scalar("SELECT created_at FROM sched_portal_assignments WHERE id = $1")
-                    .bind(i64::try_from(id).expect("portal assignment id overflows i64"))
+                    .bind(i32::try_from(id).expect("portal assignment id overflows i32"))
                     .fetch_optional(conn)
                     .await
             })
@@ -261,7 +261,7 @@ impl StorageInspect for PostgresStorage {
     }
 
     fn get_worker_assignment_confirmation(&self) -> u64 {
-        let result: i64 = self
+        let result: i32 = self
             .with_conn_ref(async move |conn| {
                 sqlx::query_scalar(
                     "SELECT COALESCE(MAX(assignment_id), 0) FROM sched_worker_confirmations",

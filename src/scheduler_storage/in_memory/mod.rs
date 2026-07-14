@@ -836,7 +836,7 @@ impl SchedulerStorage for InMemoryStorage {
         }
 
         for (peer_id, worker) in remaining {
-            let id = WorkerPk(self.counters.worker_id.next() as i64);
+            let id = WorkerPk(self.counters.worker_id.next() as i32);
             self.sched_workers.insert(
                 id,
                 WorkerEntry {
