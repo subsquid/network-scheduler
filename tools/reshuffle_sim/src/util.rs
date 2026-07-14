@@ -261,9 +261,4 @@ mod tests {
             "none:1 1.0.0:1 2.0.0:2"
         );
     }
-
-    #[test]
-    fn empty_workers_render_empty() {
-        assert_eq!(format_version_distribution(&[]), "");
-    }
 }

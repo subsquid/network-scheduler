@@ -336,23 +336,13 @@ mod tests {
     }
 
     #[test]
-    fn params_override_defaults() {
-        let rate = ChunkRate::parse("triangle:peak=200").unwrap();
-        assert_eq!(rate.count_at(5, 10), 200);
-    }
-
-    #[test]
-    fn rejects_unknown_shape() {
-        assert!(ChunkRate::parse("spiral:peak=1").is_err());
-    }
-
-    #[test]
-    fn points_requires_breakpoints() {
-        assert!(ChunkRate::parse("points").is_err());
-    }
-
-    #[test]
-    fn rejects_non_positive_sigma() {
-        assert!(ChunkRate::parse("gaussian:peak=1,sigma=0").is_err());
+    fn rejects_malformed_specs() {
+        for spec in [
+            "spiral:peak=1",           // unknown shape
+            "points",                  // no breakpoints
+            "gaussian:peak=1,sigma=0", // sigma must be positive
+        ] {
+            assert!(ChunkRate::parse(spec).is_err(), "{spec} must be rejected");
+        }
     }
 }

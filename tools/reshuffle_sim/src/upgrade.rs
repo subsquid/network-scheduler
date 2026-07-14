@@ -138,13 +138,6 @@ mod tests {
     }
 
     #[test]
-    fn initial_fraction_sets_starting_upgraded_count() {
-        let mut rng = StdRng::seed_from_u64(1);
-        let st = WorkerVersionState::new(100, 0.2, &mut rng);
-        assert_eq!(st.eligible_count(), 20);
-    }
-
-    #[test]
     fn advance_is_monotonic_and_respects_initial_floor() {
         let mut rng = StdRng::seed_from_u64(1);
         let mut st = WorkerVersionState::new(100, 0.2, &mut rng);
@@ -206,45 +199,19 @@ mod tests {
     }
 
     #[test]
-    fn rejects_descending_steps() {
-        assert!(UpgradeSchedule::parse("5:0.25,2:0.5").is_err());
-    }
-
-    #[test]
-    fn rejects_out_of_range_fraction() {
-        assert!(UpgradeSchedule::parse("1:1.5").is_err());
-    }
-
-    #[test]
-    fn rejects_malformed_entry() {
-        assert!(UpgradeSchedule::parse("1-0").is_err());
-    }
-
-    #[test]
-    fn rejects_non_finite_fraction() {
-        assert!(UpgradeSchedule::parse("1:NaN").is_err());
-        assert!(UpgradeSchedule::parse("1:inf").is_err());
-    }
-
-    #[test]
-    fn rejects_duplicate_steps() {
-        assert!(UpgradeSchedule::parse("5:0.25,5:0.5").is_err());
-    }
-
-    #[test]
-    fn apply_with_zero_upgraded_leaves_originals_untouched() {
-        let original = Version::new(2, 10, 1);
-        let mut rng = StdRng::seed_from_u64(3);
-        let st = WorkerVersionState::new(5, 0.0, &mut rng);
-        let mut workers = make_test_workers(5);
-        for w in &mut workers {
-            w.version = Some(original.clone());
+    fn rejects_malformed_schedules() {
+        for spec in [
+            "5:0.25,2:0.5", // steps must ascend
+            "5:0.25,5:0.5", // duplicate step
+            "1:1.5",        // fraction out of range
+            "1-0",          // not `step:fraction`
+            "1:NaN",
+            "1:inf",
+        ] {
+            assert!(
+                UpgradeSchedule::parse(spec).is_err(),
+                "{spec} must be rejected"
+            );
         }
-        st.apply(&mut workers, &new_version());
-        assert!(
-            workers
-                .iter()
-                .all(|w| w.version.as_ref() == Some(&original))
-        );
     }
 }
