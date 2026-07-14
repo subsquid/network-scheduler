@@ -4,9 +4,8 @@ use anyhow::Context;
 use itertools::Itertools;
 
 use crate::{
-    cli, clickhouse,
+    cli, clickhouse, dataset_data_storage,
     scheduling::{self, ScheduledChunk},
-    storage,
     types::{self, FbVersion},
     upload, weight,
 };
@@ -158,7 +157,7 @@ impl WithChunks {
     pub async fn load_new_chunks(
         mut self,
         db: Option<&clickhouse::ClickhouseClient>,
-        datasets_storage: &storage::S3Storage,
+        datasets_storage: &dataset_data_storage::S3Storage,
         access: CacheAccess,
     ) -> anyhow::Result<Self> {
         tracing::info!("Reading new chunks from storage");

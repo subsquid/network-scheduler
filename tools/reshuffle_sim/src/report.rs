@@ -50,6 +50,16 @@ pub fn generate_html(metrics: &[ReshuffleMetrics], path: &Path) -> anyhow::Resul
             }
         })
         .collect();
+    let stale_pct: Vec<f64> = metrics
+        .iter()
+        .map(|m| {
+            if m.total_capacity_bytes > 0 {
+                m.stale_capacity_bytes as f64 / m.total_capacity_bytes as f64 * 100.0
+            } else {
+                0.0
+            }
+        })
+        .collect();
     let workers_receiving_new: Vec<usize> = metrics
         .iter()
         .map(|m| m.data_movement.workers_receiving_new)
@@ -70,6 +80,10 @@ pub fn generate_html(metrics: &[ReshuffleMetrics], path: &Path) -> anyhow::Resul
             let r = &m.restricted_movement;
             r.new_chunk_bytes + r.shuffled_bytes + r.increased_replication_bytes
         })
+        .collect();
+    let schedule_ms: Vec<f64> = metrics
+        .iter()
+        .map(|m| m.schedule_duration.as_secs_f64() * 1000.0)
         .collect();
 
     let new_chunk_bytes_fmt: Vec<String> = new_chunk_bytes_raw
@@ -97,6 +111,8 @@ pub fn generate_html(metrics: &[ReshuffleMetrics], path: &Path) -> anyhow::Resul
         .map(|b| ByteSize(*b).to_string())
         .collect();
     let used_pct_fmt: Vec<String> = used_pct.iter().map(|p| format!("{p:.1}%")).collect();
+    let stale_pct_fmt: Vec<String> = stale_pct.iter().map(|p| format!("{p:.1}%")).collect();
+    let schedule_time_fmt: Vec<String> = schedule_ms.iter().map(|m| format!("{m:.1} ms")).collect();
 
     let replication_labels: Vec<String> = metrics
         .iter()
@@ -195,6 +211,10 @@ pub fn generate_html(metrics: &[ReshuffleMetrics], path: &Path) -> anyhow::Resul
   <canvas id="restrictedDownloadChart"></canvas>
 </div>
 
+<div class="card">
+  <canvas id="scheduleTimeChart"></canvas>
+</div>
+
 <div class="card wide">
 <h3 style="margin-top:0">Raw Data</h3>
 <div style="overflow-x:auto">
@@ -203,9 +223,9 @@ pub fn generate_html(metrics: &[ReshuffleMetrics], path: &Path) -> anyhow::Resul
   <th>Step</th><th>New chunks</th><th>New restricted</th><th>Total chunks</th><th>Total restricted</th><th>Replication factor</th>
   <th>New chunks download (all replicas)</th><th>Shuffled chunks</th><th>Shuffled chunks download (all replicas)</th>
   <th>Replication increase download</th><th>Replication decrease freed</th><th>Total S3 download (all replicas)</th>
-  <th>Free capacity</th><th>Used %</th>
+  <th>Free capacity</th><th>Used %</th><th>Stale %</th>
   <th>Workers receiving new</th><th>Workers losing</th><th>Workers receiving shuffled</th>
-  <th>Eligible workers</th><th>Scheduled</th><th>Restricted download (all replicas)</th>
+  <th>Eligible workers</th><th>Scheduled</th><th>Restricted download (all replicas)</th><th>Scheduling time</th>
 </tr>
 {table_rows}
 </table>
@@ -226,12 +246,14 @@ const decreasedRepl = {decreased_repl_raw:?};
 const totalDownload = {total_download_raw:?};
 const freeCapacity = {free_capacity_raw:?};
 const usedPct = {used_pct:?};
+const stalePct = {stale_pct:?};
 const workersReceivingNew = {workers_receiving_new:?};
 const workersLosing = {workers_losing:?};
 const workersShuffled = {workers_shuffled:?};
 const eligibleWorkers = {eligible_workers:?};
 const scheduledFlags = {scheduled_flags:?};
 const restrictedDownload = {restricted_download_raw:?};
+const scheduleMs = {schedule_ms:?};
 
 function formatBytes(b) {{
   if (b === 0) return '0 B';
@@ -357,7 +379,8 @@ new Chart(document.getElementById('capacityChart'), {{
     labels: stepLabels,
     datasets: [
       {{ label: 'Free capacity', data: freeCapacity, backgroundColor: 'rgba(75,192,192,0.7)', yAxisID: 'y' }},
-      {{ label: 'Used %', data: usedPct, type: 'line', borderColor: '#ff6384', backgroundColor: 'transparent', yAxisID: 'y1' }}
+      {{ label: 'Used %', data: usedPct, type: 'line', borderColor: '#ff6384', backgroundColor: 'transparent', yAxisID: 'y1' }},
+      {{ label: 'Stale %', data: stalePct, type: 'line', borderColor: '#ff9f40', backgroundColor: 'transparent', borderDash: [5,5], yAxisID: 'y1' }}
     ]
   }},
   options: {{
@@ -405,6 +428,20 @@ new Chart(document.getElementById('restrictedDownloadChart'), {{
     scales: {{ y: bytesScale }}
   }}
 }});
+
+new Chart(document.getElementById('scheduleTimeChart'), {{
+  type: 'line',
+  data: {{
+    labels: stepLabels,
+    datasets: [
+      {{ label: 'Scheduling time (ms)', data: scheduleMs, borderColor: '#9966ff', backgroundColor: 'rgba(153,102,255,0.1)', fill: true }}
+    ]
+  }},
+  options: {{
+    plugins: {{ title: {{ display: true, text: 'Scheduling Algorithm Time per Step' }}, tooltip: {{ callbacks: {{ label: function(ctx) {{ return ctx.dataset.label + ': ' + ctx.raw.toFixed(1) + ' ms'; }} }} }} }},
+    scales: {{ y: {{ beginAtZero: true, title: {{ display: true, text: 'Milliseconds' }} }} }}
+  }}
+}});
 </script>
 </body>
 </html>"##,
@@ -417,7 +454,9 @@ new Chart(document.getElementById('restrictedDownloadChart'), {{
             &decreased_repl_fmt,
             &total_download_fmt,
             &free_capacity_fmt,
-            &used_pct_fmt
+            &used_pct_fmt,
+            &stale_pct_fmt,
+            &schedule_time_fmt
         ),
     );
 
@@ -426,6 +465,7 @@ new Chart(document.getElementById('restrictedDownloadChart'), {{
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_table_rows(
     metrics: &[ReshuffleMetrics],
     replication_labels: &[String],
@@ -436,6 +476,8 @@ fn build_table_rows(
     total_download: &[String],
     free_capacity: &[String],
     used_pct: &[String],
+    stale_pct: &[String],
+    schedule_time: &[String],
 ) -> String {
     metrics
         .iter()
@@ -446,7 +488,7 @@ fn build_table_rows(
             let restricted_dl = r.new_chunk_bytes + r.shuffled_bytes + r.increased_replication_bytes;
             let scheduled = if m.scheduled { "yes" } else { "NO" };
             format!(
-                "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+                "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
                 m.step,
                 m.new_chunks_in_step,
                 m.new_restricted_in_step,
@@ -461,12 +503,14 @@ fn build_table_rows(
                 total_download[i],
                 free_capacity[i],
                 used_pct[i],
+                stale_pct[i],
                 dm.workers_receiving_new,
                 dm.workers_losing,
                 dm.workers_shuffled,
                 m.eligible_workers,
                 scheduled,
                 ByteSize(restricted_dl),
+                schedule_time[i],
             )
         })
         .collect::<Vec<_>>()

@@ -1,0 +1,8 @@
+# baseline.yaml + confirmation/portal lag (the only change). Its lag=0 control is baseline.yaml
+# itself (same seed 42). Plain ingest supersedes only what ring drift moves, so expect a smaller
+# overhang than copy-replace — possibly near-zero. Pair with production_config.yaml + mainnet input.
+chunks_per_step: 2000
+steps: 10
+scheduler: multistep
+confirm_lag_steps: 1
+portal_lag_steps: 1

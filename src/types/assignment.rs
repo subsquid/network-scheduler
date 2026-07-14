@@ -1,3 +1,5 @@
+#[cfg(test)]
+use std::collections::BTreeSet;
 use std::collections::{BTreeMap, HashMap};
 
 use libp2p_identity::PeerId;
@@ -144,7 +146,17 @@ impl Assignment {
 
         for worker in workers {
             let status = match worker.status {
-                WorkerStatus::Online => sqd_assignments::WorkerStatus::Ok,
+                WorkerStatus::Online => {
+                    if worker
+                        .version
+                        .as_ref()
+                        .is_some_and(|v| v < &config.min_recommended_worker_version)
+                    {
+                        sqd_assignments::WorkerStatus::DeprecatedVersion
+                    } else {
+                        sqd_assignments::WorkerStatus::Ok
+                    }
+                }
                 WorkerStatus::Offline => sqd_assignments::WorkerStatus::Unreliable,
                 WorkerStatus::UnsupportedVersion => {
                     sqd_assignments::WorkerStatus::UnsupportedVersion
@@ -160,6 +172,20 @@ impl Assignment {
         }
 
         assignment_builder.finish()
+    }
+
+    /// Invert `worker_chunks` into `chunk index -> set of holding workers`. `n_chunks` sizes the
+    /// result so every chunk is present (chunks with no copies map to an empty set). Test-only: the
+    /// inverse view several test suites recompute by hand.
+    #[cfg(test)]
+    pub fn chunk_holders(&self, n_chunks: usize) -> Vec<BTreeSet<PeerId>> {
+        let mut out = vec![BTreeSet::new(); n_chunks];
+        for (&worker, chunks) in &self.worker_chunks {
+            for &ci in chunks {
+                out[ci as usize].insert(worker);
+            }
+        }
+        out
     }
 
     fn worker_ids_for_chunk(&self) -> Vec<Vec<WorkerIndex>> {
@@ -200,7 +226,7 @@ mod tests {
             scheduler_state_bucket: "test".to_string(),
             cloudflare_storage_secret: "secret".to_owned().into(),
             min_supported_worker_version: "2.0.0".parse().unwrap(),
-            min_recommended_worker_version: "2.0.0".parse().unwrap(),
+            min_recommended_worker_version: "3.0.0".parse().unwrap(),
             assignment_delay: Duration::from_secs(60),
             assignment_ttl: Duration::from_secs(86400),
             concurrent_dataset_downloads: 1,
@@ -290,5 +316,90 @@ mod tests {
         assert_eq!(hashes[2].1, Some("hash_a3".to_string()));
         assert_eq!(hashes[3].1, Some("hash_b1".to_string()));
         assert_eq!(hashes[4].1, Some("hash_b2".to_string()));
+    }
+
+    #[test]
+    fn online_worker_below_recommended_serializes_as_deprecated_version() {
+        // test_config() has min_supported=2.0.0, min_recommended=3.0.0
+        let worker = make_worker();
+        let chunks = vec![make_chunk("s3://dataset-a", 0, 99, "hash_a1")];
+        let assignment = Assignment {
+            worker_chunks: BTreeMap::from([(worker, vec![0])]),
+            replication_by_weight: BTreeMap::new(),
+        };
+        let config = test_config();
+
+        let encode = |workers: Vec<Worker>| -> sqd_assignments::WorkerStatus {
+            let fb_bytes = assignment.encode_fb(&chunks, &config, &workers, FbVersion::V1);
+            let fb = sqd_assignments::Assignment::from_owned_unchecked(fb_bytes);
+            fb.get_worker(&worker)
+                .expect("worker must exist in assignment")
+                .status()
+        };
+
+        // Version below recommended (but >= supported) -> DeprecatedVersion
+        assert_eq!(
+            encode(vec![Worker {
+                id: worker,
+                status: WorkerStatus::Online,
+                version: Some("2.5.0".parse().unwrap()),
+            }]),
+            sqd_assignments::WorkerStatus::DeprecatedVersion,
+        );
+
+        // Version at or above recommended -> Ok
+        assert_eq!(
+            encode(vec![Worker {
+                id: worker,
+                status: WorkerStatus::Online,
+                version: Some("3.5.0".parse().unwrap()),
+            }]),
+            sqd_assignments::WorkerStatus::Ok,
+        );
+
+        // Version exactly equal to recommended -> Ok (boundary, not deprecated)
+        assert_eq!(
+            encode(vec![Worker {
+                id: worker,
+                status: WorkerStatus::Online,
+                version: Some("3.0.0".parse().unwrap()),
+            }]),
+            sqd_assignments::WorkerStatus::Ok,
+        );
+
+        // Unknown version -> Ok (don't deprecate what we can't measure)
+        assert_eq!(
+            encode(vec![Worker {
+                id: worker,
+                status: WorkerStatus::Online,
+                version: None,
+            }]),
+            sqd_assignments::WorkerStatus::Ok,
+        );
+    }
+
+    #[test]
+    fn online_worker_below_supported_serializes_as_unsupported_version() {
+        // UnsupportedVersion must not be masked by the deprecation logic
+        let worker = make_worker();
+        let chunks = vec![make_chunk("s3://dataset-a", 0, 99, "hash_a1")];
+        let assignment = Assignment {
+            worker_chunks: BTreeMap::from([(worker, vec![0])]),
+            replication_by_weight: BTreeMap::new(),
+        };
+        let config = test_config();
+        let workers = vec![Worker {
+            id: worker,
+            status: WorkerStatus::UnsupportedVersion,
+            version: Some("1.0.0".parse().unwrap()),
+        }];
+        let fb_bytes = assignment.encode_fb(&chunks, &config, &workers, FbVersion::V1);
+        let fb = sqd_assignments::Assignment::from_owned_unchecked(fb_bytes);
+        assert_eq!(
+            fb.get_worker(&worker)
+                .expect("worker must exist in assignment")
+                .status(),
+            sqd_assignments::WorkerStatus::UnsupportedVersion,
+        );
     }
 }

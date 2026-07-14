@@ -3,17 +3,24 @@ members = ["tools/compare_fb", "tools/clear_block_hash", "tools/reshuffle_sim"]
 
 [package]
 name = "network-scheduler"
-version = "3.11.0"
+version = "3.12.0"
 edition = "2024"
 
 [features]
 default = []
-mvcc-chunks = ["sqd-assignments/mvcc-chunks"]
+# The MVCC chunk-lifecycle storage / multi-step scheduler (Postgres backend + sim tests).
+mvcc-chunks = ["dep:sqlx", "dep:bit-vec", "sqd-assignments/mvcc-chunks"]
+# Exposes the Postgres testcontainer harness (`scheduler_storage::test_harness::pg_harness`) to other
+# crates — e.g. reshuffle-sim. Implies the Postgres backend. The crate's own tests get the harness via
+# `cfg(test)` + dev-dependencies, so they don't need this feature.
+pg-testkit = ["mvcc-chunks", "dep:dtor", "dep:testcontainers", "dep:testcontainers-modules"]
 
 [dependencies]
 anyhow = "1.0.98"
 aws-config = { version = "1.6.2", features = ["behavior-version-latest"] }
 aws-sdk-s3 = "1.85.0"
+bit-vec = { version = "0.8", optional = true }
+bytesize = "2.3.1"
 chrono = "0.4.41"
 clap = { version = "4.5.38", features = ["derive", "env"] }
 clickhouse = "0.13.2"
@@ -45,6 +52,22 @@ tokio = { version = "1.45.0", features = ["full"] }
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.19", features = ["env-filter", "parking_lot"] }
 secrecy = { version = "0.10.3", features = ["serde"] }
+sqlx = { version = "0.9", features = ["runtime-tokio", "postgres", "migrate", "chrono", "derive", "tls-native-tls", "bit-vec", "json"], optional = true }
+# Also dev-dependencies (for the crate's own tests); optional here so the `pg-testkit` feature can hand
+# the harness to downstream crates without forcing testcontainers into a plain build.
+dtor = { version = "1.0.5", optional = true }
+testcontainers = { version = "0.27.2", features = ["watchdog"], optional = true }
+testcontainers-modules = { version = "0.15", features = ["postgres"], optional = true }
+rustc-hash = "2"
 
 [dev-dependencies]
-proptest = "1.11"
+claims = "0.8"
+dtor = "1.0.5"
+maplit = "1.0.2"
+# The iterative state-machine runner — whose generator can read the live SUT — lives in
+# `proptest-state-machine::iterative_runner`. Pinned to the HEAD of define-null/proptest's
+# `defnull/iterative-runner-2` branch. Both crates share the rev so they use one `proptest` build.
+proptest = { git = "https://github.com/define-null/proptest", rev = "253a26e9a6e4ac7c75d6265b441b1be00cf1e2c6" }
+proptest-state-machine = { git = "https://github.com/define-null/proptest", rev = "253a26e9a6e4ac7c75d6265b441b1be00cf1e2c6" }
+testcontainers = { version = "0.27.2", features = ["watchdog"] }
+testcontainers-modules = { version = "0.15", features = ["postgres"] }

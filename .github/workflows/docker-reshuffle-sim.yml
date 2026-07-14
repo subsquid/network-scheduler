@@ -1,0 +1,78 @@
+name: reshuffle-sim docker
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Git ref to build (branch, tag, or SHA). Leave empty to build default branch HEAD."
+        required: false
+        default: ""
+      push:
+        description: "Push the built image to GCR (uncheck to build only)."
+        type: boolean
+        required: false
+        default: true
+  # Also run on PRs that touch this image to verify it still builds. PR runs are build-only;
+  # pushing happens only on a manual workflow_dispatch run with the push input checked.
+  pull_request:
+    paths:
+      - "tools/reshuffle_sim/**"
+      - "Cargo.lock"
+      - ".github/workflows/docker-reshuffle-sim.yml"
+
+jobs:
+  gcr:
+    name: Build & push reshuffle-sim image to GCR
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+
+    env:
+      DOCKERFILE_PATH: "./tools/reshuffle_sim/deploy/Dockerfile"
+      IMAGE: "gcr.io/${{ secrets.GCP_PROJECT }}/subsquid/reshuffle-sim"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.ref }}
+          fetch-depth: 1
+
+      # setup-gcloud@v2 does NOT authenticate (the service_account_key/export_default_credentials
+      # inputs were removed in v1+); credentials must come from the auth action, or the docker push
+      # goes out unauthenticated.
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SERVICE_ACCOUNT_KEY }}
+
+      - name: Setup gcloud
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ secrets.GCP_PROJECT }}
+
+      - name: Configure Docker auth for GCR
+        run: gcloud --quiet auth configure-docker gcr.io
+
+      - name: Compute commit tag
+        id: vars
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "SHA=$(git rev-parse --short=12 HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Build image (latest + sha)
+        run: |
+          docker build \
+            -f "${DOCKERFILE_PATH}" \
+            -t "${IMAGE}:latest" \
+            -t "${IMAGE}:${{ steps.vars.outputs.SHA }}" \
+            .
+
+      - name: Push image (latest + sha)
+        # Push only on a manual dispatch with the push input checked; PR runs are build-only.
+        if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.push == 'true' }}
+        run: |
+          docker push "${IMAGE}:latest"
+          docker push "${IMAGE}:${{ steps.vars.outputs.SHA }}"

@@ -49,6 +49,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Run tests
         run: cargo test --all-features
+        env:
+          # Reduced PBT budget for CI: each in-memory sim case is a 100-300-transition
+          # walk (default 256 per model), each Postgres case gets a fresh database.
+          SIM_IN_MEMORY_CASES: 16
+          SIM_PG_CASES: 2
 
   fmt:
     name: Rustfmt

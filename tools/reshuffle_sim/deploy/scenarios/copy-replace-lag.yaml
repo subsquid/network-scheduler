@@ -1,0 +1,14 @@
+# copy-replace.yaml + confirmation/portal lag. Its lag=0 control is copy-replace.yaml itself
+# (same seed 42), so diff the Stale (% cap) / used % columns between the two.
+# The step-3 copy and step-5 replace supersede copies that now stay resident until their
+# replacement clears both lags (S + 3 + 1), inflating stale/used and pulling any shortage earlier.
+# Pair with production_config.yaml and the mainnet input.
+chunks_per_step: 2000
+steps: 20
+scheduler: multistep
+confirm_lag_steps: 3
+portal_lag_steps: 1
+copy:
+  - { src: base-mainnet, dst: base-mainnet-2, at_step: 3 }
+replace:
+  - { dataset: binance-mainnet, at_step: 5 }

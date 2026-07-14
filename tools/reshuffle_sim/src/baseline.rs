@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap},
+    collections::{BTreeMap, HashMap},
     io::Read,
     path::PathBuf,
     sync::Arc,
@@ -11,7 +11,7 @@ use network_scheduler::types::{BlockNumber, Chunk, Worker, WorkerStatus};
 use semver::Version;
 use sqd_assignments::Assignment as FbAssignment;
 
-use crate::ChunkOwners;
+use crate::{ChunkOwners, WorkerIdx};
 
 pub struct DatasetInfo {
     pub dataset_id: Arc<String>,
@@ -24,6 +24,8 @@ pub struct DatasetInfo {
 pub struct Baseline {
     pub chunks: Vec<Chunk>,
     pub workers: Vec<Worker>,
+    /// Holders per chunk as flatbuffer worker-table indices — i.e. positions in
+    /// `workers`, so `workers[idx].id` is the holder's `PeerId`.
     pub chunk_owners: ChunkOwners,
     pub datasets: Vec<DatasetInfo>,
 }
@@ -60,7 +62,7 @@ fn extract_workers(fb: &FbAssignment, worker_version: &Version) -> anyhow::Resul
                 sqd_assignments::WorkerStatus::UnsupportedVersion => {
                     WorkerStatus::UnsupportedVersion
                 }
-                _ => WorkerStatus::Offline,
+                sqd_assignments::WorkerStatus::DeprecatedVersion => WorkerStatus::Online,
             };
             Worker {
                 id: peer_id,
@@ -76,11 +78,6 @@ fn extract_workers(fb: &FbAssignment, worker_version: &Version) -> anyhow::Resul
 /// Reconstructs chunks and their worker ownership from the flatbuffer.
 /// Each chunk's last_block is inferred from the next chunk's first_block within the same dataset.
 fn extract_chunks_and_owners(fb: &FbAssignment) -> anyhow::Result<(Vec<Chunk>, ChunkOwners)> {
-    let mut worker_peer_ids: Vec<PeerId> = Vec::new();
-    for i in 0..fb.workers().len() {
-        worker_peer_ids.push(fb.get_worker_id(i as u16)?);
-    }
-
     let mut chunks = Vec::new();
     let mut chunk_owners = BTreeMap::new();
     let mut dataset_pool: HashMap<String, Arc<String>> = HashMap::new();
@@ -110,11 +107,16 @@ fn extract_chunks_and_owners(fb: &FbAssignment) -> anyhow::Result<(Vec<Chunk>, C
                 summary: None,
             });
 
-            let owners: BTreeSet<PeerId> = fb_chunk
+            // The flatbuffer already stores holders as worker-table indices, so keep
+            // them as `WorkerIdx` rather than inflating to `PeerId`. Sorted (the fb
+            // order isn't guaranteed) so `ChunkOwners`' merge-diff invariant holds.
+            let mut owners: Vec<WorkerIdx> = fb_chunk
                 .worker_indexes()
                 .iter()
-                .map(|wi| worker_peer_ids[wi as usize])
+                .map(|wi| wi as WorkerIdx)
                 .collect();
+            owners.sort_unstable();
+            owners.dedup();
             chunk_owners.insert((dataset_arc, chunk_id_arc), owners);
         }
     }
@@ -159,7 +161,7 @@ pub fn load_baseline(path: &PathBuf, worker_version: &Version) -> anyhow::Result
     let (chunks, chunk_owners) = extract_chunks_and_owners(&fb)?;
     let datasets = compute_dataset_stats(&chunks);
 
-    eprintln!(
+    tracing::info!(
         "Loaded {} chunks across {} datasets, {} workers",
         chunks.len(),
         datasets.len(),
