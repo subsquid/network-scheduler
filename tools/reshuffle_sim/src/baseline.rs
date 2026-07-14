@@ -11,7 +11,7 @@ use network_scheduler::types::{BlockNumber, Chunk, Worker, WorkerStatus};
 use semver::Version;
 use sqd_assignments::Assignment as FbAssignment;
 
-use crate::{ChunkOwners, WorkerIdx};
+use crate::types::{ChunkOwners, WorkerIdx};
 
 pub struct DatasetInfo {
     pub dataset_id: Arc<String>,
@@ -124,8 +124,7 @@ fn extract_chunks_and_owners(fb: &FbAssignment) -> anyhow::Result<(Vec<Chunk>, C
     Ok((chunks, chunk_owners))
 }
 
-/// Aggregates per-dataset statistics needed for proportional chunk generation:
-/// chunk count, highest block number, average block span, and average chunk size.
+/// Per-dataset statistics driving proportional chunk generation.
 fn compute_dataset_stats(chunks: &[Chunk]) -> Vec<DatasetInfo> {
     let mut stats: BTreeMap<Arc<String>, (u32, BlockNumber, u64, u64)> = BTreeMap::new();
 

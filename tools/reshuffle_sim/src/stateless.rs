@@ -1,7 +1,5 @@
 //! Stateless scheduler path: each step re-runs the production single-step scheduler
-//! ([`network_scheduler::scheduling`]) on the baseline chunks plus every chunk added so far, so the
-//! placement is rebuilt from scratch. Driven through [`StepScheduler`] by the shared loop in
-//! [`crate::simulation`]. Honors the simulation's version restrictions and worker upgrades.
+//! ([`network_scheduler::scheduling`]) on every chunk so far, rebuilding the placement from scratch.
 
 use std::any::Any;
 use std::collections::BTreeMap;
@@ -17,16 +15,14 @@ use network_scheduler::{
 };
 use semver::Version;
 
-use crate::{
-    ChunkOwners, WorkerIndex,
-    simulation::{StepContext, StepOutcome, StepPlacement, StepScheduler},
-};
+use crate::metrics::Placement;
+use crate::simulation::{StepContext, StepOutcome, StepPlacement, StepScheduler};
+use crate::types::{ChunkOwners, ChunkSizeIndex, WorkerIndex};
 
 pub struct StatelessScheduler {
     /// The input-file placement, used as step 1's reference.
     initial_owners: ChunkOwners,
-    /// Maps each step's placement `PeerId`s to the same compact indices used in
-    /// `initial_owners`, so owners stay comparable across steps.
+    /// Shares `initial_owners`' indices, so owners stay comparable across steps.
     worker_index: WorkerIndex,
 }
 
@@ -44,8 +40,14 @@ impl StatelessScheduler {
 }
 
 impl StepScheduler for StatelessScheduler {
-    fn take_initial_owners(&mut self) -> ChunkOwners {
-        std::mem::take(&mut self.initial_owners)
+    fn take_initial_placement(&mut self) -> (Placement, ChunkSizeIndex) {
+        let placement = Placement {
+            owners: std::mem::take(&mut self.initial_owners),
+            stale: ChunkOwners::new(),
+        };
+        // Step 1 re-schedules every chunk, so its placement already carries every size, and this path
+        // never drops a chunk from the placement.
+        (placement, ChunkSizeIndex::new())
     }
 
     fn step(&mut self, ctx: StepContext) -> anyhow::Result<StepOutcome> {
@@ -71,6 +73,8 @@ impl StepScheduler for StatelessScheduler {
 
         Ok(StepOutcome::Scheduled(StepPlacement {
             owners: chunk_owners_from_assignment(&chunks, &assignment, &mut self.worker_index),
+            // Rebuilt from scratch each step: no drain, so the ideal is the physical placement.
+            stale_owners: ChunkOwners::new(),
             chunk_sizes: chunks
                 .iter()
                 .map(|c| ((c.dataset.clone(), c.id.clone()), c.size))
@@ -78,17 +82,17 @@ impl StepScheduler for StatelessScheduler {
             replication_by_weight: assignment.replication_by_weight,
             used_capacity_bytes,
             stale_capacity_bytes: 0,
-            total_chunks: chunks.len(),
+            ingested_chunks: chunks.len(),
+            // The loop replays copies as ordinary new chunks, and there is no portal on this path.
+            copied_or_replaced_chunks: 0,
+            portal_chunks: None,
             schedule_duration,
         }))
     }
 }
 
-/// Merges existing and new chunks and runs the scheduler. Each chunk's minimum
-/// worker version is whatever its dataset segment in `datasets_config` requires.
-///
-/// The scheduler panics on infeasible version restrictions, so it runs inside
-/// `catch_unwind`; the returned `Err(reason)` signals the caller to stop.
+/// The scheduler panics on infeasible version restrictions, so it runs inside `catch_unwind`; the
+/// returned `Err(reason)` tells the caller to stop.
 pub fn schedule_combined_chunks(
     existing_chunks: &[Chunk],
     new_chunks: &[Chunk],
@@ -106,12 +110,8 @@ pub fn schedule_combined_chunks(
     (chunks, assignment, schedule_duration)
 }
 
-/// A chunk with its scheduling weight and config-derived minimum worker version,
-/// as produced by [`prepare_chunks`].
 type PreparedChunk = (Chunk, ChunkWeight, Option<Version>);
 
-/// Merges existing and new chunks, sorts them by dataset then block, and assigns
-/// weights/versions via the config.
 fn prepare_combined_chunks(
     existing: &[Chunk],
     new: &[Chunk],
@@ -127,8 +127,6 @@ fn prepare_combined_chunks(
     prepare_chunks(combined, config)
 }
 
-/// Builds the scheduler input, taking each chunk's minimum worker version from
-/// the config-derived version assigned by [`prepare_chunks`].
 fn to_scheduled_chunks<'a>(prepared: &'a [PreparedChunk]) -> Vec<ScheduledChunk<'a>> {
     prepared
         .iter()
@@ -143,9 +141,8 @@ fn to_scheduled_chunks<'a>(prepared: &'a [PreparedChunk]) -> Vec<ScheduledChunk<
         .collect()
 }
 
-/// Runs the scheduler under `catch_unwind`, returning any panic or error as a
-/// message. The default panic hook is silenced so an expected version-restriction
-/// panic isn't also dumped to stderr.
+/// The default panic hook is silenced so an expected version-restriction panic isn't also dumped to
+/// stderr.
 fn run_scheduler(
     scheduled: &[ScheduledChunk],
     workers: &[Worker],
@@ -184,15 +181,14 @@ fn chunk_owners_from_assignment(
                 .push(idx);
         }
     }
-    // Holders are pushed in worker-iteration order; sort so `ChunkOwners`' merge-diff
-    // invariant holds. Each worker owns a chunk at most once, so no dedup is needed.
+    // Sorted so `ChunkOwners`' merge-diff invariant holds. Each worker owns a chunk at most once, so
+    // no dedup is needed.
     for holders in owners.values_mut() {
         holders.sort_unstable();
     }
     owners
 }
 
-/// Extracts a human-readable message from a caught panic payload.
 fn panic_message(panic: Box<dyn Any + Send>) -> String {
     if let Some(s) = panic.downcast_ref::<&str>() {
         (*s).to_string()

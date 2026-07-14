@@ -6,7 +6,7 @@ use std::collections::{BTreeMap, HashSet};
 use claims::assert_matches;
 use proptest::prelude::*;
 
-use super::{current_schema_id, fresh_storage, register_chunk};
+use super::{confirm, current_schema_id, fresh_storage, insert_and_register_chunk};
 use crate::scheduler_storage::algorithm::IdealMapping;
 use crate::scheduler_storage::postgres::PostgresStorage;
 use crate::scheduler_storage::test_harness::assert_portal_chunks_exact;
@@ -20,17 +20,6 @@ use crate::types::{DatasetSchema, TableSchema, Worker};
 // ---------------------------------------------------------------------------
 // Test helpers
 // ---------------------------------------------------------------------------
-
-fn insert_and_register_chunk(
-    storage: &mut PostgresStorage,
-    dataset_name: &str,
-    id_seed: u32,
-    size: u32,
-) -> ChunkPk {
-    // Ignore already-exists errors for shared dataset names.
-    let _ = storage.insert_new_datasets(vec![(dataset(dataset_name), DatasetSchema::default())]);
-    register_chunk(storage, dataset_name, id_seed, size)
-}
 
 fn schedule_all(
     storage: &mut PostgresStorage,
@@ -48,12 +37,6 @@ fn schedule_all(
         .run_scheduling_cycle(&algorithm, &(), at, 60)
         .expect("scheduling succeeds")
         .id
-}
-
-fn confirm(storage: &mut PostgresStorage, assignment_id: AssignmentId, now: u64) {
-    storage
-        .confirm_worker_assignment(assignment_id, now)
-        .expect("confirm succeeds");
 }
 
 /// Simulate the mark_for_removal path by setting the column directly via SQL.

@@ -5,10 +5,11 @@ use bytesize::ByteSize;
 use network_scheduler::types::Worker;
 use semver::Version;
 use tabled::builder::Builder;
-use tabled::settings::span::{ColumnSpan, RowSpan};
+use tabled::settings::span::ColumnSpan;
 use tabled::settings::{Alignment, Modify, Style};
 
 use crate::metrics::ReshuffleMetrics;
+use crate::simulation::Summary;
 
 /// Counts workers by version (ascending), rendering a missing version as
 /// "none". Example: `"1.0.0:50 2.0.0:17"`.
@@ -26,102 +27,147 @@ pub fn format_version_distribution(workers: &[Worker]) -> String {
         .join(" ")
 }
 
-/// Human-readable scheduling time, in milliseconds with one decimal.
 fn format_duration(d: Duration) -> String {
     format!("{:.1} ms", d.as_secs_f64() * 1000.0)
 }
 
-/// Index of the first of the three "Workers" sub-columns (new / lost / shuffled).
-const WORKERS_COL: usize = 11;
-/// Single-value columns whose header should span both header rows.
-const SINGLE_COLS: [usize; 14] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 14, 15, 16];
+/// A table column. Consecutive columns sharing a `head` render under one spanning header (`Chunks`,
+/// `Workers`); an ungrouped column has an empty `sub`.
+///
+/// `show` decides, over the whole run, whether the column carries information: one that is constant or
+/// zero throughout (no restricted data, no upgrades, no drain) is dropped instead of printed as a
+/// stripe of zeroes.
+///
+/// A head is never merged into the sub row with a `RowSpan`. A merged cell is only as tall as the rows
+/// it spans, and tabled silently drops the overflowing lines of a multi-line head when the visible
+/// columns make those rows short.
+struct Col {
+    head: &'static str,
+    sub: &'static str,
+    cell: fn(&ReshuffleMetrics) -> String,
+    show: fn(&[ReshuffleMetrics]) -> bool,
+}
 
-/// Builds the metrics table. The three worker counts sit under one spanning
-/// `Workers` header (`new / lost / shuffled`); other headers are stacked across
-/// lines so each column is only as wide as its longest word.
+const ALWAYS: fn(&[ReshuffleMetrics]) -> bool = |_| true;
+
+#[rustfmt::skip]
+const COLS: &[Col] = &[
+    Col { head: "Step", sub: "", show: ALWAYS,
+          cell: |m| if m.scheduled { m.step.to_string() } else { format!("{} ✗", m.step) } },
+    Col { head: "New\nchunks", sub: "", show: ALWAYS,
+          cell: |m| m.new_chunks_in_step.to_string() },
+    Col { head: "Copied/\nreplaced", sub: "",
+          show: |ms| ms.iter().any(|m| m.copied_or_replaced_chunks > 0),
+          cell: |m| m.copied_or_replaced_chunks.to_string() },
+    Col { head: "New\nrestr.", sub: "", show: has_restricted,
+          cell: |m| m.new_restricted_in_step.to_string() },
+
+    // The chunk funnel: ingested ⊇ placed ⊇ portal. The gaps are dead rows (rejected, or tombstoned by
+    // a correction) and chunks not yet confirmed to the portal.
+    Col { head: "Chunks", sub: "ingested", show: ALWAYS,
+          cell: |m| m.ingested_chunks.to_string() },
+    Col { head: "Chunks", sub: "placed", show: ALWAYS,
+          cell: |m| m.placed_chunks.to_string() },
+    Col { head: "Chunks", sub: "portal", show: has_portal,
+          cell: |m| m.portal_chunks.map_or_else(|| "-".to_string(), |n| n.to_string()) },
+    Col { head: "Restr.\nchunks", sub: "", show: has_restricted,
+          cell: |m| m.total_restricted_chunks.to_string() },
+
+    Col { head: "Repl.", sub: "", show: replication_varies,
+          cell: |m| m.replication_label() },
+
+    // The download, split by cause: new data, chunks moving, extra replicas. The three sum to the
+    // total, so "shuffle %" is the share of the step's traffic that reshuffling cost.
+    Col { head: "Download", sub: "new", show: ALWAYS,
+          cell: |m| ByteSize(m.data_movement.new_chunk_bytes).to_string() },
+    Col { head: "Download", sub: "shuffle", show: ALWAYS,
+          cell: |m| ByteSize(m.data_movement.shuffled_bytes).to_string() },
+    Col { head: "Download", sub: "+repl", show: ALWAYS,
+          cell: |m| ByteSize(m.data_movement.increased_replication_bytes).to_string() },
+    Col { head: "Download", sub: "total", show: ALWAYS,
+          cell: |m| ByteSize(m.total_download()).to_string() },
+    Col { head: "Download", sub: "shuffle %", show: ALWAYS,
+          cell: |m| format!("{:.1}%", m.shuffle_share()) },
+
+    Col { head: "Chunks\nmoved", sub: "", show: ALWAYS,
+          cell: |m| m.data_movement.shuffled_count.to_string() },
+    Col { head: "Freed", sub: "", show: ALWAYS,
+          cell: |m| ByteSize(m.freed_bytes()).to_string() },
+    Col { head: "Repl.\nshed", sub: "", show: |ms| ms.iter().any(|m| m.data_movement.shed_replication_bytes > 0),
+          cell: |m| ByteSize(m.data_movement.shed_replication_bytes).to_string() },
+    Col { head: "Restr.\ndownload", sub: "", show: has_restricted,
+          cell: |m| ByteSize(m.restricted_download()).to_string() },
+
+    Col { head: "Free cap\n(used %)", sub: "", show: ALWAYS,
+          cell: |m| format!("{} ({:.1}%)", ByteSize(m.free_capacity()), m.used_pct()) },
+    Col { head: "Stale\n(% cap)", sub: "", show: |ms| ms.iter().any(|m| m.stale_capacity_bytes > 0),
+          cell: |m| format!("{:.1}%", m.stale_pct()) },
+
+    Col { head: "Workers", sub: "new", show: ALWAYS,
+          cell: |m| m.data_movement.workers_receiving_new.to_string() },
+    Col { head: "Workers", sub: "existing", show: ALWAYS,
+          cell: |m| m.data_movement.workers_receiving_existing.to_string() },
+    Col { head: "Workers", sub: "lost", show: ALWAYS,
+          cell: |m| m.data_movement.workers_losing.to_string() },
+
+    Col { head: "Upgraded\nworkers", sub: "", show: |ms| ms.iter().any(|m| m.eligible_workers > 0),
+          cell: |m| m.eligible_workers.to_string() },
+    Col { head: "Sched\ntime", sub: "", show: ALWAYS,
+          cell: |m| format_duration(m.schedule_duration) },
+];
+
+fn has_restricted(ms: &[ReshuffleMetrics]) -> bool {
+    ms.iter().any(|m| m.total_restricted_chunks > 0)
+}
+
+fn has_portal(ms: &[ReshuffleMetrics]) -> bool {
+    ms.iter().any(|m| m.portal_chunks.is_some())
+}
+
+/// The replication factor is normally the same every step; then it belongs under the table, not in a
+/// column of its own.
+fn replication_varies(ms: &[ReshuffleMetrics]) -> bool {
+    let mut labels = ms
+        .iter()
+        .filter(|m| m.scheduled)
+        .map(|m| m.replication_label());
+    let first = labels.next();
+    labels.any(|l| Some(&l) != first.as_ref())
+}
+
 fn build_table(metrics: &[ReshuffleMetrics]) -> tabled::Table {
+    let cols: Vec<&Col> = COLS.iter().filter(|c| (c.show)(metrics)).collect();
+
+    // Grouped columns (same `head`) put the head over the first of the group and blank it on the rest;
+    // ungrouped ones carry their head alone and leave the sub-header row empty.
+    let mut heads = Vec::with_capacity(cols.len());
+    let mut subs = Vec::with_capacity(cols.len());
+    for (i, col) in cols.iter().enumerate() {
+        let continues_group = i > 0 && cols[i - 1].head == col.head;
+        heads.push(if continues_group { "" } else { col.head });
+        subs.push(col.sub);
+    }
+
     let mut builder = Builder::default();
-    builder.push_record([
-        "Step",
-        "New\nchunks\n(restr)",
-        "Total\nchunks\n(restr)",
-        "Repl.",
-        "New\ndownload",
-        "Shuffled\nchunks\n(download)",
-        "Repl chg\n+gain/\n-freed",
-        "Total\ndownload",
-        "Restr.\ndownload",
-        "Free cap\n(used %)",
-        "Stale\n(% cap)",
-        "Workers",
-        "",
-        "",
-        "Upgraded\nworkers",
-        "Sched.",
-        "Sched\ntime",
-    ]);
-    builder.push_record([
-        "", "", "", "", "", "", "", "", "", "", "", "new", "lost", "shuffled", "", "", "",
-    ]);
-
+    builder.push_record(heads.iter().copied());
+    builder.push_record(subs.iter().copied());
     for m in metrics {
-        let dm = &m.data_movement;
-        let total_download =
-            dm.new_chunk_bytes + dm.shuffled_bytes + dm.increased_replication_bytes;
-        let free_capacity = m.total_capacity_bytes.saturating_sub(m.used_capacity_bytes);
-        let used_pct = if m.total_capacity_bytes > 0 {
-            m.used_capacity_bytes as f64 / m.total_capacity_bytes as f64 * 100.0
-        } else {
-            0.0
-        };
-        let stale_pct = if m.total_capacity_bytes > 0 {
-            m.stale_capacity_bytes as f64 / m.total_capacity_bytes as f64 * 100.0
-        } else {
-            0.0
-        };
-        let restricted_download = m.restricted_movement.new_chunk_bytes
-            + m.restricted_movement.shuffled_bytes
-            + m.restricted_movement.increased_replication_bytes;
-        let replication = m
-            .replication_by_weight
-            .iter()
-            .map(|(weight, factor)| format!("{weight}:{factor}"))
-            .collect::<Vec<_>>()
-            .join(", ");
-
-        builder.push_record([
-            m.step.to_string(),
-            format!("{} ({})", m.new_chunks_in_step, m.new_restricted_in_step),
-            format!("{} ({})", m.total_chunks, m.total_restricted_chunks),
-            replication,
-            ByteSize(dm.new_chunk_bytes).to_string(),
-            format!("{} ({})", dm.shuffled_count, ByteSize(dm.shuffled_bytes)),
-            format!(
-                "+{} / -{}",
-                ByteSize(dm.increased_replication_bytes),
-                ByteSize(dm.decreased_replication_bytes)
-            ),
-            ByteSize(total_download).to_string(),
-            ByteSize(restricted_download).to_string(),
-            format!("{} ({used_pct:.1}%)", ByteSize(free_capacity)),
-            format!("{stale_pct:.1}%"),
-            dm.workers_receiving_new.to_string(),
-            dm.workers_losing.to_string(),
-            dm.workers_shuffled.to_string(),
-            m.eligible_workers.to_string(),
-            if m.scheduled { "yes" } else { "NO" }.to_string(),
-            format_duration(m.schedule_duration),
-        ]);
+        builder.push_record(cols.iter().map(|c| (c.cell)(m)));
     }
 
     let mut table = builder.build();
     table.with(Style::modern()).with(Alignment::right());
-    // "Workers" spans its three sub-columns and is centered above them.
-    table.with(Modify::new((0, WORKERS_COL)).with(ColumnSpan::new(3)));
-    table.with(Modify::new((0, WORKERS_COL)).with(Alignment::center()));
-    // Single-value headers span both header rows so they aren't split.
-    for col in SINGLE_COLS {
-        table.with(Modify::new((0, col)).with(RowSpan::new(2)));
+    let mut i = 0;
+    while i < cols.len() {
+        let width = cols[i..]
+            .iter()
+            .take_while(|c| c.head == cols[i].head)
+            .count();
+        if !cols[i].sub.is_empty() {
+            table.with(Modify::new((0, i)).with(ColumnSpan::new(width as isize)));
+            table.with(Modify::new((0, i)).with(Alignment::center()));
+        }
+        i += width;
     }
     table
 }
@@ -130,44 +176,62 @@ fn build_table(metrics: &[ReshuffleMetrics]) -> tabled::Table {
 /// killed mid-way (e.g. OOM) still shows every step it completed, not just the final table.
 pub fn print_step(m: &ReshuffleMetrics) {
     let dm = &m.data_movement;
-    let total_download = dm.new_chunk_bytes + dm.shuffled_bytes + dm.increased_replication_bytes;
-    let free_capacity = m.total_capacity_bytes.saturating_sub(m.used_capacity_bytes);
-    let pct = |n: u64| {
-        if m.total_capacity_bytes > 0 {
-            n as f64 / m.total_capacity_bytes as f64 * 100.0
-        } else {
-            0.0
-        }
+    let injected = if m.copied_or_replaced_chunks > 0 {
+        format!(" +{}", m.copied_or_replaced_chunks)
+    } else {
+        String::new()
     };
+    let portal = m
+        .portal_chunks
+        .map_or_else(String::new, |n| format!("/portal {n}"));
     println!(
-        "step {} | new {} (r{}) | total {} (r{}) | download {} (new {}, shuffled {}/{}, repl +{}/-{}) \
-         | free {} ({:.1}% used) | stale {:.1}% | workers +{}/-{}/{} | upgraded {} | sched {} {}",
+        "step {} | new {}{} (r{}) | chunks {} ingested/placed {}{} | download {} (new {}, shuffle {} = {:.1}%, +repl {}) \
+         | moved {} chunks | freed {} | free {} ({:.1}% used) | stale {:.1}% | workers +{}/~{}/-{} | upgraded {} | sched {} {}",
         m.step,
         m.new_chunks_in_step,
+        injected,
         m.new_restricted_in_step,
-        m.total_chunks,
-        m.total_restricted_chunks,
-        ByteSize(total_download),
+        m.ingested_chunks,
+        m.placed_chunks,
+        portal,
+        ByteSize(m.total_download()),
         ByteSize(dm.new_chunk_bytes),
-        dm.shuffled_count,
         ByteSize(dm.shuffled_bytes),
+        m.shuffle_share(),
         ByteSize(dm.increased_replication_bytes),
-        ByteSize(dm.decreased_replication_bytes),
-        ByteSize(free_capacity),
-        pct(m.used_capacity_bytes),
-        pct(m.stale_capacity_bytes),
+        dm.shuffled_count,
+        ByteSize(m.freed_bytes()),
+        ByteSize(m.free_capacity()),
+        m.used_pct(),
+        m.stale_pct(),
         dm.workers_receiving_new,
+        dm.workers_receiving_existing,
         dm.workers_losing,
-        dm.workers_shuffled,
         m.eligible_workers,
         if m.scheduled { "yes" } else { "NO" },
         format_duration(m.schedule_duration),
     );
 }
 
-/// Prints the full metrics table once — the end-of-run summary.
 pub fn print_table(metrics: &[ReshuffleMetrics]) {
     println!("{}", build_table(metrics));
+    if !replication_varies(metrics)
+        && let Some(m) = metrics.iter().find(|m| m.scheduled)
+    {
+        println!("Replication by weight: {}", m.replication_label());
+    }
+}
+
+pub fn print_summary(summary: &Summary) {
+    let non_restricted = summary.total_chunks_added - summary.restricted_chunks;
+    println!(
+        "\nChunks added: {} (version-restricted: {}, non-restricted: {non_restricted})",
+        summary.total_chunks_added, summary.restricted_chunks
+    );
+    println!(
+        "Workers upgraded to {}: {} of {}",
+        summary.new_worker_version, summary.upgraded_workers, summary.total_workers
+    );
 }
 
 #[cfg(test)]

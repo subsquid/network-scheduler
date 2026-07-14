@@ -1,15 +1,8 @@
-//! Drives the simulation: advances chunk ingestion and worker upgrades step by
-//! step, schedules each step through a pluggable [`StepScheduler`], and collects
-//! reshuffle metrics.
+//! Drives the simulation: advances chunk ingestion and worker upgrades step by step, schedules each
+//! step through a pluggable [`StepScheduler`], and collects reshuffle metrics.
 //!
-//! The scheduler is the only part that differs between the **stateless** path
-//! (rebuilds the whole placement each step) and the **multistep** path (reuses
-//! the stored placement, so only new data moves).
-//!
-//! Version restrictions are config-driven: a dedicated synthetic restricted
-//! dataset gets `minimum_worker_version` set on its config segment, so every
-//! chunk of it requires the new version. Both schedulers derive that from the
-//! config, so both honor it identically.
+//! Version restrictions are config-driven: the synthetic restricted dataset carries
+//! `minimum_worker_version` on its config segment, so both schedulers honor it identically.
 
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
@@ -23,11 +16,15 @@ use network_scheduler::{
 use rand::rngs::StdRng;
 use semver::Version;
 
+use anyhow::Context;
+
 use crate::baseline::{Baseline, DatasetInfo};
 use crate::metrics::{ReshuffleMetrics, StepStats};
+use crate::profile::Profile;
 use crate::rate::ChunkRate;
+use crate::types::{ChunkId, ChunkOwners, ChunkSizeIndex, bucket_of, dataset_id};
 use crate::upgrade::{self, UpgradeSchedule, WorkerVersionState};
-use crate::{ChunkId, ChunkOwners, ChunkSizeIndex, chunks, metrics};
+use crate::{chunks, metrics, rate};
 
 /// At step `at_step`, clone every current chunk of dataset `src` (bucket) into a new dataset `dst`
 /// (identical ids, ranges and sizes).
@@ -37,7 +34,6 @@ pub struct CopyPlan {
     pub at_step: u32,
 }
 
-/// CLI-derived knobs controlling a run.
 pub struct SimulationParams {
     pub steps: u32,
     pub chunk_rate: ChunkRate,
@@ -50,7 +46,40 @@ pub struct SimulationParams {
     pub copy: Vec<CopyPlan>,
 }
 
-/// End-of-run totals.
+impl SimulationParams {
+    /// `copy` is a parameter because only the stateless path replays copies through the loop; the
+    /// multistep one clones them inside Postgres.
+    pub fn from_profile(run: &Profile, copy: Vec<CopyPlan>) -> anyhow::Result<Self> {
+        let chunk_rate = match &run.chunks_shape {
+            Some(spec) => rate::ChunkRate::parse(spec).context("Failed to parse chunks_shape")?,
+            None => rate::ChunkRate::Constant {
+                n: run.chunks_per_step,
+            },
+        };
+        Ok(Self {
+            steps: run.steps,
+            chunk_rate,
+            chunk_size: run
+                .chunk_size
+                .map(|s| s.as_u64().min(u32::MAX as u64) as u32),
+            restricted_fraction: run.restricted_fraction,
+            restricted_dataset_name: run.restricted_dataset.clone(),
+            initial_new_fraction: run.initial_new_fraction,
+            upgrade_schedule: UpgradeSchedule::parse(&run.upgrade_schedule)?,
+            lift_restriction_at_step: run.lift_restriction_at_step,
+            copy,
+        })
+    }
+}
+
+/// What one step's ingest added to `accumulated_new_chunks`.
+struct Ingested {
+    /// Where this step's chunks start in `accumulated_new_chunks`.
+    start: usize,
+    count: u32,
+    restricted: u32,
+}
+
 pub struct Summary {
     pub total_chunks_added: usize,
     pub restricted_chunks: usize,
@@ -59,22 +88,30 @@ pub struct Summary {
     pub new_worker_version: Version,
 }
 
-/// One step's resulting placement — everything needed to diff against the
-/// previous step and fill the metrics row.
+/// One step's resulting placement — everything needed to diff against the previous step.
 pub struct StepPlacement {
+    /// Physical holders: what each worker has on disk (ideal ∪ stale).
     pub owners: ChunkOwners,
+    /// Of those, the copies that are only draining. Empty on the stateless path. Holds the in-flight
+    /// drains, not the corpus, so it stays small enough to keep across steps.
+    pub stale_owners: ChunkOwners,
     pub chunk_sizes: ChunkSizeIndex,
     pub replication_by_weight: BTreeMap<u16, u16>,
     pub used_capacity_bytes: u64,
     /// Bytes held by draining stale copies (0 for the stateless path).
     pub stale_capacity_bytes: u64,
-    pub total_chunks: usize,
+    /// Every chunk inserted so far, dead rows included — see
+    /// [`ReshuffleMetrics::ingested_chunks`](crate::metrics::ReshuffleMetrics::ingested_chunks).
+    pub ingested_chunks: usize,
+    /// Chunks this step's `copy` and `replace` plans added.
+    pub copied_or_replaced_chunks: u32,
+    /// Chunks the portal routes; `None` on the stateless path.
+    pub portal_chunks: Option<usize>,
     pub schedule_duration: Duration,
 }
 
-/// What the host loop hands a scheduler each step. The stateless path uses the
-/// full chunk set; the multistep path uses only the step's new chunks (it
-/// persists the rest). Both derive version restrictions from `datasets_config`.
+/// What the host loop hands a scheduler each step. The stateless path uses the full chunk set; the
+/// multistep path uses only the step's new chunks (it persists the rest).
 pub struct StepContext<'a> {
     pub baseline_chunks: &'a [Chunk],
     pub accumulated_new_chunks: &'a [Chunk],
@@ -84,24 +121,22 @@ pub struct StepContext<'a> {
     pub scheduling_config: &'a SchedulingConfig,
 }
 
-/// Outcome of scheduling one step.
 pub enum StepOutcome {
     Scheduled(StepPlacement),
-    /// Scheduling was infeasible this step (e.g. a capacity shortage). The run
-    /// records a failed step and stops.
+    /// Infeasible this step (e.g. a capacity shortage): the run records a failed step and stops.
     Failed(String),
 }
 
-/// A scheduler the shared loop drives one step at a time — the only part that
-/// differs between the stateless and multistep paths.
+/// A scheduler the shared loop drives one step at a time — the only part that differs between the
+/// stateless and multistep paths.
 pub trait StepScheduler {
-    /// Placement that step 1 is diffed against: the input assignment for the
-    /// stateless path, the seeded baseline placement for multistep. Moves the map
-    /// out — the scheduler needs it only to seed step 1's reference, so consuming
-    /// it avoids cloning (and then permanently retaining) the whole 6M-entry map.
-    fn take_initial_owners(&mut self) -> ChunkOwners;
-    /// Schedule this step. A returned `Err` is fatal (aborts the run); an
-    /// infeasible-but-expected outcome is `Ok(StepOutcome::Failed)`.
+    /// Placement that step 1 is diffed against, and the sizes of the chunks in it: a chunk dropped
+    /// later still has to be scored as freeing its bytes, and by then it is gone from the placement it
+    /// left. Moves the maps out instead of cloning — they are large, and the scheduler never reads
+    /// them again.
+    fn take_initial_placement(&mut self) -> (metrics::Placement, ChunkSizeIndex);
+    /// A returned `Err` is fatal (aborts the run); an infeasible-but-expected outcome is
+    /// `Ok(StepOutcome::Failed)`.
     fn step(&mut self, ctx: StepContext) -> anyhow::Result<StepOutcome>;
 }
 
@@ -116,12 +151,13 @@ pub struct Simulation {
     workers: Vec<Worker>,
     baseline_chunks: Vec<Chunk>,
     accumulated_new_chunks: Vec<Chunk>,
-    /// The dedicated synthetic dataset that requires the new worker version.
     /// `None` when `restricted_fraction <= 0.0`.
     restricted_dataset: Option<DatasetInfo>,
-    /// True while the restriction is in force; set false at the lift step.
     restricted_active: bool,
-    previous_owners: ChunkOwners,
+    previous: metrics::Placement,
+    /// Sizes of every chunk placed so far. Accumulated across the run: a chunk a correction tombstones
+    /// is gone from the current placement, yet its bytes were freed off the workers and must be scored.
+    chunk_sizes: ChunkSizeIndex,
     version_state: WorkerVersionState,
     rng: StdRng,
 }
@@ -145,10 +181,8 @@ impl Simulation {
         let mut workers = baseline.workers;
         version_state.apply(&mut workers, &new_worker_version);
 
-        // Build a dedicated synthetic restricted dataset (its config segment carries the new
-        // version requirement) when a fraction is set. Draws NO rng — the restricted data is
-        // generated deterministically by head-extension, so a fraction-0 (and even a fraction>0)
-        // run keeps the existing-dataset rng stream unchanged.
+        // Draws no rng: the restricted data is generated deterministically by head-extension, so
+        // enabling it leaves the existing-dataset rng stream unchanged.
         let restricted_dataset = build_restricted_dataset(
             &mut datasets_config,
             &baseline.datasets,
@@ -158,10 +192,7 @@ impl Simulation {
         );
         let restricted_active = restricted_dataset.is_some();
 
-        // The scheduler defines step 1's reference placement. Moved out, not cloned:
-        // the baseline owners map is ~5 GB at 6M chunks, and the scheduler never reads
-        // it again, so cloning would both spike and permanently double that footprint.
-        let previous_owners = scheduler.take_initial_owners();
+        let (previous, chunk_sizes) = scheduler.take_initial_placement();
 
         Self {
             params,
@@ -175,20 +206,18 @@ impl Simulation {
             accumulated_new_chunks: Vec::new(),
             restricted_dataset,
             restricted_active,
-            previous_owners,
+            previous,
+            chunk_sizes,
             version_state,
             rng,
         }
     }
 
-    /// The worker fleet, reflecting the current version distribution.
     pub fn workers(&self) -> &[Worker] {
         &self.workers
     }
 
-    /// Runs every step, invoking `on_step` with the metrics collected so far
-    /// after each one. Stops early if a step fails to schedule. Returns the
-    /// full metrics series.
+    /// Runs every step, invoking `on_step` after each one. Stops early if a step fails to schedule.
     pub fn run(&mut self, mut on_step: impl FnMut(&[ReshuffleMetrics])) -> Vec<ReshuffleMetrics> {
         let mut all_metrics = Vec::new();
         for step in 1..=self.params.steps {
@@ -213,7 +242,6 @@ impl Simulation {
         }
     }
 
-    /// Whether `chunk` belongs to the (still-restricted) dedicated dataset.
     fn is_restricted(&self, chunk: &Chunk) -> bool {
         self.restricted_active
             && self
@@ -222,7 +250,7 @@ impl Simulation {
                 .is_some_and(|d| bucket_of(&chunk.dataset) == bucket_of(&d.dataset_id))
     }
 
-    /// Ids of accumulated chunks in restricted datasets. Empty once lifted.
+    /// Empty once the restriction is lifted.
     fn restricted_chunk_ids(&self) -> HashSet<ChunkId> {
         self.accumulated_new_chunks
             .iter()
@@ -231,13 +259,12 @@ impl Simulation {
             .collect()
     }
 
-    /// Clones every chunk of each `src` (baseline + accumulated) into its `dst` for the copies due at
-    /// `step`. Stateless only: it holds all chunks in memory, so cloning + injecting as new chunks is
-    /// natural. Multistep clones from its Postgres assignment instead, so copy stays per-scheduler.
+    /// Stateless only: it holds all chunks in memory, so cloning them in is natural. Multistep clones
+    /// server-side from Postgres instead.
     fn copy_chunks_due(&self, step: u32) -> Vec<Chunk> {
         let mut copied = Vec::new();
         for copy in self.params.copy.iter().filter(|c| c.at_step == step) {
-            let dst_id = Arc::new(format!("s3://{}", copy.dst));
+            let dst_id = Arc::new(dataset_id(&copy.dst));
             copied.extend(
                 self.baseline_chunks
                     .iter()
@@ -254,41 +281,7 @@ impl Simulation {
 
     fn run_step(&mut self, step: u32) -> ReshuffleMetrics {
         self.lift_restrictions_if_due(step);
-
-        let total = self.params.chunk_rate.count_at(step, self.params.steps);
-        // A fixed share of each step's new chunks goes into the dedicated restricted dataset; the
-        // rest keep the existing size-weighted distribution among real datasets.
-        let restricted_n = if self.restricted_active && self.restricted_dataset.is_some() {
-            ((self.params.restricted_fraction * total as f64).round() as u32).min(total)
-        } else {
-            0
-        };
-        let normal_n = total - restricted_n;
-
-        let mut new_chunks = chunks::generate_new_chunks(
-            &mut self.datasets,
-            normal_n,
-            self.params.chunk_size,
-            &mut self.rng,
-        );
-        if restricted_n > 0 {
-            let dataset = self.restricted_dataset.as_mut().unwrap();
-            new_chunks.extend(chunks::generate_for_dataset(
-                dataset,
-                restricted_n,
-                self.params.chunk_size,
-            ));
-        }
-        let start = self.accumulated_new_chunks.len();
-        self.accumulated_new_chunks.extend(new_chunks);
-        // Clone after appending this step's ingest, so a copy reflects src as of this step.
-        let copies = self.copy_chunks_due(step);
-        self.accumulated_new_chunks.extend(copies);
-        let new_chunks_count = (self.accumulated_new_chunks.len() - start) as u32;
-        let new_restricted_count = self.accumulated_new_chunks[start..]
-            .iter()
-            .filter(|c| self.is_restricted(c))
-            .count() as u32;
+        let ingested = self.ingest_chunks(step);
 
         self.version_state
             .advance(&self.params.upgrade_schedule, step);
@@ -297,8 +290,8 @@ impl Simulation {
 
         let stats = StepStats {
             step,
-            new_chunks: new_chunks_count,
-            new_restricted: new_restricted_count,
+            new_chunks: ingested.count,
+            new_restricted: ingested.restricted,
             eligible_workers: self.version_state.eligible_count(),
         };
         let total_capacity = self.total_capacity_bytes();
@@ -307,53 +300,84 @@ impl Simulation {
         let ctx = StepContext {
             baseline_chunks: &self.baseline_chunks,
             accumulated_new_chunks: &self.accumulated_new_chunks,
-            new_chunks_this_step: &self.accumulated_new_chunks[start..],
+            new_chunks_this_step: &self.accumulated_new_chunks[ingested.start..],
             workers: &self.workers,
             datasets_config: &self.datasets_config,
             scheduling_config: &self.scheduling_config,
         };
 
-        match self.scheduler.step(ctx) {
+        let (what, reason) = match self.scheduler.step(ctx) {
             Ok(StepOutcome::Scheduled(placement)) => {
-                let (metrics, owners) = metrics::measure_reshuffle(
-                    &self.previous_owners,
+                let (metrics, current) = metrics::measure_reshuffle(
+                    &self.previous,
+                    &mut self.chunk_sizes,
                     placement,
                     &restricted,
                     stats,
                     total_capacity,
                 );
-                self.previous_owners = owners;
-                metrics
+                self.previous = current;
+                return metrics;
             }
-            Ok(StepOutcome::Failed(reason)) => {
-                eprintln!("Scheduling failed at step {step}: {reason}. Stopping simulation.");
-                metrics::failed_step_metrics(
-                    stats,
-                    self.baseline_chunks.len() + self.accumulated_new_chunks.len(),
-                    restricted.len(),
-                    total_capacity,
-                    reason,
-                )
-            }
-            Err(e) => {
-                let reason = format!("{e:#}");
-                eprintln!("Scheduler error at step {step}: {reason}. Stopping simulation.");
-                metrics::failed_step_metrics(
-                    stats,
-                    self.baseline_chunks.len() + self.accumulated_new_chunks.len(),
-                    restricted.len(),
-                    total_capacity,
-                    reason,
-                )
-            }
+            Ok(StepOutcome::Failed(reason)) => ("Scheduling failed", reason),
+            Err(e) => ("Scheduler error", format!("{e:#}")),
+        };
+        eprintln!("{what} at step {step}: {reason}. Stopping simulation.");
+        metrics::failed_step_metrics(
+            stats,
+            self.baseline_chunks.len() + self.accumulated_new_chunks.len(),
+            restricted.len(),
+            total_capacity,
+            reason,
+        )
+    }
+
+    /// Generates this step's new chunks and appends them to the accumulated set, along with any copies
+    /// due at `step`.
+    fn ingest_chunks(&mut self, step: u32) -> Ingested {
+        let total = self.params.chunk_rate.count_at(step, self.params.steps);
+        let restricted_count = if self.restricted_active && self.restricted_dataset.is_some() {
+            ((self.params.restricted_fraction * total as f64).round() as u32).min(total)
+        } else {
+            0
+        };
+
+        let mut new_chunks = chunks::generate_new_chunks(
+            &mut self.datasets,
+            total - restricted_count,
+            self.params.chunk_size,
+            &mut self.rng,
+        );
+        if let Some(dataset) = self
+            .restricted_dataset
+            .as_mut()
+            .filter(|_| restricted_count > 0)
+        {
+            new_chunks.extend(chunks::generate_for_dataset(
+                dataset,
+                restricted_count,
+                self.params.chunk_size,
+            ));
+        }
+
+        let start = self.accumulated_new_chunks.len();
+        self.accumulated_new_chunks.extend(new_chunks);
+        // Clone after appending this step's ingest, so a copy reflects src as of this step.
+        let copies = self.copy_chunks_due(step);
+        self.accumulated_new_chunks.extend(copies);
+
+        Ingested {
+            count: (self.accumulated_new_chunks.len() - start) as u32,
+            restricted: self.accumulated_new_chunks[start..]
+                .iter()
+                .filter(|chunk| self.is_restricted(chunk))
+                .count() as u32,
+            start,
         }
     }
 
-    /// At the lift step, drop the restriction: deactivate it and clear the
-    /// `minimum_worker_version` on the restricted dataset's config segment, so
-    /// its existing chunks become unrestricted and no new restricted chunks are
-    /// generated. Both schedulers then treat that data as unrestricted; no
-    /// chunks are removed.
+    /// Clearing `minimum_worker_version` unrestricts the dataset's existing chunks too; none are
+    /// removed.
     fn lift_restrictions_if_due(&mut self, step: u32) {
         if self.params.lift_restriction_at_step != Some(step) {
             return;
@@ -374,21 +398,41 @@ impl Simulation {
     }
 }
 
-/// Config key for a chunk's dataset id: the bucket without the `s3://` prefix.
-fn bucket_of(dataset_id: &str) -> &str {
-    dataset_id.strip_prefix("s3://").unwrap_or(dataset_id)
+/// Registers the copy's destination dataset, inheriting the source's weight so both schedulers weight
+/// it the same.
+pub fn register_copy_dataset(
+    plan: &CopyPlan,
+    baseline: &Baseline,
+    datasets: &mut DatasetsConfig,
+) -> anyhow::Result<()> {
+    let src_id = dataset_id(&plan.src);
+    anyhow::ensure!(
+        baseline.chunks.iter().any(|c| *c.dataset == src_id),
+        "copy source {} not found in the assignment",
+        plan.src
+    );
+    anyhow::ensure!(
+        !datasets.contains_key(&plan.dst),
+        "copy destination {} already exists",
+        plan.dst
+    );
+    let segments = datasets.get(&plan.src).cloned().unwrap_or_else(|| {
+        vec![DatasetSegmentConfig {
+            from: 0,
+            weight: 1,
+            minimum_worker_version: None,
+        }]
+    });
+    datasets.insert(plan.dst.clone(), segments);
+    Ok(())
 }
 
-/// Default per-chunk values for the synthetic restricted dataset when there are
-/// no baseline datasets to average over.
+/// Fallbacks for the synthetic restricted dataset when there are no baseline datasets to average over.
 const DEFAULT_AVG_BLOCK_SPAN: u64 = 1000;
 const DEFAULT_AVG_CHUNK_SIZE: u32 = 256 * 1024 * 1024;
 
-/// Builds the dedicated synthetic restricted dataset (bucket `name`, requiring
-/// `new_version`) and registers its config segment. Its per-chunk shape is the
-/// mean over `datasets`, falling back to sane defaults when there are none.
-///
-/// Draws no RNG; returns `None` (and touches nothing) when `fraction <= 0.0`.
+/// The synthetic restricted dataset (bucket `name`, requiring `new_version`), shaped like the mean of
+/// `datasets`. Returns `None` and touches nothing when `fraction <= 0.0`.
 fn build_restricted_dataset(
     config: &mut DatasetsConfig,
     datasets: &[DatasetInfo],
@@ -426,7 +470,7 @@ fn build_restricted_dataset(
     );
 
     Some(DatasetInfo {
-        dataset_id: Arc::new(format!("s3://{bucket}")),
+        dataset_id: Arc::new(dataset_id(&bucket)),
         chunk_count: 0,
         last_block: 0,
         avg_block_span,

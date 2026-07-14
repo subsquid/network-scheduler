@@ -39,8 +39,6 @@ pub fn generate_for_dataset(
         .collect()
 }
 
-/// Appends one chunk to the head of `dataset`, advancing its block range and
-/// chunk count, and returns the new chunk.
 fn extend_dataset(dataset: &mut DatasetInfo, chunk_size: Option<u32>) -> Chunk {
     let first_block = dataset.last_block + 1;
     let last_block = first_block + dataset.avg_block_span - 1;
@@ -62,8 +60,8 @@ fn extend_dataset(dataset: &mut DatasetInfo, chunk_size: Option<u32>) -> Chunk {
     }
 }
 
-/// Cumulative `(dataset_index, threshold)` weights, where each dataset's share
-/// is proportional to its chunk count. Used to sample datasets for new chunks.
+/// Cumulative `(dataset_index, threshold)` weights: each dataset's share is proportional to its
+/// chunk count.
 fn cumulative_chunk_distribution(datasets: &[DatasetInfo]) -> Vec<(usize, f64)> {
     let total: f64 = datasets.iter().map(|d| d.chunk_count as f64).sum();
     let mut cumulative = Vec::with_capacity(datasets.len());
