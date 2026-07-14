@@ -880,7 +880,7 @@ impl SchedulerStorage for InMemoryStorage {
                     .get(pk)
                     .is_none_or(|m| m.worker_servable())
             })
-            .map(|(pk, chunk)| (*pk, chunk.algo_view()))
+            .map(|(pk, chunk)| (*pk, chunk.into()))
             .collect();
         let workers: Vec<(WorkerPk, Worker)> = self
             .sched_workers

@@ -106,14 +106,13 @@ pub struct WorkerAssignmentChunk {
     pub tables_present: Option<bit_vec::BitVec>,
 }
 
-impl WorkerAssignmentChunk {
-    /// Project the chunk down to what the scheduling algorithms may see.
-    pub fn algo_view(&self) -> AlgoChunk {
+impl From<&WorkerAssignmentChunk> for AlgoChunk {
+    fn from(chunk: &WorkerAssignmentChunk) -> Self {
         AlgoChunk {
-            dataset: self.dataset.clone(),
-            id: self.id.clone(),
-            size: self.size,
-            blocks: self.blocks.clone(),
+            dataset: chunk.dataset.clone(),
+            id: chunk.id.clone(),
+            size: chunk.size,
+            blocks: chunk.blocks.clone(),
         }
     }
 }

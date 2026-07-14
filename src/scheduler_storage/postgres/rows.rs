@@ -8,7 +8,7 @@ use anyhow::{Context, Result};
 use libp2p_identity::PeerId;
 
 use crate::scheduler_storage::{
-    AlgoChunk, AssignmentWorker, ChunkPk, NewChunk, SchemaId, WorkerAssignmentChunk, WorkerPk,
+    AssignmentWorker, ChunkPk, NewChunk, SchemaId, WorkerAssignmentChunk, WorkerPk,
 };
 use crate::types::{BlockNumber, WorkerStatus};
 
@@ -26,19 +26,6 @@ pub(super) struct ChunkRow {
     pub(super) first_block: i64,
     /// last_block - first_block; add to `first_block` to recover the inclusive end.
     pub(super) last_block_delta: i32,
-}
-
-/// Slim row for the hot scheduling-cycle read (no schema columns), decoding into [`AlgoChunk`]
-/// plus the chunk's placement. `worker_ids` is `None` for a never-placed chunk.
-#[derive(sqlx::FromRow)]
-pub(super) struct AlgoChunkRow {
-    pub(super) chunk_pk: ChunkPk,
-    pub(super) dataset_name: String,
-    pub(super) chunk_id: String,
-    pub(super) size: i32,
-    pub(super) first_block: i64,
-    pub(super) last_block_delta: i32,
-    pub(super) worker_ids: Option<Vec<WorkerPk>>,
 }
 
 #[derive(sqlx::FromRow)]
@@ -90,15 +77,6 @@ pub(super) fn chunk_from_row(row: ChunkRow, dataset: Arc<String>) -> WorkerAssig
         blocks: block_range_from_columns(row.first_block, row.last_block_delta),
         schema_id: row.schema_id,
         tables_present: row.tables_present,
-    }
-}
-
-pub(super) fn algo_chunk_from_row(row: AlgoChunkRow, dataset: Arc<String>) -> AlgoChunk {
-    AlgoChunk {
-        dataset,
-        id: Arc::new(row.chunk_id),
-        size: row.size as u32,
-        blocks: block_range_from_columns(row.first_block, row.last_block_delta),
     }
 }
 

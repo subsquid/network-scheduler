@@ -244,12 +244,13 @@ pub(super) async fn apply_ready_corrections(
     Ok(())
 }
 
-/// Promote every eligible chunk to portal-visible in one UPDATE: confirmed by a worker assignment
-/// at/under the watermark, not yet visible, not dropped, not marked for removal, and not a pending
-/// correction's replacement (those promote via the correction path). No `rejected` check — rejected
-/// chunks never reach a worker assignment, so the first condition already excludes them. The
-/// non-overlap gate now lives in [`evict_portal_overlaps`], which settles overlaps in memory over the
-/// visible set we fetch anyway — so this neither fetches the candidates nor probes per chunk.
+/// Promote every chunk eligible at/under the confirmation watermark to portal-visible in one UPDATE
+/// Pending corrections' replacements are excluded — they promote via the
+/// correction path. `NOT rejected` is redundant for correctness (rejected chunks never reach a worker
+/// assignment) but the planner can't prove that; it's the conjunct that lets the UPDATE ride the
+/// `sched_chunk_metadata_promotable` partial index instead of seq-scanning the table every cycle. The
+/// non-overlap gate now lives in [`evict_portal_overlaps`], settling overlaps in memory over the
+/// visible set we already fetch — so this neither fetches candidates nor probes per chunk.
 pub(super) async fn promote_eligible_chunks(
     tx: &mut Transaction<'_, Postgres>,
     new_pa_id: AssignmentId,
@@ -259,7 +260,8 @@ pub(super) async fn promote_eligible_chunks(
     let res = sqlx::query(
         r#"
         UPDATE sched_chunk_metadata SET applied_at_portal_assignment_id = $1
-        WHERE applied_at_worker_assignment_id IS NOT NULL
+        WHERE NOT rejected
+          AND applied_at_worker_assignment_id IS NOT NULL
           AND applied_at_worker_assignment_id <= $2
           AND applied_at_portal_assignment_id IS NULL
           AND dropped_at_portal_assignment_id IS NULL
@@ -440,8 +442,7 @@ pub(super) async fn fetch_portal_visible_chunks(
 
 /// Confirmed routing for the portal-visible chunks. The visible set is re-derived server-side —
 /// the same predicate `fetch_portal_visible_chunks` reads and `evict_portal_overlaps` has already
-/// written its un-promotions to — instead of shipping the ~6M-pk array back as a parameter
-/// (~50 MB serialized and a server-side hash of every element, ~3x the join's cost).
+/// written its un-promotions.
 pub(super) async fn fetch_confirmed_routing(
     conn: &mut PgConnection,
 ) -> Result<BTreeMap<ChunkPk, Vec<WorkerPk>>> {
