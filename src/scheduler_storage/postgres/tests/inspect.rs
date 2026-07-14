@@ -102,14 +102,16 @@ impl StorageInspect for PostgresStorage {
     where
         F: FnMut(&StaleMappingView) -> bool,
     {
+        // Derived drain anchor: the first portal assignment whose watermark covers the row.
         let rows: Vec<(i64, i64, i64, Option<i64>)> = self
             .with_conn_ref(async move |conn| {
                 sqlx::query_as(
-                    "SELECT chunk_pk, worker_id, \
-                            superseded_at_worker_assignment_id, \
-                            dropped_at_portal_assignment_id \
-                     FROM sched_stale_mappings \
-                     ORDER BY chunk_pk, worker_id",
+                    "SELECT s.chunk_pk, s.worker_id, \
+                            s.superseded_at_worker_assignment_id, \
+                            (SELECT MIN(p.id) FROM sched_portal_assignments p \
+                             WHERE p.confirmed_up_to >= s.superseded_at_worker_assignment_id) \
+                     FROM sched_stale_mappings s \
+                     ORDER BY s.chunk_pk, s.worker_id",
                 )
                 .fetch_all(conn)
                 .await

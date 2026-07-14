@@ -88,7 +88,7 @@ fn set_dropped_at_portal(storage: &mut PostgresStorage, chunk_pk: ChunkPk) {
     anchor_metadata_column(
         storage,
         chunk_pk,
-        "INSERT INTO sched_portal_assignments (created_at) VALUES (1) RETURNING id",
+        "INSERT INTO sched_portal_assignments (created_at, confirmed_up_to) VALUES (1, 0) RETURNING id",
         "dropped_at_portal_assignment_id",
     );
 }

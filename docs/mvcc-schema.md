@@ -166,10 +166,12 @@ CREATE TABLE sched_worker_assignments (
     scheduler_version TEXT
 );
 
--- One row per visibility cycle. created_at anchors the M-tick drain window.
+-- One row per visibility cycle. created_at anchors the M-tick drain window; confirmed_up_to is
+-- the worker-assignment confirmation watermark the cycle saw.
 CREATE TABLE sched_portal_assignments (
-    id         BIGSERIAL PRIMARY KEY,
-    created_at BIGINT    NOT NULL
+    id              BIGSERIAL PRIMARY KEY,
+    created_at      BIGINT    NOT NULL,
+    confirmed_up_to BIGINT    NOT NULL
 );
 ```
 
@@ -211,13 +213,15 @@ every read that gathers schedulable or live chunks (see
 
 ### Removal at two granularities, one timing rule
 
-`dropped_at_portal_assignment_id` appears in two tables; in both it anchors the same M-tick drain
-(the `created_at` of the referenced portal assignment — Invariant 4). Only the scope differs:
+Both removals drain M ticks from the portal assignment that dropped them (Invariant 4); only the
+scope and the anchor's storage differ:
 
 - `sched_chunk_metadata` (keyed by `chunk_pk`) — the **whole chunk** leaves portal visibility
-  (gate A).
+  (gate A). Anchor stored: `dropped_at_portal_assignment_id`.
 - `sched_stale_mappings` (keyed by `(chunk_pk, worker_id)`) — a single **(chunk, worker) pair**
-  leaves the confirmed routing while the chunk stays visible (gate B).
+  leaves the confirmed routing while the chunk stays visible (gate B). Anchor derived: the first
+  portal assignment whose `confirmed_up_to` covers the pair's
+  `superseded_at_worker_assignment_id`.
 
 ### sched_workers
 
@@ -256,19 +260,25 @@ The two routing tables behind the two-gate model. `sched_ideal_chunk_workers` is
 scheduler currently *wants*; the scheduler serves it to workers as the download target.
 `sched_confirmed_chunk_workers` is the confirmed routing the scheduler serves to portals, lagging
 the ideal until the confirmation watermark advances. Workers and portals do not read these tables
-directly — both consume the scheduler's published assignment. Same shape:
+directly — both consume the scheduler's published assignment. Same shape, deliberately no chunks
+FK: the cycle re-stages the whole ideal via COPY, and every pk entering it is validated once,
+churn-sized, by the diffs table's FK (see the migration).
 
 ```sql
 CREATE TABLE sched_ideal_chunk_workers (
-    chunk_pk   BIGINT   PRIMARY KEY REFERENCES chunks(chunk_pk),
+    chunk_pk   BIGINT   PRIMARY KEY,
     worker_ids BIGINT[] NOT NULL
 );
 
 CREATE TABLE sched_confirmed_chunk_workers (
-    chunk_pk   BIGINT   PRIMARY KEY REFERENCES chunks(chunk_pk),
+    chunk_pk   BIGINT   PRIMARY KEY,
     worker_ids BIGINT[] NOT NULL
 );
 ```
+
+A structurally identical twin, `sched_future_ideal_chunk_workers`, stages each cycle's freshly
+computed ideal; the cycle derives its deltas by joining live vs future, then rename-swaps the two
+(the swap leaves the twin empty for the next cycle).
 
 The published worker assignment is `sched_ideal_chunk_workers ∪ sched_stale_mappings` — it does
 **not** read the confirmed routing (see [mvcc-storage.md](mvcc-storage.md), "Deferred removal").
@@ -303,17 +313,17 @@ CREATE TABLE sched_stale_mappings (
     chunk_pk                           BIGINT NOT NULL REFERENCES chunks(chunk_pk),
     worker_id                          BIGINT NOT NULL REFERENCES sched_workers(id),
     superseded_at_worker_assignment_id BIGINT NOT NULL REFERENCES sched_worker_assignments(id),
-    dropped_at_portal_assignment_id    BIGINT REFERENCES sched_portal_assignments(id),  -- NULL while pending
     PRIMARY KEY (chunk_pk, worker_id)
 );
 
 CREATE INDEX sched_stale_mappings_worker_id ON sched_stale_mappings (worker_id);
+CREATE INDEX sched_stale_mappings_superseded
+    ON sched_stale_mappings (superseded_at_worker_assignment_id);
 ```
 
 - `superseded_at_worker_assignment_id` — first worker assignment whose ideal no longer routes the
-  chunk to this worker. Activation gate: the removal is confirmed once this is `<=` the watermark.
-- `dropped_at_portal_assignment_id` — NULL while pending; stamped when the removal reaches the
-  portal, anchoring the M-tick drain (same rule as `sched_chunk_metadata`).
+  chunk to this worker. Pending vs draining is derived from it: the pair is draining once a portal
+  assignment's `confirmed_up_to` covers it, anchored at the first such assignment.
 
 Lifecycle (pending → draining → dropped) and per-cycle logic: [mvcc-storage.md](mvcc-storage.md),
 "Deferred removal". Transient — empty on stable cycles.
@@ -358,8 +368,9 @@ Phase A (GC):
      AND dropped_at_portal_assignment_id IN (
          SELECT id FROM sched_portal_assignments WHERE created_at <= $now - $m_ticks);
    ```
-2. **Expire drained stale mappings** — the per-pair equivalent (`DELETE FROM sched_stale_mappings
-   WHERE dropped_at_portal_assignment_id` references a portal assignment ≥ M ticks old).
+2. **Expire drained stale mappings** — the per-pair equivalent: delete pairs at/under the newest
+   `confirmed_up_to` among portal assignments ≥ M ticks old (exactly those whose derived drain
+   anchor has aged out; both columns are monotone over assignment ids).
 
 Phase B (placement reconcile):
 
@@ -368,16 +379,15 @@ Phase B (placement reconcile):
    (`sched_ideal_chunk_workers ∪ sched_stale_mappings`).
 4. **Compute the ideal in Rust** via the `SchedulingAlgorithm`.
 5. **Open** a new `sched_worker_assignments` row (`created_at = now`).
-6. **Mint pending stale mappings** for each `(chunk, worker)` pair the new ideal drops (skipping
-   chunks being removed at the chunk level and workers GC'd from `sched_workers`):
-   `INSERT INTO sched_stale_mappings (...) ON CONFLICT (chunk_pk, worker_id) DO NOTHING`.
-7. **Record routing diffs** into `sched_worker_assignment_diffs` (changed chunks + removals as
-   empty arrays).
-8. **Commit the new ideal** — upsert present pairs, delete absent chunks from
-   `sched_ideal_chunk_workers`.
-9. **Resolve flip-flops** — delete stale rows for pairs the new ideal re-added.
-10. **Stamp entered chunks** — `applied_at_worker_assignment_id = $new_wa_id` for newly placed
-    chunks (`WHERE applied_at_worker_assignment_id IS NULL`).
+6. **Stage the new ideal** — COPY it into the empty `sched_future_ideal_chunk_workers` twin.
+7. **Derive deltas and swap**, one batched round-trip joining live vs future ideal:
+   - mint pending stale mappings for each `(chunk, worker)` pair the new ideal drops (skipping
+     chunks being removed at the chunk level and workers GC'd from `sched_workers`);
+   - record routing diffs into `sched_worker_assignment_diffs` (changed chunks + removals as
+     empty arrays);
+   - resolve flip-flops — delete stale rows for pairs the new ideal re-added;
+   - stamp entered chunks (`applied_at_worker_assignment_id = $new_wa_id` where NULL);
+   - rename-swap the twins, so the staged ideal becomes live.
 
 The published assignment is then read post-commit as `ideal ∪ stale` over non-tombstoned chunks.
 
@@ -405,8 +415,8 @@ All in one transaction so the swap is atomic (Invariant 5):
    ```
 3. **Drop marked chunks** — `dropped_at_portal_assignment_id = $new_pa_id WHERE marked_for_removal
    IS NOT NULL AND dropped_at_portal_assignment_id IS NULL`.
-4. **Activate confirmed drains** — stamp pending stale mappings whose
-   `superseded_at_worker_assignment_id <= $confirmed_watermark` with `dropped_at_portal_assignment_id`.
+4. **Drain activation is implicit** — this cycle's portal-assignment row records the watermark
+   (`confirmed_up_to`); pending stale pairs at/under it are draining from here on.
 5. **Return** portal-visible chunks (`applied_at_portal_assignment_id IS NOT NULL AND
    dropped_at_portal_assignment_id IS NULL`) with their confirmed routing.
 

@@ -105,7 +105,8 @@ pub(super) async fn tombstone_expired_chunks(
     Ok(())
 }
 
-/// Expire stale mappings whose portal-drop landed at least `m_ticks` ago.
+/// Expire stale mappings whose drain activated at least `m_ticks` ago: those at/under the newest
+/// watermark among aged portal assignments (exact: both monotone over assignment ids).
 pub(super) async fn expire_drained_stale_mappings(
     tx: &mut Transaction<'_, Postgres>,
     now: u64,
@@ -115,11 +116,11 @@ pub(super) async fn expire_drained_stale_mappings(
     let res = sqlx::query(
         r#"
         DELETE FROM sched_stale_mappings
-        WHERE dropped_at_portal_assignment_id IS NOT NULL
-          AND dropped_at_portal_assignment_id IN (
-              SELECT id FROM sched_portal_assignments
-              WHERE created_at <= $1 - $2
-          )
+        WHERE superseded_at_worker_assignment_id <= (
+            SELECT COALESCE(MAX(confirmed_up_to), 0)
+            FROM sched_portal_assignments
+            WHERE created_at <= $1 - $2
+        )
         "#,
     )
     .bind(tick_to_i64(now))

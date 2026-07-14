@@ -409,13 +409,13 @@ impl SchedulerStorage for PostgresStorage {
             let _timer = Timer::new("run_visibility_cycle");
             let mut tx = conn.begin().await.context("run_visibility_cycle: begin")?;
 
-            let new_pa_id = phase::open_portal_assignment(&mut tx, now).await?;
+            // Watermark read first so the portal assignment records it (activates drains).
             let confirmed_up_to = phase::confirmation_watermark(&mut tx).await?;
+            let new_pa_id = phase::open_portal_assignment(&mut tx, now, confirmed_up_to).await?;
 
             phase::apply_ready_corrections(&mut tx, new_pa_id, confirmed_up_to, now).await?;
             phase::promote_eligible_chunks(&mut tx, new_pa_id, confirmed_up_to).await?;
             phase::drop_marked_chunks(&mut tx, new_pa_id).await?;
-            phase::activate_confirmed_drains(&mut tx, new_pa_id, confirmed_up_to).await?;
 
             tx.commit().await.context("run_visibility_cycle: commit")?;
 
