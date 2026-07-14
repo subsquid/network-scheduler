@@ -62,48 +62,37 @@ pub(super) async fn replay_confirmed_diffs(
     // in (prev, assignment_id] (one per cycle it changed). Keep the newest per chunk — both because
     // it's the current routing and because one INSERT can't hit the same ON CONFLICT row twice:
     // `DISTINCT ON (chunk_pk) ... ORDER BY worker_assignment_id DESC`. Empty final set = removed.
+    //
+    // One statement: `final` has two consumers, so it materializes once instead of the window's
+    // scan+sort running twice. The upsert and delete rows are disjoint (empty vs non-empty final
+    // holder set); `rows_affected` reports only the DELETE.
     let mut timer = PhaseTimer::new("confirm_worker_assignment:replay_confirmed_diffs");
-    let upserted = sqlx::query(
+    let res = sqlx::query(
         r#"
-        INSERT INTO sched_confirmed_chunk_workers (chunk_pk, worker_ids)
-        SELECT chunk_pk, worker_ids
-        FROM (
+        WITH final AS (
             SELECT DISTINCT ON (chunk_pk) chunk_pk, worker_ids
             FROM sched_worker_assignment_diffs
             WHERE worker_assignment_id > $1
               AND worker_assignment_id <= $2
             ORDER BY chunk_pk, worker_assignment_id DESC
-        ) final
-        WHERE cardinality(worker_ids) > 0
-        ON CONFLICT (chunk_pk) DO UPDATE SET worker_ids = EXCLUDED.worker_ids
-        "#,
-    )
-    .bind(prev)
-    .bind(assignment_id)
-    .execute(&mut **tx)
-    .await?;
-    timer.stmt(upserted.rows_affected());
-
-    let deleted = sqlx::query(
-        r#"
-        DELETE FROM sched_confirmed_chunk_workers
-        WHERE chunk_pk IN (
-            SELECT chunk_pk FROM (
-                SELECT DISTINCT ON (chunk_pk) chunk_pk, worker_ids
-                FROM sched_worker_assignment_diffs
-                WHERE worker_assignment_id > $1
-                  AND worker_assignment_id <= $2
-                ORDER BY chunk_pk, worker_assignment_id DESC
-            ) final
-            WHERE cardinality(worker_ids) = 0
+        ),
+        upsert AS (
+            INSERT INTO sched_confirmed_chunk_workers (chunk_pk, worker_ids)
+            SELECT chunk_pk, worker_ids FROM final
+            WHERE cardinality(worker_ids) > 0
+            ON CONFLICT (chunk_pk) DO UPDATE SET worker_ids = EXCLUDED.worker_ids
         )
+        DELETE FROM sched_confirmed_chunk_workers ccw
+        USING final
+        WHERE ccw.chunk_pk = final.chunk_pk
+          AND cardinality(final.worker_ids) = 0
         "#,
     )
     .bind(prev)
     .bind(assignment_id)
     .execute(&mut **tx)
     .await?;
-    timer.stmt(deleted.rows_affected());
+    timer.stmt(res.rows_affected());
     Ok(())
 }
 
