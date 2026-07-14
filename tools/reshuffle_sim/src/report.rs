@@ -1,525 +1,140 @@
+//! HTML report: fills `templates/report.html` with the per-step table and the chart series.
+//!
+//! A metric reaches the report as one row of [`COLUMNS`] (header + cell) or one of [`SERIES`] (JS name
+//! + value); headers, cells and JS arrays all come from those tables, so they can't drift apart.
+
 use std::path::Path;
 
 use bytesize::ByteSize;
 
 use crate::metrics::ReshuffleMetrics;
 
+const TEMPLATE: &str = include_str!("../templates/report.html");
+
+/// A column of the raw-data table: its header, and how to render one step's cell.
+type Column = (&'static str, fn(&ReshuffleMetrics) -> String);
+
+#[rustfmt::skip]
+const COLUMNS: &[Column] = &[
+    ("Step",                                 |m| m.step.to_string()),
+    ("New chunks",                           |m| m.new_chunks_in_step.to_string()),
+    ("Copied/replaced",                      |m| m.copied_or_replaced_chunks.to_string()),
+    ("New restricted",                       |m| m.new_restricted_in_step.to_string()),
+    ("Chunks ingested",                      |m| m.ingested_chunks.to_string()),
+    ("Chunks placed (on workers)",           |m| m.placed_chunks.to_string()),
+    ("Chunks in portal",                     |m| m.portal_chunks.map_or_else(|| "-".to_string(), |n| n.to_string())),
+    ("Total restricted",                     |m| m.total_restricted_chunks.to_string()),
+    ("Replication factor",                   |m| m.replication_label()),
+    ("New chunks download (all replicas)",   |m| bytes(m.data_movement.new_chunk_bytes)),
+    ("Shuffled chunks",                      |m| m.data_movement.shuffled_count.to_string()),
+    ("Shuffled chunks download (all replicas)", |m| bytes(m.data_movement.shuffled_bytes)),
+    ("Replication increase download",        |m| bytes(m.data_movement.increased_replication_bytes)),
+    ("Total S3 download (all replicas)",     |m| bytes(m.total_download())),
+    ("Shuffle % of download",                |m| format!("{:.1}%", m.shuffle_share())),
+    ("Freed (all replicas)",                 |m| bytes(m.freed_bytes())),
+    ("Replication shed (frees later)",       |m| bytes(m.data_movement.shed_replication_bytes)),
+    ("Free capacity",                        |m| bytes(m.free_capacity())),
+    ("Used %",                               |m| format!("{:.1}%", m.used_pct())),
+    ("Stale %",                              |m| format!("{:.1}%", m.stale_pct())),
+    ("Workers receiving new",                |m| m.data_movement.workers_receiving_new.to_string()),
+    ("Workers losing",                       |m| m.data_movement.workers_losing.to_string()),
+    ("Workers receiving existing",           |m| m.data_movement.workers_receiving_existing.to_string()),
+    ("Eligible workers",                     |m| m.eligible_workers.to_string()),
+    ("Scheduled",                            |m| if m.scheduled { "yes" } else { "NO" }.to_string()),
+    ("Restricted download (all replicas)",   |m| bytes(m.restricted_download())),
+    ("Scheduling time",                      |m| format!("{:.1} ms", m.schedule_ms())),
+];
+
+/// A chart series: its name in the template's `series` object, and one step's value as a JS number.
+type Series = (&'static str, fn(&ReshuffleMetrics) -> String);
+
+#[rustfmt::skip]
+const SERIES: &[Series] = &[
+    ("steps",               |m| m.step.to_string()),
+    ("newChunks",           |m| m.new_chunks_in_step.to_string()),
+    ("ingestedChunks",      |m| m.ingested_chunks.to_string()),
+    ("placedChunks",        |m| m.placed_chunks.to_string()),
+    // `null` (not 0) on the stateless path, so the chart draws no portal line rather than a flat zero.
+    ("portalChunks",        |m| m.portal_chunks.map_or_else(|| "null".to_string(), |n| n.to_string())),
+    ("newChunkBytes",       |m| m.data_movement.new_chunk_bytes.to_string()),
+    ("shuffledBytes",       |m| m.data_movement.shuffled_bytes.to_string()),
+    ("shuffledCount",       |m| m.data_movement.shuffled_count.to_string()),
+    ("increasedRepl",       |m| m.data_movement.increased_replication_bytes.to_string()),
+    ("freedBytes",          |m| m.data_movement.freed_bytes.to_string()),
+    ("shedRepl",            |m| m.data_movement.shed_replication_bytes.to_string()),
+    ("shuffleShare",        |m| float(m.shuffle_share())),
+    ("totalDownload",       |m| m.total_download().to_string()),
+    ("freeCapacity",        |m| m.free_capacity().to_string()),
+    ("usedPct",             |m| float(m.used_pct())),
+    ("stalePct",            |m| float(m.stale_pct())),
+    ("workersReceivingNew", |m| m.data_movement.workers_receiving_new.to_string()),
+    ("workersLosing",       |m| m.data_movement.workers_losing.to_string()),
+    ("workersReceivingExisting", |m| m.data_movement.workers_receiving_existing.to_string()),
+    ("eligibleWorkers",     |m| m.eligible_workers.to_string()),
+    ("scheduled",           |m| u8::from(m.scheduled).to_string()),
+    ("restrictedDownload",  |m| m.restricted_download().to_string()),
+    ("scheduleMs",          |m| float(m.schedule_ms())),
+];
+
+fn bytes(n: u64) -> String {
+    ByteSize(n).to_string()
+}
+
+/// A JS number literal that round-trips the f64 exactly (`96.66666666666667`, not `96.7`).
+fn float(v: f64) -> String {
+    format!("{v:?}")
+}
+
 pub fn generate_html(metrics: &[ReshuffleMetrics], path: &Path) -> anyhow::Result<()> {
-    let steps: Vec<u32> = metrics.iter().map(|m| m.step).collect();
-    let new_chunks: Vec<u32> = metrics.iter().map(|m| m.new_chunks_in_step).collect();
-    let total_chunks: Vec<usize> = metrics.iter().map(|m| m.total_chunks).collect();
-
-    let new_chunk_bytes_raw: Vec<u64> = metrics
+    let headers: String = COLUMNS
         .iter()
-        .map(|m| m.data_movement.new_chunk_bytes)
-        .collect();
-    let shuffled_bytes_raw: Vec<u64> = metrics
-        .iter()
-        .map(|m| m.data_movement.shuffled_bytes)
-        .collect();
-    let shuffled_count: Vec<u32> = metrics
-        .iter()
-        .map(|m| m.data_movement.shuffled_count)
-        .collect();
-    let refetched_bytes_raw: Vec<u64> = metrics
-        .iter()
-        .map(|m| m.data_movement.refetched_bytes)
-        .collect();
-    let refetched_count: Vec<u32> = metrics
-        .iter()
-        .map(|m| m.data_movement.refetched_count)
-        .collect();
-    let increased_repl_raw: Vec<u64> = metrics
-        .iter()
-        .map(|m| m.data_movement.increased_replication_bytes)
-        .collect();
-    let decreased_repl_raw: Vec<u64> = metrics
-        .iter()
-        .map(|m| m.data_movement.decreased_replication_bytes)
-        .collect();
-    let total_download_raw: Vec<u64> = metrics
-        .iter()
-        .map(|m| m.data_movement.total_download())
-        .collect();
-    let free_capacity_raw: Vec<u64> = metrics
-        .iter()
-        .map(|m| m.total_capacity_bytes.saturating_sub(m.used_capacity_bytes))
-        .collect();
-    let used_pct: Vec<f64> = metrics
-        .iter()
-        .map(|m| {
-            if m.total_capacity_bytes > 0 {
-                m.used_capacity_bytes as f64 / m.total_capacity_bytes as f64 * 100.0
-            } else {
-                0.0
-            }
-        })
-        .collect();
-    let stale_pct: Vec<f64> = metrics
-        .iter()
-        .map(|m| {
-            if m.total_capacity_bytes > 0 {
-                m.stale_capacity_bytes as f64 / m.total_capacity_bytes as f64 * 100.0
-            } else {
-                0.0
-            }
-        })
-        .collect();
-    let workers_receiving_new: Vec<usize> = metrics
-        .iter()
-        .map(|m| m.data_movement.workers_receiving_new)
-        .collect();
-    let workers_losing: Vec<usize> = metrics
-        .iter()
-        .map(|m| m.data_movement.workers_losing)
-        .collect();
-    let workers_shuffled: Vec<usize> = metrics
-        .iter()
-        .map(|m| m.data_movement.workers_shuffled)
-        .collect();
-    let eligible_workers: Vec<usize> = metrics.iter().map(|m| m.eligible_workers).collect();
-    let scheduled_flags: Vec<u8> = metrics.iter().map(|m| m.scheduled as u8).collect();
-    let restricted_download_raw: Vec<u64> = metrics
-        .iter()
-        .map(|m| m.restricted_movement.total_download())
-        .collect();
-    let schedule_ms: Vec<f64> = metrics
-        .iter()
-        .map(|m| m.schedule_duration.as_secs_f64() * 1000.0)
+        .map(|(header, _)| format!("<th>{header}</th>"))
         .collect();
 
-    let new_chunk_bytes_fmt: Vec<String> = new_chunk_bytes_raw
-        .iter()
-        .map(|b| ByteSize(*b).to_string())
-        .collect();
-    let shuffled_bytes_fmt: Vec<String> = shuffled_bytes_raw
-        .iter()
-        .map(|b| ByteSize(*b).to_string())
-        .collect();
-    let increased_repl_fmt: Vec<String> = increased_repl_raw
-        .iter()
-        .map(|b| ByteSize(*b).to_string())
-        .collect();
-    let decreased_repl_fmt: Vec<String> = decreased_repl_raw
-        .iter()
-        .map(|b| ByteSize(*b).to_string())
-        .collect();
-    let total_download_fmt: Vec<String> = total_download_raw
-        .iter()
-        .map(|b| ByteSize(*b).to_string())
-        .collect();
-    let free_capacity_fmt: Vec<String> = free_capacity_raw
-        .iter()
-        .map(|b| ByteSize(*b).to_string())
-        .collect();
-    let used_pct_fmt: Vec<String> = used_pct.iter().map(|p| format!("{p:.1}%")).collect();
-    let stale_pct_fmt: Vec<String> = stale_pct.iter().map(|p| format!("{p:.1}%")).collect();
-    let schedule_time_fmt: Vec<String> = schedule_ms.iter().map(|m| format!("{m:.1} ms")).collect();
-
-    let replication_labels: Vec<String> = metrics
+    let rows: Vec<String> = metrics
         .iter()
         .map(|m| {
-            m.replication_by_weight
+            let cells: String = COLUMNS
                 .iter()
-                .map(|(w, f)| format!("{w}:{f}"))
-                .collect::<Vec<_>>()
-                .join(", ")
+                .map(|(_, cell)| format!("<td>{}</td>", cell(m)))
+                .collect();
+            format!("<tr>{cells}</tr>")
         })
         .collect();
 
-    // If the run stopped because scheduling failed, show the recorded reason.
-    let stop_banner = metrics
+    let series: Vec<String> = SERIES
         .iter()
-        .find(|m| !m.scheduled)
-        .map(|m| {
-            let reason = m
-                .failure_reason
-                .as_deref()
-                .unwrap_or("scheduling failed")
-                .replace('&', "&amp;")
-                .replace('<', "&lt;")
-                .replace('>', "&gt;");
-            format!(
-                r#"<div class="stop-banner"><strong>Simulation stopped at step {}:</strong> {}</div>"#,
-                m.step, reason
-            )
+        .map(|(name, value)| {
+            let values: Vec<String> = metrics.iter().map(value).collect();
+            format!("  {name}: [{}]", values.join(", "))
         })
-        .unwrap_or_default();
+        .collect();
 
-    let html = format!(
-        r##"<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Reshuffle Simulation Report</title>
-<script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
-<style>
-  body {{ font-family: system-ui, -apple-system, sans-serif; margin: 0; padding: 20px; background: #f5f5f5; }}
-  h1 {{ text-align: center; color: #333; }}
-  .grid {{ display: grid; grid-template-columns: 1fr 1fr; gap: 20px; max-width: 1400px; margin: 0 auto; }}
-  .card {{ background: white; border-radius: 8px; padding: 20px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }}
-  .card.wide {{ grid-column: 1 / -1; }}
-  canvas {{ width: 100% !important; }}
-  table {{ border-collapse: collapse; width: 100%; font-size: 13px; }}
-  th, td {{ border: 1px solid #ddd; padding: 6px 10px; text-align: right; }}
-  .stop-banner {{ max-width: 1400px; margin: 0 auto 16px; padding: 12px 16px; background: #ffe5e5; border: 1px solid #ffb3b3; border-radius: 8px; color: #900; }}
-  th {{ background: #f0f0f0; position: sticky; top: 0; }}
-  td:first-child, th:first-child {{ text-align: center; }}
-</style>
-</head>
-<body>
-<h1>Reshuffle Simulation Report</h1>
-{stop_banner}
-<div class="grid">
-
-<div class="card">
-  <canvas id="chunksChart"></canvas>
-</div>
-
-<div class="card">
-  <canvas id="dataBreakdownChart"></canvas>
-</div>
-
-<div class="card">
-  <canvas id="shuffledChart"></canvas>
-</div>
-
-<div class="card">
-  <canvas id="replicationChart"></canvas>
-</div>
-
-<div class="card">
-  <canvas id="workersChart"></canvas>
-</div>
-
-<div class="card">
-  <canvas id="shuffledCountChart"></canvas>
-</div>
-
-<div class="card">
-  <canvas id="totalDownloadChart"></canvas>
-</div>
-
-<div class="card">
-  <canvas id="capacityChart"></canvas>
-</div>
-
-<div class="card">
-  <canvas id="eligibleWorkersChart"></canvas>
-</div>
-
-<div class="card">
-  <canvas id="restrictedDownloadChart"></canvas>
-</div>
-
-<div class="card">
-  <canvas id="scheduleTimeChart"></canvas>
-</div>
-
-<div class="card wide">
-<h3 style="margin-top:0">Raw Data</h3>
-<div style="overflow-x:auto">
-<table>
-<tr>
-  <th>Step</th><th>New chunks</th><th>New restricted</th><th>Total chunks</th><th>Total restricted</th><th>Replication factor</th>
-  <th>New chunks download (all replicas)</th><th>Shuffled chunks</th><th>Shuffled chunks download (all replicas)</th>
-  <th>Refetched chunks (drain&rarr;refetch download)</th>
-  <th>Replication increase download</th><th>Replication decrease freed</th><th>Total S3 download (all replicas)</th>
-  <th>Free capacity</th><th>Used %</th><th>Stale %</th>
-  <th>Workers receiving new</th><th>Workers losing</th><th>Workers receiving shuffled</th>
-  <th>Eligible workers</th><th>Scheduled</th><th>Restricted download (all replicas)</th><th>Scheduling time</th>
-</tr>
-{table_rows}
-</table>
-</div>
-</div>
-
-</div>
-
-<script>
-const steps = {steps:?};
-const newChunks = {new_chunks:?};
-const totalChunks = {total_chunks:?};
-const newChunkBytes = {new_chunk_bytes_raw:?};
-const shuffledBytes = {shuffled_bytes_raw:?};
-const shuffledCount = {shuffled_count:?};
-const refetchedBytes = {refetched_bytes_raw:?};
-const refetchedCount = {refetched_count:?};
-const increasedRepl = {increased_repl_raw:?};
-const decreasedRepl = {decreased_repl_raw:?};
-const totalDownload = {total_download_raw:?};
-const freeCapacity = {free_capacity_raw:?};
-const usedPct = {used_pct:?};
-const stalePct = {stale_pct:?};
-const workersReceivingNew = {workers_receiving_new:?};
-const workersLosing = {workers_losing:?};
-const workersShuffled = {workers_shuffled:?};
-const eligibleWorkers = {eligible_workers:?};
-const scheduledFlags = {scheduled_flags:?};
-const restrictedDownload = {restricted_download_raw:?};
-const scheduleMs = {schedule_ms:?};
-
-function formatBytes(b) {{
-  if (b === 0) return '0 B';
-  const units = ['B','KB','MB','GB','TB'];
-  const i = Math.floor(Math.log(b)/Math.log(1024));
-  return (b/Math.pow(1024,i)).toFixed(1) + ' ' + units[i];
-}}
-
-const bytesTooltip = {{ callbacks: {{ label: function(ctx) {{ return ctx.dataset.label + ': ' + formatBytes(ctx.raw); }} }} }};
-const bytesScale = {{ beginAtZero: true, ticks: {{ callback: function(v) {{ return formatBytes(v); }} }} }};
-const stepLabels = steps.map(s => 'Step ' + s);
-
-new Chart(document.getElementById('chunksChart'), {{
-  type: 'bar',
-  data: {{
-    labels: stepLabels,
-    datasets: [
-      {{ label: 'New chunks', data: newChunks, backgroundColor: 'rgba(54,162,235,0.7)' }},
-      {{ label: 'Total chunks', data: totalChunks, type: 'line', borderColor: '#ff6384', backgroundColor: 'transparent', yAxisID: 'y1' }}
-    ]
-  }},
-  options: {{
-    plugins: {{ title: {{ display: true, text: 'Chunk Counts' }} }},
-    scales: {{
-      y: {{ beginAtZero: true, title: {{ display: true, text: 'New per step' }} }},
-      y1: {{ position: 'right', title: {{ display: true, text: 'Total' }}, grid: {{ drawOnChartArea: false }} }}
-    }}
-  }}
-}});
-
-new Chart(document.getElementById('dataBreakdownChart'), {{
-  type: 'bar',
-  data: {{
-    labels: stepLabels,
-    datasets: [
-      {{ label: 'New chunks download (all replicas)', data: newChunkBytes, backgroundColor: 'rgba(54,162,235,0.7)' }},
-      {{ label: 'Shuffled chunks download (all replicas)', data: shuffledBytes, backgroundColor: 'rgba(255,99,132,0.7)' }},
-      {{ label: 'Refetched (drain→refetch download)', data: refetchedBytes, backgroundColor: 'rgba(153,102,255,0.7)' }},
-      {{ label: 'Replication increase download', data: increasedRepl, backgroundColor: 'rgba(255,206,86,0.7)' }}
-    ]
-  }},
-  options: {{
-    plugins: {{ title: {{ display: true, text: 'S3 Download Breakdown (chunk size × number of downloading workers)' }}, tooltip: bytesTooltip }},
-    scales: {{ y: bytesScale }}
-  }}
-}});
-
-new Chart(document.getElementById('shuffledChart'), {{
-  type: 'bar',
-  data: {{
-    labels: stepLabels,
-    datasets: [
-      {{ label: 'Shuffled chunks download (all replicas)', data: shuffledBytes, backgroundColor: 'rgba(255,99,132,0.7)' }}
-    ]
-  }},
-  options: {{
-    plugins: {{ title: {{ display: true, text: 'Shuffled Chunks Download (all replicas, existing chunks moved to different workers)' }}, tooltip: bytesTooltip }},
-    scales: {{ y: bytesScale }}
-  }}
-}});
-
-new Chart(document.getElementById('replicationChart'), {{
-  type: 'bar',
-  data: {{
-    labels: stepLabels,
-    datasets: [
-      {{ label: 'Replication increase download', data: increasedRepl, backgroundColor: 'rgba(75,192,192,0.7)' }},
-      {{ label: 'Replication decrease freed', data: decreasedRepl, backgroundColor: 'rgba(255,159,64,0.7)' }}
-    ]
-  }},
-  options: {{
-    plugins: {{ title: {{ display: true, text: 'Replication Changes (download from gained replicas / freed from lost replicas)' }}, tooltip: bytesTooltip }},
-    scales: {{ y: bytesScale }}
-  }}
-}});
-
-new Chart(document.getElementById('workersChart'), {{
-  type: 'bar',
-  data: {{
-    labels: stepLabels,
-    datasets: [
-      {{ label: 'Receiving new chunks', data: workersReceivingNew, backgroundColor: 'rgba(54,162,235,0.7)' }},
-      {{ label: 'Losing chunks', data: workersLosing, backgroundColor: 'rgba(255,99,132,0.7)' }},
-      {{ label: 'Receiving shuffled chunks', data: workersShuffled, backgroundColor: 'rgba(255,206,86,0.7)' }}
-    ]
-  }},
-  options: {{
-    plugins: {{ title: {{ display: true, text: 'Workers Affected by Category' }} }},
-    scales: {{ y: {{ beginAtZero: true }} }}
-  }}
-}});
-
-new Chart(document.getElementById('shuffledCountChart'), {{
-  type: 'line',
-  data: {{
-    labels: stepLabels,
-    datasets: [
-      {{ label: 'Chunks shuffled', data: shuffledCount, borderColor: '#ff6384', backgroundColor: 'rgba(255,99,132,0.1)', fill: true }}
-    ]
-  }},
-  options: {{
-    plugins: {{ title: {{ display: true, text: 'Existing Chunks Reshuffled (count)' }} }},
-    scales: {{ y: {{ beginAtZero: true }} }}
-  }}
-}});
-
-new Chart(document.getElementById('totalDownloadChart'), {{
-  type: 'bar',
-  data: {{
-    labels: stepLabels,
-    datasets: [
-      {{ label: 'Total S3 download (all replicas)', data: totalDownload, backgroundColor: 'rgba(153,102,255,0.7)' }}
-    ]
-  }},
-  options: {{
-    plugins: {{ title: {{ display: true, text: 'Total S3 Download per Step (all replicas: new + shuffled + replication increase)' }}, tooltip: bytesTooltip }},
-    scales: {{ y: bytesScale }}
-  }}
-}});
-
-new Chart(document.getElementById('capacityChart'), {{
-  type: 'bar',
-  data: {{
-    labels: stepLabels,
-    datasets: [
-      {{ label: 'Free capacity', data: freeCapacity, backgroundColor: 'rgba(75,192,192,0.7)', yAxisID: 'y' }},
-      {{ label: 'Used %', data: usedPct, type: 'line', borderColor: '#ff6384', backgroundColor: 'transparent', yAxisID: 'y1' }},
-      {{ label: 'Stale %', data: stalePct, type: 'line', borderColor: '#ff9f40', backgroundColor: 'transparent', borderDash: [5,5], yAxisID: 'y1' }}
-    ]
-  }},
-  options: {{
-    plugins: {{ title: {{ display: true, text: 'Remaining Free Capacity Across All Workers' }}, tooltip: {{
-      callbacks: {{ label: function(ctx) {{
-        if (ctx.dataset.yAxisID === 'y1') return ctx.dataset.label + ': ' + ctx.raw.toFixed(1) + '%';
-        return ctx.dataset.label + ': ' + formatBytes(ctx.raw);
-      }} }}
-    }} }},
-    scales: {{
-      y: {{ ...bytesScale, title: {{ display: true, text: 'Free capacity' }} }},
-      y1: {{ position: 'right', min: 0, max: 100, title: {{ display: true, text: 'Used %' }}, grid: {{ drawOnChartArea: false }}, ticks: {{ callback: function(v) {{ return v + '%'; }} }} }}
-    }}
-  }}
-}});
-
-new Chart(document.getElementById('eligibleWorkersChart'), {{
-  type: 'line',
-  data: {{
-    labels: stepLabels,
-    datasets: [
-      {{ label: 'Workers on new version', data: eligibleWorkers, borderColor: '#36a2eb', backgroundColor: 'rgba(54,162,235,0.1)', fill: true }}
-    ]
-  }},
-  options: {{
-    plugins: {{ title: {{ display: true, text: 'Worker Version Upgrade Progress (eligible workers)' }} }},
-    scales: {{ y: {{ beginAtZero: true }} }}
-  }}
-}});
-
-new Chart(document.getElementById('restrictedDownloadChart'), {{
-  type: 'bar',
-  data: {{
-    labels: stepLabels,
-    datasets: [
-      {{
-        label: 'Restricted chunk download (all replicas)',
-        data: restrictedDownload,
-        backgroundColor: scheduledFlags.map(f => f ? 'rgba(153,102,255,0.7)' : 'rgba(255,99,132,0.9)')
-      }}
-    ]
-  }},
-  options: {{
-    plugins: {{ title: {{ display: true, text: 'Version-Restricted Download per Step (red = scheduling failed)' }}, tooltip: bytesTooltip }},
-    scales: {{ y: bytesScale }}
-  }}
-}});
-
-new Chart(document.getElementById('scheduleTimeChart'), {{
-  type: 'line',
-  data: {{
-    labels: stepLabels,
-    datasets: [
-      {{ label: 'Scheduling time (ms)', data: scheduleMs, borderColor: '#9966ff', backgroundColor: 'rgba(153,102,255,0.1)', fill: true }}
-    ]
-  }},
-  options: {{
-    plugins: {{ title: {{ display: true, text: 'Scheduling Algorithm Time per Step' }}, tooltip: {{ callbacks: {{ label: function(ctx) {{ return ctx.dataset.label + ': ' + ctx.raw.toFixed(1) + ' ms'; }} }} }} }},
-    scales: {{ y: {{ beginAtZero: true, title: {{ display: true, text: 'Milliseconds' }} }} }}
-  }}
-}});
-</script>
-</body>
-</html>"##,
-        table_rows = build_table_rows(
-            metrics,
-            &replication_labels,
-            &new_chunk_bytes_fmt,
-            &shuffled_bytes_fmt,
-            &increased_repl_fmt,
-            &decreased_repl_fmt,
-            &total_download_fmt,
-            &free_capacity_fmt,
-            &used_pct_fmt,
-            &stale_pct_fmt,
-            &schedule_time_fmt
-        ),
-    );
+    let html = TEMPLATE
+        .replace("{{STOP_BANNER}}", &stop_banner(metrics))
+        .replace("{{TABLE_HEADERS}}", &headers)
+        .replace("{{TABLE_ROWS}}", &rows.join("\n"))
+        .replace("{{SERIES}}", &format!("{{\n{}\n}}", series.join(",\n")));
 
     std::fs::write(path, html)?;
     eprintln!("Report written to {}", path.display());
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
-fn build_table_rows(
-    metrics: &[ReshuffleMetrics],
-    replication_labels: &[String],
-    new_chunk_bytes: &[String],
-    shuffled_bytes: &[String],
-    increased_repl: &[String],
-    decreased_repl: &[String],
-    total_download: &[String],
-    free_capacity: &[String],
-    used_pct: &[String],
-    stale_pct: &[String],
-    schedule_time: &[String],
-) -> String {
-    metrics
-        .iter()
-        .enumerate()
-        .map(|(i, m)| {
-            let dm = &m.data_movement;
-            let restricted_dl = m.restricted_movement.total_download();
-            let scheduled = if m.scheduled { "yes" } else { "NO" };
-            let refetched = format!("{} ({})", dm.refetched_count, ByteSize(dm.refetched_bytes));
-            format!(
-                "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
-                m.step,
-                m.new_chunks_in_step,
-                m.new_restricted_in_step,
-                m.total_chunks,
-                m.total_restricted_chunks,
-                replication_labels[i],
-                new_chunk_bytes[i],
-                dm.shuffled_count,
-                shuffled_bytes[i],
-                refetched,
-                increased_repl[i],
-                decreased_repl[i],
-                total_download[i],
-                free_capacity[i],
-                used_pct[i],
-                stale_pct[i],
-                dm.workers_receiving_new,
-                dm.workers_losing,
-                dm.workers_shuffled,
-                m.eligible_workers,
-                scheduled,
-                ByteSize(restricted_dl),
-                schedule_time[i],
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
+/// If the run stopped because scheduling failed, the banner naming the step and reason.
+fn stop_banner(metrics: &[ReshuffleMetrics]) -> String {
+    let Some(failed) = metrics.iter().find(|m| !m.scheduled) else {
+        return String::new();
+    };
+    let reason = failed
+        .failure_reason
+        .as_deref()
+        .unwrap_or("scheduling failed")
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;");
+    format!(
+        r#"<div class="stop-banner"><strong>Simulation stopped at step {}:</strong> {reason}</div>"#,
+        failed.step
+    )
 }

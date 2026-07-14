@@ -52,8 +52,7 @@ impl UpgradeSchedule {
         Ok(Self { breakpoints })
     }
 
-    /// Target fraction of workers on the new version at `step`: the fraction of
-    /// the latest breakpoint whose step is `<= step`, or 0.0 before the first.
+    /// The fraction of the latest breakpoint whose step is `<= step`, or 0.0 before the first.
     pub fn target_fraction(&self, step: u32) -> f64 {
         let mut frac = 0.0;
         for &(bp_step, bp_frac) in &self.breakpoints {
@@ -95,20 +94,17 @@ impl WorkerVersionState {
         }
     }
 
-    /// Raises the upgraded count to the schedule's target for `step`, never
-    /// decreasing it (monotonic high-water mark).
+    /// Never decreases the count: a monotonic high-water mark.
     pub fn advance(&mut self, schedule: &UpgradeSchedule, step: u32) {
         let target = frac_to_count(schedule.target_fraction(step), self.n);
         self.upgraded = self.upgraded.max(target);
     }
 
-    /// Number of workers currently on the new version.
     pub fn eligible_count(&self) -> usize {
         self.upgraded
     }
 
-    /// Upgrades the chosen subset of workers to `new`, leaving every other
-    /// worker on its original (loaded) version. Idempotent across steps because
+    /// Leaves every other worker on its original (loaded) version. Idempotent across steps, because
     /// the upgraded set only grows.
     pub fn apply(&self, workers: &mut [Worker], new: &Version) {
         debug_assert_eq!(

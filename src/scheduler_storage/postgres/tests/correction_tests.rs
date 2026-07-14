@@ -6,7 +6,7 @@ use std::collections::{BTreeMap, HashSet};
 use claims::assert_matches;
 use proptest::prelude::*;
 
-use super::{current_schema_id, fresh_storage, register_chunk};
+use super::{confirm, current_schema_id, fresh_storage, insert_and_register_chunk};
 use crate::scheduler_storage::algorithm::IdealMapping;
 use crate::scheduler_storage::postgres::PostgresStorage;
 use crate::scheduler_storage::test_harness::assert_portal_chunks_exact;
@@ -20,17 +20,6 @@ use crate::types::{DatasetSchema, TableSchema, Worker};
 // ---------------------------------------------------------------------------
 // Test helpers
 // ---------------------------------------------------------------------------
-
-fn insert_and_register_chunk(
-    storage: &mut PostgresStorage,
-    dataset_name: &str,
-    id_seed: u32,
-    size: u32,
-) -> ChunkPk {
-    // Ignore already-exists errors for shared dataset names.
-    let _ = storage.insert_new_datasets(vec![(dataset(dataset_name), DatasetSchema::default())]);
-    register_chunk(storage, dataset_name, id_seed, size)
-}
 
 fn schedule_all(
     storage: &mut PostgresStorage,
@@ -50,12 +39,6 @@ fn schedule_all(
         .id
 }
 
-fn confirm(storage: &mut PostgresStorage, assignment_id: AssignmentId, now: u64) {
-    storage
-        .confirm_worker_assignment(assignment_id, now)
-        .expect("confirm succeeds");
-}
-
 /// Simulate the mark_for_removal path by setting the column directly via SQL.
 fn set_marked_for_removal(storage: &mut PostgresStorage, chunk_pk: ChunkPk, tick: i64) {
     storage
@@ -71,179 +54,6 @@ fn set_marked_for_removal(storage: &mut PostgresStorage, chunk_pk: ChunkPk, tick
             Ok::<_, StorageError>(())
         })
         .unwrap();
-}
-
-/// `expiring_stale_mappings` reports exactly the `(chunk, worker)` copies the next cycle's GC will
-/// delete. Migrate w1 → w2, then let w1's holdover drain once the grace window elapses.
-#[test]
-fn expiring_stale_mappings_matches_what_the_cycle_deletes() {
-    let grace = 60;
-    let mut storage = fresh_storage("expiring_stale");
-    let chunk_pk = insert_and_register_chunk(&mut storage, "ds", 1, 100);
-    storage
-        .update_worker_set(&[worker(1, None), worker(2, None)], 0, 1000)
-        .expect("upsert workers");
-    let worker_ids: Vec<WorkerPk> = storage
-        .get_workers(|_| true)
-        .iter()
-        .map(|v| v.worker_id)
-        .collect();
-    let (w1, w2) = (worker_ids[0], worker_ids[1]);
-
-    // One cycle placing `chunk_pk` on `holder`, confirmed and made portal-visible.
-    let cycle = |storage: &mut PostgresStorage, holder: WorkerPk, at: u64| {
-        let mapping: IdealMapping = [(chunk_pk, vec![holder])].into_iter().collect();
-        let algo = StaticSchedulingAlgorithm { mapping };
-        let wa = storage
-            .run_scheduling_cycle(&algo, &(), at, grace)
-            .expect("scheduling succeeds");
-        confirm(storage, wa.id, at + 10);
-        storage.run_visibility_cycle(at + 50).expect("visibility");
-        wa
-    };
-
-    // Cycles 1-3: place on w1, migrate to w2, hold (300 − 250 < grace).
-    cycle(&mut storage, w1, 100);
-    cycle(&mut storage, w2, 200); // supersedes w1 → w1 becomes a draining stale copy
-    cycle(&mut storage, w2, 300);
-    assert!(
-        !storage.get_stale_mappings(|_| true).is_empty(),
-        "w1's copy is still draining inside the grace window",
-    );
-    // Nothing is due to expire yet at t=300.
-    assert!(
-        storage
-            .expiring_stale_mappings(300, grace)
-            .unwrap()
-            .is_empty()
-    );
-
-    // At t=400 (400 − 250 ≥ grace) w1's holdover is due — the read predicts it before the cycle...
-    assert_eq!(
-        storage.expiring_stale_mappings(400, grace).unwrap(),
-        vec![(chunk_pk, w1)],
-        "the read reports exactly the copy the next cycle will expire",
-    );
-    // ...and the cycle at t=400 actually deletes it.
-    cycle(&mut storage, w2, 400);
-    assert!(
-        storage.get_stale_mappings(|_| true).is_empty(),
-        "nothing left draining after the grace period",
-    );
-    assert!(
-        storage
-            .expiring_stale_mappings(500, grace)
-            .unwrap()
-            .is_empty(),
-        "already deleted — nothing left to expire",
-    );
-}
-
-/// The phenomenon the reshuffle-sim's drained set exists to catch: under the real algorithm, a bonus
-/// replica shed by capacity pressure drains off its worker, then — because the deterministic ring
-/// re-selects that worker and its copy is already gone (expire runs before placement) — is
-/// re-downloaded onto the *same* worker. Drives replication down then up via the capacity lever and
-/// checks the shed worker drains and is re-selected.
-#[test]
-fn shed_bonus_replica_drains_then_refetches_onto_the_same_worker() {
-    use std::collections::BTreeSet;
-
-    use semver::Version;
-
-    use crate::multistep_scheduler::SchedulingConfig;
-    use crate::scheduler_storage::WorkerAssignment;
-    use crate::scheduler_storage::algorithm::MultistepAlgorithm;
-    use crate::types::ChunkWeight;
-    use crate::weight::{SchedulingChunk, WeightStrategy};
-
-    struct UniformWeight;
-    impl WeightStrategy for UniformWeight {
-        fn prepare<T: SchedulingChunk>(
-            &self,
-            chunks: Vec<T>,
-        ) -> Vec<(T, ChunkWeight, Option<Version>)> {
-            chunks.into_iter().map(|c| (c, 1, None)).collect()
-        }
-    }
-    let cfg = |cap: u64| SchedulingConfig {
-        worker_capacity: cap,
-        saturation: 1.0,
-        min_replication: 1,
-        ignore_reliability: true,
-    };
-    let grace = 60u64;
-
-    let mut storage = fresh_storage("refetch");
-    // 1 target + 2 fillers of size 100 over 5 workers. R = clamp(floor(cap·5/300), 1, 5): cap 270 →
-    // R=4 (target on 4 of 5), cap 210 → R=3 (sheds one). Per-worker load stays under capacity.
-    let target = insert_and_register_chunk(&mut storage, "ds", 1, 100);
-    insert_and_register_chunk(&mut storage, "ds", 2, 100);
-    insert_and_register_chunk(&mut storage, "ds", 3, 100);
-    let workers: Vec<Worker> = (1..=5).map(|s| worker(s, None)).collect();
-    storage.update_worker_set(&workers, 0, 1000).unwrap();
-
-    let cycle = |storage: &mut PostgresStorage, cap: u64, at: u64| -> WorkerAssignment {
-        storage.register_new_chunks().unwrap();
-        let wa = storage
-            .run_scheduling_cycle(
-                &MultistepAlgorithm::new(UniformWeight),
-                &cfg(cap),
-                at,
-                grace,
-            )
-            .expect("scheduling succeeds");
-        confirm(storage, wa.id, at + 10);
-        storage.run_visibility_cycle(at + 50).unwrap();
-        wa
-    };
-    let physical = |wa: &WorkerAssignment| -> BTreeSet<WorkerPk> {
-        wa.chunk_workers
-            .get(&target)
-            .into_iter()
-            .flatten()
-            .copied()
-            .collect()
-    };
-    let ideal = |storage: &PostgresStorage, wa: &WorkerAssignment| -> BTreeSet<WorkerPk> {
-        let stale: HashSet<(ChunkPk, WorkerPk)> =
-            storage.stale_mappings().unwrap().into_iter().collect();
-        physical(wa)
-            .into_iter()
-            .filter(|w| !stale.contains(&(target, *w)))
-            .collect()
-    };
-
-    let wa_r4 = cycle(&mut storage, 270, 100); // R=4
-    let ideal_r4 = ideal(&storage, &wa_r4);
-    let wa_r3 = cycle(&mut storage, 210, 200); // R=3 — target sheds one
-    let ideal_r3 = ideal(&storage, &wa_r3);
-    let shed: Vec<WorkerPk> = ideal_r4.difference(&ideal_r3).copied().collect();
-    assert_eq!(shed.len(), 1, "one bonus replica shed going R=4→3");
-    let shed = shed[0];
-
-    // The shed copy is due to drain, and the cycle at t=400 physically removes it from that worker.
-    assert!(
-        storage
-            .expiring_stale_mappings(400, grace)
-            .unwrap()
-            .contains(&(target, shed)),
-        "the shed copy is reported as about to expire",
-    );
-    let wa_drain = cycle(&mut storage, 210, 400);
-    let physical_after_drain = physical(&wa_drain);
-    assert!(
-        !physical_after_drain.contains(&shed),
-        "the shed worker physically dropped the chunk (drained)",
-    );
-
-    // Replication restored: the ring re-selects the same worker, which no longer holds the bytes.
-    let wa_r4_again = cycle(&mut storage, 270, 500);
-    let ideal_r4_again = ideal(&storage, &wa_r4_again);
-    assert_eq!(ideal_r4_again, ideal_r4, "the same placement is restored");
-    assert!(
-        ideal_r4_again.contains(&shed),
-        "the drained worker is re-selected — it re-downloads the chunk it just dropped",
-    );
 }
 
 /// Insert an FK-anchor row via `insert_sql` (which must `RETURNING id`), then point

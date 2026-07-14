@@ -77,34 +77,4 @@ impl PostgresStorage {
             Ok::<_, StorageError>(rows)
         })
     }
-
-    /// The stale `(chunk, worker)` copies a cycle at `(now, m_ticks)` would expire — the same
-    /// predicate [`expire_drained_stale_mappings`](super::scheduling_cycle) runs, as a read. Offline
-    /// tooling (reshuffle-sim) queries it before the cycle to attribute a same-worker drain→refetch
-    /// that a step-boundary placement diff can't see.
-    pub fn expiring_stale_mappings(
-        &self,
-        now: u64,
-        m_ticks: u64,
-    ) -> Result<Vec<(ChunkPk, WorkerPk)>, StorageError> {
-        use super::rows::tick_to_i64;
-        self.with_conn_ref(async move |conn| {
-            let rows: Vec<(ChunkPk, WorkerPk)> = sqlx::query_as(
-                r#"
-                SELECT chunk_pk, worker_id
-                FROM sched_stale_mappings
-                WHERE dropped_at_portal_assignment_id IS NOT NULL
-                  AND dropped_at_portal_assignment_id IN (
-                      SELECT id FROM sched_portal_assignments WHERE created_at <= $1 - $2
-                  )
-                "#,
-            )
-            .bind(tick_to_i64(now))
-            .bind(tick_to_i64(m_ticks))
-            .fetch_all(&mut *conn)
-            .await
-            .context("fetch expiring stale mappings")?;
-            Ok::<_, StorageError>(rows)
-        })
-    }
 }

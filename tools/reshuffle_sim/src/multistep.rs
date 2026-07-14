@@ -23,23 +23,22 @@ use network_scheduler::{
     types::{Chunk, DatasetSchema},
 };
 
-use crate::{
-    ChunkOwners, ChunkSizeIndex, DrainedOwners, WorkerIdx, WorkerIndex,
-    baseline::Baseline,
-    simulation::{CopyPlan, StepContext, StepOutcome, StepPlacement, StepScheduler},
-};
+use crate::baseline::Baseline;
+use crate::metrics::Placement;
+use crate::simulation::{CopyPlan, StepContext, StepOutcome, StepPlacement, StepScheduler};
+use crate::types::{ChunkOwners, ChunkSizeIndex, WorkerIndex, dataset_id};
 
-/// One cycle's result: the published assignment, its stale snapshot, the copies the cycle expired,
-/// and the schedule duration — or a capacity shortage (the run records a failed step and stops).
 enum CycleResult {
     Scheduled {
         assignment: WorkerAssignment,
         /// Draining copies in the published placement.
         stale: Vec<(ChunkPk, WorkerPk)>,
-        /// Copies this cycle physically expired. Same type as `stale`; named to keep them distinct.
-        drains: Vec<(ChunkPk, WorkerPk)>,
+        /// Chunks the portal routes after this cycle's visibility pass. Trails the placement by the
+        /// confirm and portal lags.
+        portal_chunks: usize,
         schedule_duration: Duration,
     },
+    /// A capacity shortage: the run records a failed step and stops.
     Shortage(String),
 }
 
@@ -58,13 +57,12 @@ pub struct ReplacePlan {
     pub at_step: u32,
 }
 
-/// Owns the run's storage. When ephemeral, the container is the shared `pg_harness` one (reaped at
-/// process exit), so there's nothing to hold or drop here.
+/// When ephemeral, the container is the shared `pg_harness` one (reaped at process exit), so there's
+/// nothing to hold or drop here.
 struct Backend {
     storage: PostgresStorage,
 }
 
-/// Connect to an existing, user-supplied database and migrate it.
 fn existing_database(url: &str) -> anyhow::Result<Backend> {
     tracing::info!("Connecting to Postgres at {url}");
     Ok(Backend {
@@ -72,9 +70,7 @@ fn existing_database(url: &str) -> anyhow::Result<Backend> {
     })
 }
 
-/// Clone a fresh, migrated database from the shared `pg_harness` container, started disk-backed
-/// because the mainnet DB overflows the test tmpfs. The container is reaped at process exit (or left
-/// running under `SIM_SQL_EXPLAIN`); both are handled by the harness.
+/// Disk-backed because the mainnet DB overflows the harness tmpfs.
 fn ephemeral_database() -> Backend {
     tracing::info!("Starting ephemeral Postgres container (pass --database-url to use your own)");
     Backend {
@@ -91,12 +87,11 @@ fn connect_migrated(url: &str) -> anyhow::Result<PostgresStorage> {
 /// What [`MultistepScheduler::build`] does with the baseline data before scheduling.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Ingestion {
-    /// Seed datasets, workers and chunks, then continue to the baseline placement (normal run).
+    /// Seed, then continue to the baseline placement.
     Run,
-    /// Seed nothing — the data is already in the database (e.g. a restored backup) — and go
-    /// straight to the baseline placement.
+    /// Seed nothing — the data is already in the database (e.g. a restored backup).
     Skip,
-    /// Seed datasets, workers and chunks, then stop before scheduling (snapshot the database here).
+    /// Seed, then stop before scheduling (snapshot the database here).
     Only,
 }
 
@@ -105,8 +100,10 @@ pub struct MultistepScheduler {
     algo: MultistepAlgorithm<DatasetsConfig>,
     config: MultistepConfig,
     clock: u64,
-    total_chunks: usize,
-    initial_owners: ChunkOwners,
+    /// Every chunk inserted so far, dead rows included.
+    ingested_chunks: usize,
+    initial_placement: Placement,
+    initial_sizes: ChunkSizeIndex,
     replace: Vec<ReplacePlan>,
     copy: Vec<CopyPlan>,
     /// Cycles a published assignment waits before the fleet has downloaded it (uniform latency).
@@ -117,96 +114,51 @@ pub struct MultistepScheduler {
     /// Worker-assignment ids in publication order (index 0 = baseline). The confirmation watermark
     /// trails the newest publication by `confirm_lag_steps + portal_lag_steps` entries.
     published_ids: Vec<AssignmentId>,
-    /// 1-based step counter, advanced once per `step`.
     current_step: u32,
     /// Placed chunks of datasets still awaiting a replace — a same-cycle replace reads its target's
     /// pre-cycle placement from here. Kept only while a replace lies ahead.
     latest_chunks: BTreeMap<ChunkPk, WorkerAssignmentChunk>,
-    /// Interns this scheduler's worker `PeerId`s to compact indices for the owners
-    /// maps it produces. Self-contained: the baseline seed and every step share it, so
-    /// indices are stable across the run. (The multistep path ignores the baseline's
-    /// own index table — it derives owners from its own storage cycles.)
+    /// Shared by the baseline seed and every step, so indices stay stable across the run. (This path
+    /// ignores the baseline's own index table — it derives owners from its storage cycles.)
     worker_index: WorkerIndex,
 }
 
+/// Everything [`MultistepScheduler::build`] needs beyond the baseline itself.
+pub struct Setup<'a> {
+    pub config: &'a Config,
+    /// An existing database to use; `None` starts an ephemeral container.
+    pub database_url: Option<&'a str>,
+    /// The synthetic restricted dataset to register, if the run has one (it has no baseline chunks).
+    pub restricted_dataset: Option<String>,
+    pub replace: Vec<ReplacePlan>,
+    pub copy: Vec<CopyPlan>,
+    pub confirm_lag_steps: u32,
+    pub portal_lag_steps: u32,
+    pub ingestion: Ingestion,
+}
+
 impl MultistepScheduler {
-    #[allow(clippy::too_many_arguments)]
-    pub fn build(
-        config: &Config,
-        baseline: &mut Baseline,
-        database_url: Option<&str>,
-        restricted_dataset: Option<String>,
-        replace: Vec<ReplacePlan>,
-        copy: Vec<CopyPlan>,
-        confirm_lag_steps: u32,
-        portal_lag_steps: u32,
-        ingestion: Ingestion,
-    ) -> anyhow::Result<Option<Self>> {
+    /// `None` under [`Ingestion::Only`], which stops once the database is seeded.
+    pub fn build(setup: Setup, baseline: &mut Baseline) -> anyhow::Result<Option<Self>> {
+        let Setup {
+            config,
+            database_url,
+            restricted_dataset,
+            replace,
+            copy,
+            confirm_lag_steps,
+            portal_lag_steps,
+            ingestion,
+        } = setup;
         let mut backend = match database_url {
             Some(url) => existing_database(url)?,
             None => ephemeral_database(),
         };
-        let algo = MultistepAlgorithm::new(config.datasets.clone());
-        let scheduling_config = MultistepConfig {
-            worker_capacity: config.worker_storage_bytes,
-            saturation: config.saturation,
-            min_replication: config.min_replication,
-            ignore_reliability: true,
-        };
 
-        // Seed: datasets must exist before their chunks; workers before the first cycle. The
-        // simulation's synthetic restricted dataset has no baseline chunks, so register it here
-        // too (it starts empty and receives chunks from step 1 on). `Ingestion::Skip` reuses the
-        // data already in the database (e.g. a restored backup) and seeds nothing.
-        let total_chunks = baseline.chunks.len();
-        match ingestion {
-            Ingestion::Skip => {
-                // Drop the in-memory chunk set; Postgres owns it now
-                baseline.chunks = Vec::new();
-                tracing::info!(
-                    "Skipping ingestion; reusing {total_chunks} baseline chunks from the database"
-                );
-            }
-            Ingestion::Run | Ingestion::Only => {
-                let mut dataset_names: BTreeSet<String> = baseline
-                    .chunks
-                    .iter()
-                    .map(|c| (*c.dataset).clone())
-                    .collect();
-                dataset_names.extend(restricted_dataset);
-                let dataset_count = dataset_names.len();
-                backend.storage.insert_new_datasets(
-                    dataset_names
-                        .into_iter()
-                        .map(|name| (name, DatasetSchema::default()))
-                        .collect(),
-                )?;
-                backend
-                    .storage
-                    .update_worker_set(&baseline.workers, 0, GC_TICKS)?;
-                tracing::info!(
-                    "Seeded {dataset_count} datasets and {} workers",
-                    baseline.workers.len()
-                );
-
-                tracing::info!("Inserting {total_chunks} baseline chunks...");
-                let storage_chunks: Vec<NewChunk> = std::mem::take(&mut baseline.chunks)
-                    .into_iter()
-                    .map(to_storage_chunk)
-                    .collect();
-                backend.storage.insert_new_chunks(storage_chunks)?;
-                let registered = backend.storage.register_new_chunks()?;
-                tracing::info!(
-                    "Registered {} baseline chunks ({} rejected as overlapping)",
-                    registered.len(),
-                    total_chunks - registered.len()
-                );
-            }
-        }
-
-        // `Ingestion::Only`: the seeded database is the deliverable — snapshot it now. Stop before
-        // scheduling, so a later `Ingestion::Skip` run restores it and benchmarks from here.
+        let ingested_chunks = seed_baseline(&mut backend, baseline, restricted_dataset, ingestion)?;
         if ingestion == Ingestion::Only {
+            // Stop before scheduling, so a later `Ingestion::Skip` run restores the snapshot and
+            // benchmarks from here.
             log_table_sizes(&backend.storage);
             tracing::info!("Ingest-only: baseline data loaded; stopping before scheduling");
             return Ok(None);
@@ -214,11 +166,17 @@ impl MultistepScheduler {
 
         let mut scheduler = Self {
             backend,
-            algo,
-            config: scheduling_config,
+            algo: MultistepAlgorithm::new(config.datasets.clone()),
+            config: MultistepConfig {
+                worker_capacity: config.worker_storage_bytes,
+                saturation: config.saturation,
+                min_replication: config.min_replication,
+                ignore_reliability: true,
+            },
             clock: 0,
-            total_chunks,
-            initial_owners: ChunkOwners::new(),
+            ingested_chunks,
+            initial_placement: Placement::default(),
+            initial_sizes: ChunkSizeIndex::new(),
             replace,
             copy,
             confirm_lag_steps,
@@ -228,12 +186,14 @@ impl MultistepScheduler {
             latest_chunks: BTreeMap::new(),
             worker_index: WorkerIndex::default(),
         };
+        scheduler.place_baseline()?;
+        Ok(Some(scheduler))
+    }
 
+    /// Runs the first cycle and keeps its placement as the one step 1 is diffed against.
+    fn place_baseline(&mut self) -> anyhow::Result<()> {
         tracing::info!("Scheduling baseline placement...");
-        let (assignment, stale) = match scheduler
-            .run_cycle()
-            .context("scheduling baseline placement")?
-        {
+        let (assignment, stale) = match self.run_cycle().context("scheduling baseline placement")? {
             CycleResult::Scheduled {
                 assignment, stale, ..
             } => (assignment, stale),
@@ -241,36 +201,36 @@ impl MultistepScheduler {
                 anyhow::bail!("baseline placement infeasible: {reason}")
             }
         };
-        scheduler.initial_owners =
-            owners_from_assignment(&assignment, &stale, &mut scheduler.worker_index).0;
-        for plan in &scheduler.replace {
-            let ds = format!("s3://{}", plan.bucket);
+
+        let snapshot = Snapshot::of(&assignment, &stale, &mut self.worker_index);
+        self.initial_sizes = snapshot.sizes;
+        self.initial_placement = Placement {
+            owners: snapshot.owners,
+            stale: snapshot.stale_owners,
+        };
+
+        for plan in &self.replace {
+            let dataset = dataset_id(&plan.bucket);
             anyhow::ensure!(
-                assignment.chunks.values().any(|c| *c.dataset == ds),
-                "replace: dataset {ds} not found in baseline"
+                assignment.chunks.values().any(|c| *c.dataset == dataset),
+                "replace: dataset {dataset} not found in baseline"
             );
         }
-        scheduler.retain_replace_targets(&assignment);
+        self.retain_replace_targets(&assignment);
         tracing::info!(
             "Baseline placed {} chunks; replication by weight {:?}",
-            scheduler.initial_owners.len(),
+            self.initial_placement.owners.len(),
             assignment.replication_by_weight
         );
-        log_table_sizes(&scheduler.backend.storage);
-        Ok(Some(scheduler))
+        log_table_sizes(&self.backend.storage);
+        Ok(())
     }
 
-    /// Run one scheduling cycle. Advances the clock by the removal delay (so earlier steps' removed
-    /// copies age out), then confirms the fleet up to the lagged watermark and runs visibility, so
-    /// only assignments the fleet+portal have caught up to let their superseded copies drain.
+    /// Advances the clock by the removal delay (so earlier steps' removed copies age out), then
+    /// confirms the fleet up to the lagged watermark and runs visibility — so only assignments the
+    /// fleet and portal have caught up to let their superseded copies drain.
     fn run_cycle(&mut self) -> anyhow::Result<CycleResult> {
         self.clock += M_TICKS;
-        // Copies this cycle's GC will expire, read before it deletes them (same `now`/`m_ticks`).
-        // One connection runs both sequentially. Lets the metric score a same-worker drain→refetch.
-        let drains = self
-            .backend
-            .storage
-            .expiring_stale_mappings(self.clock, M_TICKS)?;
         let started = Instant::now();
         let assignment = match self.backend.storage.run_scheduling_cycle(
             &self.algo,
@@ -292,19 +252,19 @@ impl MultistepScheduler {
         // Before confirm/visibility expire or drain stale, so the snapshot matches `assignment`.
         let stale = self.backend.storage.stale_mappings()?;
         self.clock += CLOCK_STEP;
-        // Confirm only up to the lagged watermark: the copies this cycle superseded keep occupying
-        // capacity until the assignment that replaced them clears both lags. Both lags 0 confirms
-        // the just-published assignment — the previous confirm-immediately behaviour.
+        // Confirming only up to the lagged watermark keeps this cycle's superseded copies occupying
+        // capacity until the assignment that replaced them clears both lags. Lags of 0 confirm the
+        // just-published assignment.
         self.published_ids.push(assignment.id);
         let watermark = self.confirmation_watermark();
         self.backend
             .storage
             .confirm_worker_assignment(watermark, self.clock)?;
-        self.backend.storage.run_visibility_cycle(self.clock)?;
+        let portal = self.backend.storage.run_visibility_cycle(self.clock)?;
         Ok(CycleResult::Scheduled {
             assignment,
             stale,
-            drains,
+            portal_chunks: portal.chunks.len(),
             schedule_duration,
         })
     }
@@ -316,10 +276,9 @@ impl MultistepScheduler {
     }
 
     /// Supersede every chunk of `bucket` with a same-range correction, sourced from `latest_chunks`
-    /// (a valid target is fully placed, so that set is its live chunks). The caller's
-    /// `register_new_chunks` makes the replacements eligible; they swap in this cycle.
-    fn replace_dataset(&mut self, bucket: &str) -> anyhow::Result<()> {
-        let target = format!("s3://{bucket}");
+    /// (a valid target is fully placed, so that set is its live chunks). Returns how many it made.
+    fn replace_dataset(&mut self, bucket: &str) -> anyhow::Result<u32> {
+        let target = dataset_id(bucket);
         let replacements: Vec<(ChunkPk, NewChunk)> = self
             .latest_chunks
             .iter()
@@ -346,21 +305,19 @@ impl MultistepScheduler {
             .storage
             .register_corrections(replacements, self.clock)
             .context("registering replacement corrections")?;
-        self.total_chunks += count;
+        self.ingested_chunks += count;
         tracing::info!(
             "Replaced {count} chunks in dataset {bucket} at step {}",
             self.current_step
         );
-        Ok(())
+        Ok(count as u32)
     }
 
-    /// Clone every live chunk of `plan.src` into the new dataset `plan.dst` (same id, range, size),
-    /// server-side — Postgres is this scheduler's source of truth (see `Simulation::copy_chunks_due`),
-    /// so the copy never round-trips 147K chunk payloads through the client. Runs before the step's
-    /// cycle: the caller's `register_new_chunks` admits the clones and the one cycle places them.
-    fn copy_dataset(&mut self, plan: &CopyPlan) -> anyhow::Result<()> {
-        let src = format!("s3://{}", plan.src);
-        let dst = format!("s3://{}", plan.dst);
+    /// Clones server-side, so the chunk payloads never round-trip through the client.
+    /// Returns how many clones it made.
+    fn copy_dataset(&mut self, plan: &CopyPlan) -> anyhow::Result<u32> {
+        let src = dataset_id(&plan.src);
+        let dst = dataset_id(&plan.dst);
         // Destination isn't seeded at build (no baseline chunks), so register it before its clones.
         self.backend
             .storage
@@ -371,24 +328,24 @@ impl MultistepScheduler {
             "copy-dataset: source {} has no chunks to copy",
             plan.src
         );
-        self.total_chunks += count as usize;
+        self.ingested_chunks += count as usize;
         tracing::info!(
             "Copied {count} chunks from {} to {} at step {}",
             plan.src,
             plan.dst,
             self.current_step
         );
-        Ok(())
+        Ok(count as u32)
     }
 
-    /// Keep in `latest_chunks` the placed chunks of datasets with a replace still ahead (at_step >
-    /// current step), so a later replace can source its target's pre-cycle placement.
+    /// Keeps the placed chunks of datasets whose replace still lies ahead, so that replace can source
+    /// its target's pre-cycle placement.
     fn retain_replace_targets(&mut self, assignment: &WorkerAssignment) {
         let targets: HashSet<String> = self
             .replace
             .iter()
             .filter(|p| p.at_step > self.current_step)
-            .map(|p| format!("s3://{}", p.bucket))
+            .map(|p| dataset_id(&p.bucket))
             .collect();
         self.latest_chunks = if targets.is_empty() {
             BTreeMap::new()
@@ -404,8 +361,11 @@ impl MultistepScheduler {
 }
 
 impl StepScheduler for MultistepScheduler {
-    fn take_initial_owners(&mut self) -> ChunkOwners {
-        std::mem::take(&mut self.initial_owners)
+    fn take_initial_placement(&mut self) -> (Placement, ChunkSizeIndex) {
+        (
+            std::mem::take(&mut self.initial_placement),
+            std::mem::take(&mut self.initial_sizes),
+        )
     }
 
     fn step(&mut self, ctx: StepContext) -> anyhow::Result<StepOutcome> {
@@ -422,18 +382,19 @@ impl StepScheduler for MultistepScheduler {
             .filter(|p| p.at_step == self.current_step)
             .map(|p| p.bucket.clone())
             .collect();
+        let mut copied_or_replaced_chunks = 0u32;
         for bucket in &due_replaces {
-            self.replace_dataset(bucket)?;
+            copied_or_replaced_chunks += self.replace_dataset(bucket)?;
         }
 
-        // Copy before the cycle: the clones (src's live set, server-side) register alongside this
-        // step's new chunks and the one cycle places everything — no second full cycle for the copy.
+        // Copy before the cycle too: the clones register alongside this step's new chunks, so one
+        // cycle places everything.
         let (due_copies, rest): (Vec<CopyPlan>, Vec<CopyPlan>) = std::mem::take(&mut self.copy)
             .into_iter()
             .partition(|p| p.at_step == self.current_step);
         self.copy = rest;
         for plan in &due_copies {
-            self.copy_dataset(plan)?;
+            copied_or_replaced_chunks += self.copy_dataset(plan)?;
         }
 
         let new_chunks: Vec<NewChunk> = ctx
@@ -442,33 +403,33 @@ impl StepScheduler for MultistepScheduler {
             .cloned()
             .map(to_storage_chunk)
             .collect();
-        self.total_chunks += new_chunks.len();
+        self.ingested_chunks += new_chunks.len();
         self.backend.storage.insert_new_chunks(new_chunks)?;
         self.backend.storage.register_new_chunks()?;
-        let (assignment, stale, drains, schedule_duration) = match self.run_cycle()? {
+        let (assignment, stale, portal_chunks, schedule_duration) = match self.run_cycle()? {
             CycleResult::Scheduled {
                 assignment,
                 stale,
-                drains,
+                portal_chunks,
                 schedule_duration,
-            } => (assignment, stale, drains, schedule_duration),
+            } => (assignment, stale, portal_chunks, schedule_duration),
             CycleResult::Shortage(reason) => return Ok(StepOutcome::Failed(reason)),
         };
 
         log_table_sizes(&self.backend.storage);
 
-        let (owners, chunk_sizes, used_capacity_bytes, stale_capacity_bytes) =
-            owners_from_assignment(&assignment, &stale, &mut self.worker_index);
-        let drained = drained_owners(&assignment, &drains, &mut self.worker_index);
+        let snapshot = Snapshot::of(&assignment, &stale, &mut self.worker_index);
         self.retain_replace_targets(&assignment);
         Ok(StepOutcome::Scheduled(StepPlacement {
-            owners,
-            chunk_sizes,
-            drained,
+            owners: snapshot.owners,
+            stale_owners: snapshot.stale_owners,
+            chunk_sizes: snapshot.sizes,
             replication_by_weight: assignment.replication_by_weight.clone(),
-            used_capacity_bytes,
-            stale_capacity_bytes,
-            total_chunks: self.total_chunks,
+            used_capacity_bytes: snapshot.used_bytes,
+            stale_capacity_bytes: snapshot.stale_bytes,
+            ingested_chunks: self.ingested_chunks,
+            copied_or_replaced_chunks,
+            portal_chunks: Some(portal_chunks),
             schedule_duration,
         }))
     }
@@ -497,15 +458,97 @@ fn log_table_sizes(storage: &PostgresStorage) {
     }
 }
 
-/// Returns the *physical* owners we diff between steps (`chunk_workers` = ideal ∪ stale), per-chunk
-/// sizes, total physical bytes, and stale bytes. Diffing physical (not ideal-only) placement means a
-/// copy that just flips ideal↔stale on disk isn't scored as a free or download; the one physical move
-/// this misses — a same-worker drain→refetch — is recovered via the `drained` set (see [`drained_owners`]).
-fn owners_from_assignment(
+/// Seeds datasets, workers and chunks: datasets must exist before their chunks, workers before the
+/// first cycle. The synthetic restricted dataset has no baseline chunks, so it is registered here too
+/// and fills up from step 1. Returns how many chunks the database now holds.
+fn seed_baseline(
+    backend: &mut Backend,
+    baseline: &mut Baseline,
+    restricted_dataset: Option<String>,
+    ingestion: Ingestion,
+) -> anyhow::Result<usize> {
+    let total_chunks = baseline.chunks.len();
+    if ingestion == Ingestion::Skip {
+        // Postgres owns the chunks now.
+        baseline.chunks = Vec::new();
+        tracing::info!(
+            "Skipping ingestion; reusing {total_chunks} baseline chunks from the database"
+        );
+        return Ok(total_chunks);
+    }
+
+    let mut dataset_names: BTreeSet<String> = baseline
+        .chunks
+        .iter()
+        .map(|chunk| (*chunk.dataset).clone())
+        .collect();
+    dataset_names.extend(restricted_dataset);
+    let dataset_count = dataset_names.len();
+    backend.storage.insert_new_datasets(
+        dataset_names
+            .into_iter()
+            .map(|name| (name, DatasetSchema::default()))
+            .collect(),
+    )?;
+    backend
+        .storage
+        .update_worker_set(&baseline.workers, 0, GC_TICKS)?;
+    tracing::info!(
+        "Seeded {dataset_count} datasets and {} workers",
+        baseline.workers.len()
+    );
+
+    tracing::info!("Inserting {total_chunks} baseline chunks...");
+    let storage_chunks: Vec<NewChunk> = std::mem::take(&mut baseline.chunks)
+        .into_iter()
+        .map(to_storage_chunk)
+        .collect();
+    backend.storage.insert_new_chunks(storage_chunks)?;
+    let registered = backend.storage.register_new_chunks()?;
+    tracing::info!(
+        "Registered {} baseline chunks ({} rejected as overlapping)",
+        registered.len(),
+        total_chunks - registered.len()
+    );
+    Ok(total_chunks)
+}
+
+/// What the metrics need from one published assignment.
+struct Snapshot {
+    /// Physical holders (`chunk_workers` = ideal ∪ stale): what each worker has on disk. A copy that
+    /// flips between the two ledgers stays on disk, so it must score as neither a free nor a download.
+    owners: ChunkOwners,
+    /// Of those, the draining copies. The diff subtracts them to recover the ideal, which is what tells
+    /// a move apart from an extra replica.
+    stale_owners: ChunkOwners,
+    sizes: ChunkSizeIndex,
+    used_bytes: u64,
+    stale_bytes: u64,
+}
+
+impl Snapshot {
+    fn of(
+        assignment: &WorkerAssignment,
+        stale: &[(ChunkPk, WorkerPk)],
+        worker_index: &mut WorkerIndex,
+    ) -> Self {
+        let (owners, sizes, used_bytes) = physical_holders(assignment, worker_index);
+        let (stale_owners, stale_bytes) = stale_holders(assignment, stale, worker_index);
+        Snapshot {
+            owners,
+            stale_owners,
+            sizes,
+            used_bytes,
+            stale_bytes,
+        }
+    }
+}
+
+/// Every chunk's holders, its size, and the total bytes they occupy.
+fn physical_holders(
     assignment: &WorkerAssignment,
-    stale: &[(ChunkPk, WorkerPk)],
     worker_index: &mut WorkerIndex,
-) -> (ChunkOwners, ChunkSizeIndex, u64, u64) {
+) -> (ChunkOwners, ChunkSizeIndex, u64) {
     let mut owners: ChunkOwners = BTreeMap::new();
     let mut sizes: ChunkSizeIndex = BTreeMap::new();
     let mut used_bytes = 0u64;
@@ -517,57 +560,43 @@ fn owners_from_assignment(
         sizes.insert(key.clone(), chunk.size);
         used_bytes += chunk.size as u64 * worker_pks.len() as u64;
 
-        let holders: Vec<WorkerIdx> =
-            worker_index.intern_holders(worker_pks.iter().filter_map(|worker_pk| {
-                assignment
-                    .workers
-                    .get(worker_pk)
-                    .map(|worker| worker.peer_id)
-            }));
+        let holders = worker_index.intern_holders(worker_pks.iter().filter_map(|worker_pk| {
+            assignment
+                .workers
+                .get(worker_pk)
+                .map(|worker| worker.peer_id)
+        }));
         owners.insert(key, holders);
     }
-
-    // Each stale row is one draining copy; sum their chunk sizes.
-    let stale_bytes: u64 = stale
-        .iter()
-        .filter_map(|(chunk_pk, _)| {
-            assignment
-                .chunks
-                .get(chunk_pk)
-                .map(|chunk| chunk.size as u64)
-        })
-        .sum();
-
-    (owners, sizes, used_bytes, stale_bytes)
+    (owners, sizes, used_bytes)
 }
 
-/// Translate drained `(chunk_pk, worker_pk)` pairs to `(ChunkId, WorkerIdx)`, interned with the same
-/// `worker_index` as [`owners_from_assignment`] so the diff lines up. Pairs whose chunk/worker is
-/// absent from the assignment are skipped — they never appear in `current`, so `freed = prev \ cur`
-/// already covers them.
-fn drained_owners(
+/// The draining copies, one per stale row, and the bytes they hold.
+fn stale_holders(
     assignment: &WorkerAssignment,
-    drains: &[(ChunkPk, WorkerPk)],
+    stale: &[(ChunkPk, WorkerPk)],
     worker_index: &mut WorkerIndex,
-) -> DrainedOwners {
-    let mut out: DrainedOwners = BTreeMap::new();
-    for (chunk_pk, worker_pk) in drains {
+) -> (ChunkOwners, u64) {
+    let mut stale_owners: ChunkOwners = BTreeMap::new();
+    let mut stale_bytes = 0u64;
+    for (chunk_pk, worker_pk) in stale {
         let (Some(chunk), Some(worker)) = (
             assignment.chunks.get(chunk_pk),
             assignment.workers.get(worker_pk),
         ) else {
             continue;
         };
-        out.entry((chunk.dataset.clone(), chunk.id.clone()))
+        stale_bytes += chunk.size as u64;
+        stale_owners
+            .entry((chunk.dataset.clone(), chunk.id.clone()))
             .or_default()
             .push(worker_index.intern(worker.peer_id));
     }
-    // `compute_data_movement` binary-searches these, so keep them sorted and deduped.
-    for holders in out.values_mut() {
+    // The diff binary-searches these against the sorted physical holders.
+    for holders in stale_owners.values_mut() {
         holders.sort_unstable();
-        holders.dedup();
     }
-    out
+    (stale_owners, stale_bytes)
 }
 
 /// Storage-boundary conversion: the sim models chunks as the legacy `types::Chunk`; the MVCC
@@ -619,9 +648,9 @@ mod tests {
         // Publication history: baseline (id 10), then steps publishing 11, 12, 13.
         let ids = [10, 11, 12, 13];
 
-        // Zero lag confirms the newest publication immediately (the prior behaviour).
+        // Zero lag confirms the newest publication immediately.
         assert_eq!(lagged_watermark(&ids, 0), 13);
-        // Lag 1/2 trail by that many publications.
+        // A lag trails by that many publications.
         assert_eq!(lagged_watermark(&ids, 1), 12);
         assert_eq!(lagged_watermark(&ids, 2), 11);
         // A lag past the start clamps to the baseline, never underflows.
@@ -659,8 +688,7 @@ mod tests {
         let stale = [(c1, worker3_pk)];
 
         let mut worker_index = WorkerIndex::default();
-        let (owners, _sizes, used_bytes, stale_bytes) =
-            owners_from_assignment(&assignment, &stale, &mut worker_index);
+        let snapshot = Snapshot::of(&assignment, &stale, &mut worker_index);
 
         // c1's physical holders include the draining copy on worker 3 (else re-promoting it later
         // would read as a fresh download). `intern_holders` sorts, so both indices in order.
@@ -670,121 +698,240 @@ mod tests {
             worker_index.intern(worker3.peer_id),
         ];
         expected.sort_unstable();
-        assert_eq!(owners[&c1_key], expected);
-        assert_eq!(owners.len(), 2);
+        assert_eq!(snapshot.owners[&c1_key], expected);
+        assert_eq!(snapshot.owners.len(), 2);
+
+        // Worker 3's copy is the draining one, and only it: the diff subtracts these to get the ideal.
+        assert_eq!(
+            snapshot.stale_owners[&c1_key],
+            vec![worker_index.intern(worker3.peer_id)],
+        );
 
         // Physical use counts the stale copy (100*2 + 50); the overhang is c1's extra copy (100).
-        assert_eq!(used_bytes, 100 * 2 + 50);
-        assert_eq!(stale_bytes, 100);
+        assert_eq!(snapshot.used_bytes, 100 * 2 + 50);
+        assert_eq!(snapshot.stale_bytes, 100);
     }
 
-    /// End-to-end guard through the full pipeline: supersede (copy → stale, must not read as freed),
-    /// then drain + same-worker refetch (expired then re-placed, a real download the drained set
-    /// recovers — a boundary diff misses it since the copy is present at both ends).
-    #[test]
-    fn superseded_copy_is_not_freed_and_a_drained_refetch_is_a_real_download() {
-        use std::time::Duration;
+    const SIZE: u32 = 100;
 
-        use crate::ChunkId;
-        use crate::metrics::{self, DataMovement, StepStats};
+    /// Drives published assignments through the metrics the way [`crate::simulation::Simulation`] does,
+    /// and re-checks the ledger on every step: used capacity must move by exactly
+    /// `total_download - freed_bytes`. That invariant ties the diff (which classifies) to the storage's
+    /// own byte count (which doesn't), so a miscounted download or free cannot pass unnoticed.
+    #[derive(Default)]
+    struct Harness {
+        worker_index: WorkerIndex,
+        sizes: ChunkSizeIndex,
+        previous: Placement,
+        used: u64,
+    }
 
-        let c1 = ChunkPk(1);
-        let c1_key: ChunkId = (Arc::new("ds".to_string()), Arc::new("c1".to_string()));
-        let (a_pk, a) = worker(1); // stable holder
-        let (b_pk, b) = worker(2); // rides supersede → drain → same-worker refetch
+    impl Harness {
+        /// The placement step 1 is diffed against; not itself measured.
+        fn seed(&mut self, assignment: &WorkerAssignment, stale: &[(ChunkPk, WorkerPk)]) {
+            let snapshot = Snapshot::of(assignment, stale, &mut self.worker_index);
+            self.used = snapshot.used_bytes;
+            self.sizes = snapshot.sizes;
+            self.previous = Placement {
+                owners: snapshot.owners,
+                stale: snapshot.stale_owners,
+            };
+        }
 
-        // One chunk (size 100). `owners_from_assignment` returns PHYSICAL owners (ideal ∪ stale).
-        let assignment = |holders: Vec<WorkerPk>| WorkerAssignment {
-            id: 1,
-            chunk_workers: BTreeMap::from([(c1, holders)]),
-            chunks: BTreeMap::from([(c1, chunk("ds", "c1", 100))]),
-            workers: BTreeMap::from([(a_pk, a.clone()), (b_pk, b.clone())]),
-            replication_by_weight: BTreeMap::new(),
-        };
-        let placement =
-            |owners: ChunkOwners, sizes: ChunkSizeIndex, drained: DrainedOwners| StepPlacement {
-                owners,
-                chunk_sizes: sizes,
-                drained,
+        fn step(
+            &mut self,
+            assignment: &WorkerAssignment,
+            stale: &[(ChunkPk, WorkerPk)],
+        ) -> crate::metrics::DataMovement {
+            use std::time::Duration;
+
+            use crate::metrics::{self, StepStats};
+            use crate::types::ChunkId;
+
+            let snapshot = Snapshot::of(assignment, stale, &mut self.worker_index);
+            let used_now = snapshot.used_bytes;
+            let placement = StepPlacement {
+                owners: snapshot.owners,
+                stale_owners: snapshot.stale_owners,
+                chunk_sizes: snapshot.sizes,
                 replication_by_weight: BTreeMap::new(),
-                used_capacity_bytes: 0,
-                stale_capacity_bytes: 0,
-                total_chunks: 1,
+                used_capacity_bytes: used_now,
+                stale_capacity_bytes: snapshot.stale_bytes,
+                ingested_chunks: 1,
+                copied_or_replaced_chunks: 0,
+                portal_chunks: None,
                 schedule_duration: Duration::ZERO,
             };
-        let restricted: HashSet<ChunkId> = HashSet::new();
-        let stats = || StepStats {
-            step: 1,
-            new_chunks: 0,
-            new_restricted: 0,
-            eligible_workers: 2,
-        };
-        let diff = |prev: &ChunkOwners, place: StepPlacement| -> (DataMovement, ChunkOwners) {
-            let (m, owners) =
-                metrics::measure_reshuffle(prev, place, &restricted, stats(), 1_000_000);
-            (m.data_movement, owners)
-        };
+            let (metrics, placed) = metrics::measure_reshuffle(
+                &self.previous,
+                &mut self.sizes,
+                placement,
+                &HashSet::<ChunkId>::new(),
+                StepStats {
+                    step: 1,
+                    new_chunks: 0,
+                    new_restricted: 0,
+                    eligible_workers: 2,
+                },
+                1_000_000,
+            );
 
-        let mut wi = WorkerIndex::default();
+            let movement = metrics.data_movement;
+            assert_eq!(
+                used_now as i64 - self.used as i64,
+                movement.total_download() as i64 - movement.freed_bytes as i64,
+                "the ledger must balance: used capacity moves by exactly (downloaded - freed)",
+            );
+            self.used = used_now;
+            self.previous = placed;
+            movement
+        }
+    }
 
-        // Baseline: c1 physically on {A, B}, nothing stale.
-        let (owners0, ..) = owners_from_assignment(&assignment(vec![a_pk, b_pk]), &[], &mut wi);
-        let idx_b = wi.intern(b.peer_id); // idempotent; names B's drained copy in phase 3
+    /// One chunk on `holders`, with `workers` as the fleet.
+    fn one_chunk(
+        holders: &[WorkerPk],
+        workers: &[(WorkerPk, AssignmentWorker)],
+    ) -> WorkerAssignment {
+        WorkerAssignment {
+            id: 1,
+            chunk_workers: BTreeMap::from([(ChunkPk(1), holders.to_vec())]),
+            chunks: BTreeMap::from([(ChunkPk(1), chunk("ds", "c1", SIZE))]),
+            workers: workers.iter().cloned().collect(),
+            replication_by_weight: BTreeMap::new(),
+        }
+    }
 
-        // PHASE 1 — supersede: ideal={A}, stale={B}; physical still {A,B}.
-        let (phys1, s1, ..) =
-            owners_from_assignment(&assignment(vec![a_pk, b_pk]), &[(c1, b_pk)], &mut wi);
-        let (dm1, owners1) = diff(&owners0, placement(phys1, s1, ChunkOwners::new()));
+    /// A move is one shuffle, and its bytes land on either side of the drain: the replacement is
+    /// downloaded in the step the scheduler drops the holder, and that holder's copy is freed later,
+    /// when its drain expires. Only the ideal sees the two together, which is what identifies the move.
+    #[test]
+    fn a_move_across_the_drain_is_one_shuffle_downloaded_then_freed() {
+        let c1 = ChunkPk(1);
+        let (a_pk, a) = worker(1);
+        let (b_pk, b) = worker(2);
+        let fleet = [(a_pk, a), (b_pk, b)];
+
+        let mut h = Harness::default();
+        h.seed(&one_chunk(&[a_pk], &fleet), &[]); // c1 on A
+
+        // The scheduler moves c1 A → B: B downloads it now, A's copy starts draining (still on disk).
+        let supersede = h.step(&one_chunk(&[a_pk, b_pk], &fleet), &[(c1, a_pk)]);
+        assert_eq!(supersede.shuffled_count, 1, "one chunk moved");
         assert_eq!(
-            dm1.decreased_replication_bytes, 0,
-            "a superseded-but-on-disk copy must NOT read as freed"
+            supersede.shuffled_bytes, SIZE as u64,
+            "B downloaded the copy"
         );
-        assert_eq!(dm1.total_download(), 0, "nothing was fetched");
-
-        // PHASE 2 — lag hold: unchanged.
-        let (phys2, s2, ..) =
-            owners_from_assignment(&assignment(vec![a_pk, b_pk]), &[(c1, b_pk)], &mut wi);
-        let (dm2, owners2) = diff(&owners1, placement(phys2, s2, ChunkOwners::new()));
         assert_eq!(
-            dm2.total_download() + dm2.decreased_replication_bytes,
+            supersede.shuffle_share(),
+            100.0,
+            "the whole download is a move"
+        );
+        assert_eq!(
+            supersede.increased_replication_bytes, 0,
+            "replication did not grow — the download replaced a dropped holder",
+        );
+        assert_eq!(
+            supersede.freed_bytes, 0,
+            "A still holds its copy while draining"
+        );
+
+        // A's drain expires: its bytes are freed, and nothing is downloaded or moved.
+        let drain = h.step(&one_chunk(&[b_pk], &fleet), &[]);
+        assert_eq!(drain.freed_bytes, SIZE as u64, "A deleted its copy");
+        assert_eq!(drain.total_download(), 0, "the drain downloads nothing");
+        assert_eq!(drain.shuffled_count, 0, "the move was already counted");
+    }
+
+    /// A download with no holder dropped is an extra replica, not a move — the distinction the
+    /// shuffle share depends on.
+    #[test]
+    fn a_download_with_no_holder_dropped_is_a_replication_increase() {
+        let (a_pk, a) = worker(1);
+        let (b_pk, b) = worker(2);
+        let fleet = [(a_pk, a), (b_pk, b)];
+
+        let mut h = Harness::default();
+        h.seed(&one_chunk(&[a_pk], &fleet), &[]);
+
+        let grow = h.step(&one_chunk(&[a_pk, b_pk], &fleet), &[]);
+        assert_eq!(grow.increased_replication_bytes, SIZE as u64);
+        assert_eq!(grow.shuffled_count, 0, "A kept its copy — nothing moved");
+        assert_eq!(
+            grow.shuffle_share(),
+            0.0,
+            "none of the download is reshuffling"
+        );
+    }
+
+    /// The copy that goes stale and comes back: it is in the published assignment the whole way, so the
+    /// worker never drops it and no byte moves. The storage test
+    /// `a_copy_expired_and_re_placed_in_one_cycle_never_leaves_the_published_assignment` pins why.
+    #[test]
+    fn a_copy_that_goes_stale_and_comes_back_moves_no_data() {
+        let c1 = ChunkPk(1);
+        let (a_pk, a) = worker(1); // stable holder
+        let (b_pk, b) = worker(2); // rides supersede → drain → re-place
+        let fleet = [(a_pk, a), (b_pk, b)];
+        let both = one_chunk(&[a_pk, b_pk], &fleet);
+
+        let mut h = Harness::default();
+        h.seed(&both, &[]);
+
+        // Supersede: ideal={A}, stale={B}; physical still {A,B}.
+        let supersede = h.step(&both, &[(c1, b_pk)]);
+        assert_eq!(
+            supersede.freed_bytes, 0,
+            "a superseded-but-on-disk copy must NOT read as freed",
+        );
+        assert_eq!(supersede.total_download(), 0, "nothing was fetched");
+        assert_eq!(
+            supersede.shed_replication_bytes, SIZE as u64,
+            "the scheduler shed a replica; the bytes free when the drain expires",
+        );
+
+        // Lag hold: unchanged.
+        let hold = h.step(&both, &[(c1, b_pk)]);
+        assert_eq!(
+            hold.total_download() + hold.freed_bytes,
             0,
             "hold is a no-op"
         );
 
-        // PHASE 3 — drain + same-worker refetch: B's copy is expired this cycle, then the ring
-        // re-places c1 back on B. Published ideal={A,B}, stale={}; drained={(c1,B)}.
-        let (phys3, s3, ..) = owners_from_assignment(&assignment(vec![a_pk, b_pk]), &[], &mut wi);
-
-        // (a) WITHOUT the drained set a boundary diff HIDES the refetch (documents the bug).
-        let (dm3_hidden, _) = diff(
-            &owners2,
-            placement(phys3.clone(), s3.clone(), ChunkOwners::new()),
-        );
+        // B is back in the ideal, and it never lost the bytes: a promotion, not a download.
+        let repromote = h.step(&both, &[]);
+        assert_eq!(repromote.total_download(), 0, "B never dropped the chunk");
+        assert_eq!(repromote.shuffled_count, 0, "nothing moved");
         assert_eq!(
-            dm3_hidden.total_download(),
-            0,
-            "without the drained set the same-worker refetch is invisible"
-        );
-
-        // (b) WITH drained {c1:[B]}: the refetch is scored as a genuine S3 download.
-        let drained = BTreeMap::from([(c1_key.clone(), vec![idx_b])]);
-        let (dm3, _) = diff(&owners2, placement(phys3, s3, drained));
-        assert_eq!(
-            dm3.refetched_bytes, 100,
-            "a drained-then-refetched copy is a real download"
-        );
-        assert_eq!(
-            dm3.total_download(),
-            100,
-            "and it counts toward total download"
-        );
-        assert_eq!(
-            dm3.increased_replication_bytes, 0,
-            "replication did NOT grow — B leaves as stale and returns as ideal"
-        );
-        assert_eq!(
-            dm3.decreased_replication_bytes, 0,
+            repromote.freed_bytes, 0,
             "c1 survives with the same holders"
+        );
+    }
+
+    /// A chunk a correction tombstones leaves the placement entirely, and its bytes really are freed
+    /// off the workers. It is absent from that step's own `chunk_sizes` (the placement it left), so a
+    /// size index rebuilt per step scores it as freeing 0 B — the sizes accumulate to prevent that.
+    #[test]
+    fn a_chunk_dropped_from_the_placement_frees_its_bytes() {
+        let (a_pk, a) = worker(1);
+        let (b_pk, b) = worker(2);
+        let fleet = [(a_pk, a), (b_pk, b)];
+
+        let mut h = Harness::default();
+        h.seed(&one_chunk(&[a_pk, b_pk], &fleet), &[]);
+
+        let tombstoned = WorkerAssignment {
+            id: 2,
+            chunk_workers: BTreeMap::new(),
+            chunks: BTreeMap::new(),
+            workers: fleet.iter().cloned().collect(),
+            replication_by_weight: BTreeMap::new(),
+        };
+        let dropped = h.step(&tombstoned, &[]);
+        assert_eq!(
+            dropped.freed_bytes,
+            SIZE as u64 * 2,
+            "both copies of the chunk were freed",
         );
     }
 }
