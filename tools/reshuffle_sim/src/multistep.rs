@@ -633,7 +633,7 @@ mod tests {
         }
     }
 
-    fn worker(pk: i64) -> (WorkerPk, AssignmentWorker) {
+    fn worker(pk: i32) -> (WorkerPk, AssignmentWorker) {
         (
             WorkerPk(pk),
             AssignmentWorker {

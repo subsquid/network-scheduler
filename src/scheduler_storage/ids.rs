@@ -1,17 +1,20 @@
 //! Storage primary-key newtypes shared by every backend.
 //!
-//! Both wrap an `i64` surrogate (Postgres `SERIAL`, in-memory counter); the newtypes keep chunk
-//! and worker keys from being swapped while staying plain integers on the wire.
+//! Each wraps the surrogate its column stores (Postgres `SERIAL`/`BIGSERIAL`, in-memory counter);
+//! the newtypes keep chunk and worker keys from being swapped while staying plain integers on the
+//! wire.
 
-/// Primary key of a chunk row.
+/// Primary key of a chunk row (`chunks.chunk_pk`, a 64-bit `BIGSERIAL`: chunk rows are never
+/// deleted, so the sequence only climbs).
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, sqlx::Type)]
 #[sqlx(transparent)]
 pub struct ChunkPk(pub i64);
 
-/// Primary key of a worker row.
+/// Primary key of a worker row (`sched_workers.id`, a 32-bit `SERIAL`). Narrow on purpose: every
+/// routing row carries one of these per replica in its `worker_ids` array.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, sqlx::Type)]
 #[sqlx(transparent)]
-pub struct WorkerPk(pub i64);
+pub struct WorkerPk(pub i32);
 
 /// Primary key of a dataset row.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, sqlx::Type)]

@@ -168,17 +168,21 @@ pub enum CorrectionRejected {
     },
 }
 
+/// One visibility cycle: when it ran, and the confirmation watermark it saw (drain derivation).
+#[derive(Debug, Clone, Copy)]
+struct PortalAssignmentEntry {
+    created_at: TimeUnit,
+    confirmed_up_to: WorkerAssignmentId,
+}
+
 /// Grace-period holdover for a `(chunk, worker)` pair removed from the ideal assignment
-/// while the chunk is still portal-visible. Pending until the superseding worker
-/// assignment is confirmed and the pair leaves the portal assignment; draining
-/// (M-tick window) after.
+/// while the chunk is still portal-visible. Pending vs draining is derived: draining once a
+/// portal assignment's `confirmed_up_to` covers `superseded_at_worker_assignment_id`,
+/// anchored at the first such assignment.
 #[derive(Debug, Clone)]
 struct StaleMapping {
-    /// First worker assignment whose ideal no longer routes the chunk to this
-    /// worker; the drain activates once `<=` the confirmation watermark.
+    /// First worker assignment whose ideal no longer routes the chunk to this worker.
     superseded_at_worker_assignment_id: WorkerAssignmentId,
-    /// `None` while pending; once set, anchors the M-tick drain.
-    dropped_at_portal_assignment_id: Option<PortalAssignmentId>,
 }
 
 #[derive(Debug, Clone)]
@@ -240,7 +244,7 @@ pub(crate) struct InMemoryStorage {
 
     sched_chunk_metadata: BTreeMap<ChunkPk, SchedulerChunkMetadata>,
     sched_worker_assignments: BTreeMap<WorkerAssignmentId, TimeUnit>,
-    sched_portal_assignments: BTreeMap<PortalAssignmentId, TimeUnit>,
+    sched_portal_assignments: BTreeMap<PortalAssignmentId, PortalAssignmentEntry>,
 
     // The highest worker assignment confirmed by the workers
     sched_worker_assignment_confirmation: WorkerAssignmentId,
@@ -509,7 +513,7 @@ impl InMemoryStorage {
     ) -> bool {
         dropped_at_portal
             .and_then(|aid| self.sched_portal_assignments.get(&aid))
-            .is_some_and(|created_at| *created_at <= cutoff)
+            .is_some_and(|entry| entry.created_at <= cutoff)
     }
 
     /// Tombstone chunks whose portal-removal happened at least `m_ticks` ago.
@@ -547,17 +551,19 @@ impl InMemoryStorage {
         let Some(cutoff) = now.checked_sub(m_ticks) else {
             return;
         };
-        let expired: Vec<(ChunkPk, WorkerPk)> = self
-            .sched_stale_mappings
-            .iter()
-            .filter_map(|(key, mapping)| {
-                self.portal_drop_elapsed(mapping.dropped_at_portal_assignment_id, cutoff)
-                    .then_some(*key)
-            })
-            .collect();
-        for key in expired {
-            self.sched_stale_mappings.remove(&key);
-        }
+        // Newest watermark among aged portal assignments; pairs at/under it are exactly those
+        // whose derived drain anchor aged out (both columns monotone over assignment ids).
+        let Some(watermark) = self
+            .sched_portal_assignments
+            .values()
+            .filter(|e| e.created_at <= cutoff)
+            .map(|e| e.confirmed_up_to)
+            .max()
+        else {
+            return;
+        };
+        self.sched_stale_mappings
+            .retain(|_, m| m.superseded_at_worker_assignment_id > watermark);
     }
 
     /// Mint a pending stale mapping for each `(chunk, worker)` pair dropped from
@@ -587,7 +593,6 @@ impl InMemoryStorage {
                         .entry((*pk, worker_id))
                         .or_insert(StaleMapping {
                             superseded_at_worker_assignment_id: new_worker_aid,
-                            dropped_at_portal_assignment_id: None,
                         });
                 }
             }
@@ -831,7 +836,7 @@ impl SchedulerStorage for InMemoryStorage {
         }
 
         for (peer_id, worker) in remaining {
-            let id = WorkerPk(self.counters.worker_id.next() as i64);
+            let id = WorkerPk(self.counters.worker_id.next() as i32);
             self.sched_workers.insert(
                 id,
                 WorkerEntry {
@@ -880,7 +885,7 @@ impl SchedulerStorage for InMemoryStorage {
                     .get(pk)
                     .is_none_or(|m| m.worker_servable())
             })
-            .map(|(pk, chunk)| (*pk, chunk.algo_view()))
+            .map(|(pk, chunk)| (*pk, chunk.into()))
             .collect();
         let workers: Vec<(WorkerPk, Worker)> = self
             .sched_workers
@@ -983,16 +988,20 @@ impl SchedulerStorage for InMemoryStorage {
     }
 
     /// Produce a new portal assignment. Atomically: apply ready corrections,
-    /// promote confirmed chunks (skipping pending correction targets), drop
-    /// chunks marked for removal, and start the M-tick drain for stale mappings
-    /// whose superseding worker assignment is now confirmed. Returns the
+    /// promote confirmed chunks (skipping pending correction targets), and drop
+    /// chunks marked for removal. Recording the watermark on the assignment is
+    /// what activates drains (derived; see [`StaleMapping`]). Returns the
     /// portal-visible chunks routed by the confirmed routing.
     fn run_visibility_cycle(&mut self, now: Tick) -> Result<PortalAssignment, StorageError> {
-        let portal_assignment_id = self.counters.portal_assignment_id.next();
-        self.sched_portal_assignments
-            .insert(portal_assignment_id, now);
-
         let confirmed_up_to = self.sched_worker_assignment_confirmation;
+        let portal_assignment_id = self.counters.portal_assignment_id.next();
+        self.sched_portal_assignments.insert(
+            portal_assignment_id,
+            PortalAssignmentEntry {
+                created_at: now,
+                confirmed_up_to,
+            },
+        );
 
         // Before the promote/drop pass so corrections fired this cycle take
         // effect immediately.
@@ -1004,17 +1013,6 @@ impl SchedulerStorage for InMemoryStorage {
         for meta in self.sched_chunk_metadata.values_mut() {
             if meta.marked_for_removal && meta.dropped_at_portal_assignment_id.is_none() {
                 meta.dropped_at_portal_assignment_id = Some(portal_assignment_id);
-            }
-        }
-
-        // Activate drains: once the superseding assignment is confirmed, this is
-        // the portal assignment that drops the pair — stamp it to start the
-        // M-tick drain.
-        for mapping in self.sched_stale_mappings.values_mut() {
-            if mapping.dropped_at_portal_assignment_id.is_none()
-                && mapping.superseded_at_worker_assignment_id <= confirmed_up_to
-            {
-                mapping.dropped_at_portal_assignment_id = Some(portal_assignment_id);
             }
         }
 

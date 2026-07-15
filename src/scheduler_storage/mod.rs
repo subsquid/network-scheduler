@@ -11,7 +11,7 @@ use crate::weight::SchedulingChunk;
 pub type Tick = u64;
 
 /// Monotonic assignment version (matches sched_worker_assignments.id / sched_portal_assignments.id).
-pub type AssignmentId = i64;
+pub type AssignmentId = i32;
 
 /// Errors returned across the [`SchedulerStorage`] boundary.
 #[derive(Debug, thiserror::Error)]
@@ -106,14 +106,13 @@ pub struct WorkerAssignmentChunk {
     pub tables_present: Option<bit_vec::BitVec>,
 }
 
-impl WorkerAssignmentChunk {
-    /// Project the chunk down to what the scheduling algorithms may see.
-    pub fn algo_view(&self) -> AlgoChunk {
+impl From<&WorkerAssignmentChunk> for AlgoChunk {
+    fn from(chunk: &WorkerAssignmentChunk) -> Self {
         AlgoChunk {
-            dataset: self.dataset.clone(),
-            id: self.id.clone(),
-            size: self.size,
-            blocks: self.blocks.clone(),
+            dataset: chunk.dataset.clone(),
+            id: chunk.id.clone(),
+            size: chunk.size,
+            blocks: chunk.blocks.clone(),
         }
     }
 }

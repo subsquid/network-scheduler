@@ -6,6 +6,7 @@ mod drain_tests;
 mod inspect;
 mod registration_tests;
 mod schema;
+mod worker_tests;
 
 use std::sync::atomic::{AtomicU64, Ordering};
 

@@ -62,48 +62,37 @@ pub(super) async fn replay_confirmed_diffs(
     // in (prev, assignment_id] (one per cycle it changed). Keep the newest per chunk — both because
     // it's the current routing and because one INSERT can't hit the same ON CONFLICT row twice:
     // `DISTINCT ON (chunk_pk) ... ORDER BY worker_assignment_id DESC`. Empty final set = removed.
+    //
+    // One statement: `final` has two consumers, so it materializes once instead of the window's
+    // scan+sort running twice. The upsert and delete rows are disjoint (empty vs non-empty final
+    // holder set); `rows_affected` reports only the DELETE.
     let mut timer = PhaseTimer::new("confirm_worker_assignment:replay_confirmed_diffs");
-    let upserted = sqlx::query(
+    let res = sqlx::query(
         r#"
-        INSERT INTO sched_confirmed_chunk_workers (chunk_pk, worker_ids)
-        SELECT chunk_pk, worker_ids
-        FROM (
+        WITH final AS (
             SELECT DISTINCT ON (chunk_pk) chunk_pk, worker_ids
             FROM sched_worker_assignment_diffs
             WHERE worker_assignment_id > $1
               AND worker_assignment_id <= $2
             ORDER BY chunk_pk, worker_assignment_id DESC
-        ) final
-        WHERE cardinality(worker_ids) > 0
-        ON CONFLICT (chunk_pk) DO UPDATE SET worker_ids = EXCLUDED.worker_ids
-        "#,
-    )
-    .bind(prev)
-    .bind(assignment_id)
-    .execute(&mut **tx)
-    .await?;
-    timer.stmt(upserted.rows_affected());
-
-    let deleted = sqlx::query(
-        r#"
-        DELETE FROM sched_confirmed_chunk_workers
-        WHERE chunk_pk IN (
-            SELECT chunk_pk FROM (
-                SELECT DISTINCT ON (chunk_pk) chunk_pk, worker_ids
-                FROM sched_worker_assignment_diffs
-                WHERE worker_assignment_id > $1
-                  AND worker_assignment_id <= $2
-                ORDER BY chunk_pk, worker_assignment_id DESC
-            ) final
-            WHERE cardinality(worker_ids) = 0
+        ),
+        upsert AS (
+            INSERT INTO sched_confirmed_chunk_workers (chunk_pk, worker_ids)
+            SELECT chunk_pk, worker_ids FROM final
+            WHERE cardinality(worker_ids) > 0
+            ON CONFLICT (chunk_pk) DO UPDATE SET worker_ids = EXCLUDED.worker_ids
         )
+        DELETE FROM sched_confirmed_chunk_workers ccw
+        USING final
+        WHERE ccw.chunk_pk = final.chunk_pk
+          AND cardinality(final.worker_ids) = 0
         "#,
     )
     .bind(prev)
     .bind(assignment_id)
     .execute(&mut **tx)
     .await?;
-    timer.stmt(deleted.rows_affected());
+    timer.stmt(res.rows_affected());
     Ok(())
 }
 
@@ -132,15 +121,20 @@ pub(super) async fn drop_replayed_diffs(
 // run_visibility_cycle phases
 // ---------------------------------------------------------------------------
 
+/// Open the cycle's portal assignment. Recording the watermark is what activates drains
+/// (see the migration).
 pub(super) async fn open_portal_assignment(
     tx: &mut Transaction<'_, Postgres>,
     now: u64,
+    confirmed_up_to: AssignmentId,
 ) -> Result<AssignmentId> {
     let mut timer = PhaseTimer::new("run_visibility_cycle:open_portal_assignment");
     let id = sqlx::query_scalar(
-        "INSERT INTO sched_portal_assignments (created_at) VALUES ($1) RETURNING id",
+        "INSERT INTO sched_portal_assignments (created_at, confirmed_up_to) \
+         VALUES ($1, $2) RETURNING id",
     )
     .bind(tick_to_i64(now))
+    .bind(confirmed_up_to)
     .fetch_one(&mut **tx)
     .await
     .context("run_visibility_cycle: insert portal assignment")?;
@@ -244,12 +238,13 @@ pub(super) async fn apply_ready_corrections(
     Ok(())
 }
 
-/// Promote every eligible chunk to portal-visible in one UPDATE: confirmed by a worker assignment
-/// at/under the watermark, not yet visible, not dropped, not marked for removal, and not a pending
-/// correction's replacement (those promote via the correction path). No `rejected` check — rejected
-/// chunks never reach a worker assignment, so the first condition already excludes them. The
-/// non-overlap gate now lives in [`evict_portal_overlaps`], which settles overlaps in memory over the
-/// visible set we fetch anyway — so this neither fetches the candidates nor probes per chunk.
+/// Promote every chunk eligible at/under the confirmation watermark to portal-visible in one UPDATE
+/// Pending corrections' replacements are excluded — they promote via the
+/// correction path. `NOT rejected` is redundant for correctness (rejected chunks never reach a worker
+/// assignment) but the planner can't prove that; it's the conjunct that lets the UPDATE ride the
+/// `sched_chunk_metadata_promotable` partial index instead of seq-scanning the table every cycle. The
+/// non-overlap gate now lives in [`evict_portal_overlaps`], settling overlaps in memory over the
+/// visible set we already fetch — so this neither fetches candidates nor probes per chunk.
 pub(super) async fn promote_eligible_chunks(
     tx: &mut Transaction<'_, Postgres>,
     new_pa_id: AssignmentId,
@@ -259,7 +254,8 @@ pub(super) async fn promote_eligible_chunks(
     let res = sqlx::query(
         r#"
         UPDATE sched_chunk_metadata SET applied_at_portal_assignment_id = $1
-        WHERE applied_at_worker_assignment_id IS NOT NULL
+        WHERE NOT rejected
+          AND applied_at_worker_assignment_id IS NOT NULL
           AND applied_at_worker_assignment_id <= $2
           AND applied_at_portal_assignment_id IS NULL
           AND dropped_at_portal_assignment_id IS NULL
@@ -384,30 +380,6 @@ pub(super) async fn drop_marked_chunks(
     Ok(())
 }
 
-/// Activate drains: stamp pending stale mappings whose superseding worker
-/// assignment is now confirmed.
-pub(super) async fn activate_confirmed_drains(
-    tx: &mut Transaction<'_, Postgres>,
-    new_pa_id: AssignmentId,
-    confirmed_up_to: AssignmentId,
-) -> Result<()> {
-    let mut timer = PhaseTimer::new("run_visibility_cycle:activate_confirmed_drains");
-    let res = sqlx::query(
-        r#"
-        UPDATE sched_stale_mappings
-        SET dropped_at_portal_assignment_id = $1
-        WHERE dropped_at_portal_assignment_id IS NULL
-          AND superseded_at_worker_assignment_id <= $2
-        "#,
-    )
-    .bind(new_pa_id)
-    .bind(confirmed_up_to)
-    .execute(&mut **tx)
-    .await?;
-    timer.stmt(res.rows_affected());
-    Ok(())
-}
-
 /// Portal-visible = applied to a portal assignment and not dropped.
 pub(super) async fn fetch_portal_visible_chunks(
     conn: &mut PgConnection,
@@ -440,8 +412,7 @@ pub(super) async fn fetch_portal_visible_chunks(
 
 /// Confirmed routing for the portal-visible chunks. The visible set is re-derived server-side —
 /// the same predicate `fetch_portal_visible_chunks` reads and `evict_portal_overlaps` has already
-/// written its un-promotions to — instead of shipping the ~6M-pk array back as a parameter
-/// (~50 MB serialized and a server-side hash of every element, ~3x the join's cost).
+/// written its un-promotions.
 pub(super) async fn fetch_confirmed_routing(
     conn: &mut PgConnection,
 ) -> Result<BTreeMap<ChunkPk, Vec<WorkerPk>>> {

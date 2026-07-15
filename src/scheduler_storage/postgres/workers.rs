@@ -9,29 +9,53 @@ use crate::scheduler_storage::WorkerPk;
 
 use super::rows::tick_to_i64;
 
-/// Upsert the active workers: clear `inactive_since` and refresh `version`.
+/// Register the active workers: insert the unseen ones, reactivate and refresh the rest.
+///
+/// Two statements, not one `ON CONFLICT DO UPDATE`: Postgres evaluates the `id` sequence default
+/// before it detects the conflict, so an upsert burns an id per already-registered worker on every
+/// sync — enough to exhaust the 32-bit sequence within a year.
+///
+/// NOTE: the `NOT EXISTS` screen is not atomic — it leans on the single-scheduler advisory lock. A
+/// racing insert would still land correct (`DO NOTHING`, then the UPDATE reactivates it), at the
+/// cost of one id.
 pub(super) async fn upsert_active(
     tx: &mut Transaction<'_, Postgres>,
     peer_ids: &[String],
     versions: &[Option<String>],
 ) -> Result<()> {
-    // peer_ids must be unique within the batch or ON CONFLICT errors on a repeated row; the active
-    // set is keyed by PeerId upstream, so they are.
     let mut timer = PhaseTimer::new("update_worker_set:upsert_active");
     let res = sqlx::query(
         r#"
         INSERT INTO sched_workers (peer_id, version)
-        SELECT peer_id, version FROM UNNEST($1::text[], $2::text[]) AS w(peer_id, version)
-        ON CONFLICT (peer_id) DO UPDATE
-            SET inactive_since = NULL,
-                version = EXCLUDED.version
+        SELECT w.peer_id, w.version
+        FROM UNNEST($1::text[], $2::text[]) AS w(peer_id, version)
+        WHERE NOT EXISTS (SELECT 1 FROM sched_workers s WHERE s.peer_id = w.peer_id)
+        ON CONFLICT (peer_id) DO NOTHING
         "#,
     )
     .bind(peer_ids)
     .bind(versions)
     .execute(&mut **tx)
     .await
-    .context("update_worker_set: upsert")?;
+    .context("update_worker_set: insert new workers")?;
+    timer.stmt(res.rows_affected());
+
+    // Skipping rows already in the wanted state keeps a steady active set from rewriting every
+    // worker row each sync.
+    let res = sqlx::query(
+        r#"
+        UPDATE sched_workers s
+        SET inactive_since = NULL, version = w.version
+        FROM UNNEST($1::text[], $2::text[]) AS w(peer_id, version)
+        WHERE s.peer_id = w.peer_id
+          AND (s.inactive_since IS NOT NULL OR s.version IS DISTINCT FROM w.version)
+        "#,
+    )
+    .bind(peer_ids)
+    .bind(versions)
+    .execute(&mut **tx)
+    .await
+    .context("update_worker_set: reactivate returning workers")?;
     timer.stmt(res.rows_affected());
     Ok(())
 }

@@ -68,7 +68,7 @@ fn anchor_metadata_column(
         format!("UPDATE sched_chunk_metadata SET {metadata_column} = $2 WHERE chunk_pk = $1");
     storage
         .with_conn(async move |conn| {
-            let anchor_id: i64 = sqlx::query_scalar(insert_sql)
+            let anchor_id: i32 = sqlx::query_scalar(insert_sql)
                 .fetch_one(&mut *conn)
                 .await
                 .unwrap();
@@ -88,7 +88,7 @@ fn set_dropped_at_portal(storage: &mut PostgresStorage, chunk_pk: ChunkPk) {
     anchor_metadata_column(
         storage,
         chunk_pk,
-        "INSERT INTO sched_portal_assignments (created_at) VALUES (1) RETURNING id",
+        "INSERT INTO sched_portal_assignments (created_at, confirmed_up_to) VALUES (1, 0) RETURNING id",
         "dropped_at_portal_assignment_id",
     );
 }

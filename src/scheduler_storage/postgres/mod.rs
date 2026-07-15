@@ -314,10 +314,13 @@ impl SchedulerStorage for PostgresStorage {
             // Phase B — placement reconcile; rolls back on shortage, leaving Phase A committed.
             let mut tx = conn.begin().await.context("run_scheduling_cycle: begin")?;
 
-            // One streamed round-trip for the algorithm's inputs; build_worker_assignment
-            // re-fetches the (much smaller) placed subset itself.
-            let (chunks_for_algo, current_placement) =
-                phase::fetch_active_chunks_with_placement(&mut tx).await?;
+            // One streamed round-trip decoding the algorithm's inputs and the published chunk
+            // columns together, so the post-commit assignment build needn't re-read them.
+            let phase::ActiveChunks {
+                for_algo: chunks_for_algo,
+                current_placement,
+                published: published_chunks,
+            } = phase::fetch_active_chunks_with_placement(&mut tx).await?;
 
             let worker_rows = phase::fetch_workers(&mut tx).await?;
             let phase::DecodedWorkers {
@@ -343,14 +346,10 @@ impl SchedulerStorage for PostgresStorage {
                 out
             };
 
-            // Open the assignment the diffs and stamps below record under.
             let new_wa_id = phase::open_worker_assignment(&mut tx, now).await?;
 
-            // Stage the new ideal into the empty future twin (the only app-side marshalling left),
-            // then derive every per-cycle delta — stale mint, routing diffs, flip-flop resolution,
-            // entered stamps — and promote the twin, all as one simple-query round-trip joining the
-            // live ideal (prev) against the future ideal (new). The swap runs last in that batch, so
-            // the diffs still read the still-live prev ideal.
+            // Stage the new ideal into the future twin, then diff it against the live ideal to
+            // derive the cycle's deltas and swap the twins.
             phase::write_future_ideal(&mut tx, &ideal_mappings, batch_size).await?;
             phase::apply_deltas_and_swap(&mut tx, new_wa_id).await?;
 
@@ -359,8 +358,10 @@ impl SchedulerStorage for PostgresStorage {
             let wa = phase::build_worker_assignment(
                 conn,
                 new_wa_id,
-                &workers_map,
+                workers_map,
                 replication_by_weight,
+                ideal_mappings,
+                published_chunks,
             )
             .await?;
             Ok::<_, StorageError>(wa)
@@ -408,13 +409,13 @@ impl SchedulerStorage for PostgresStorage {
             let _timer = Timer::new("run_visibility_cycle");
             let mut tx = conn.begin().await.context("run_visibility_cycle: begin")?;
 
-            let new_pa_id = phase::open_portal_assignment(&mut tx, now).await?;
+            // Watermark read first so the portal assignment records it (activates drains).
             let confirmed_up_to = phase::confirmation_watermark(&mut tx).await?;
+            let new_pa_id = phase::open_portal_assignment(&mut tx, now, confirmed_up_to).await?;
 
             phase::apply_ready_corrections(&mut tx, new_pa_id, confirmed_up_to, now).await?;
             phase::promote_eligible_chunks(&mut tx, new_pa_id, confirmed_up_to).await?;
             phase::drop_marked_chunks(&mut tx, new_pa_id).await?;
-            phase::activate_confirmed_drains(&mut tx, new_pa_id, confirmed_up_to).await?;
 
             tx.commit().await.context("run_visibility_cycle: commit")?;
 

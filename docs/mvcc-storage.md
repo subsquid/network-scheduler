@@ -22,7 +22,7 @@ The two streams are non-1:1, so each has its **own monotonic id sequence**
 kinds** — ordering is used only within a kind (e.g. the confirmation watermark over worker ids),
 and cross-kind links are always explicit foreign-key references (e.g. a drain anchored on the
 portal assignment that dropped a pair). The schema does not *enforce* the no-cross-kind-compare
-rule — both sequences are `BIGSERIAL` from 1, so the same numeric value can exist in both — but it
+rule — both sequences are `SERIAL` from 1, so the same numeric value can exist in both — but it
 makes the distinction structural and visible: every referencing column targets exactly one of the
 two id tables, so a mix-up is caught at code-review time, not by the engine.
 
@@ -56,7 +56,8 @@ two id tables, so a mix-up is caught at code-review time, not by the engine.
    - **Whole-chunk removal** (backfill/compaction): the chunk is dropped (gate A) and all its
      pairs leave together. Anchored on `sched_chunk_metadata.dropped_at_portal_assignment_id`.
    - **Single-pair removal** (reshuffle): one pair leaves the confirmed routing (gate B) while
-     the chunk stays visible. Anchored on `sched_stale_mappings.dropped_at_portal_assignment_id`.
+     the chunk stays visible. Anchor derived: the first portal assignment whose `confirmed_up_to`
+     covers the pair's `superseded_at_worker_assignment_id`.
 
 5. **A correction's drop and promote are one atomic swap.** When a correction replaces a chunk,
    the portal assignment must never contain both the original and the replacement at once. The
@@ -295,8 +296,8 @@ worker-side tables. It deliberately does **not** read the confirmed portal routi
 
 Because a stale row is minted the instant a pair leaves the ideal, `ideal ∪ stale` is always a
 **superset of the confirmed portal routing**, so the worker side never needs to consult the
-portal view. The drain anchor mirrors `sched_chunk_metadata.dropped_at_portal_assignment_id`
-exactly — one timing rule, two granularities (Invariant 4).
+portal view. The drain follows the same timing rule as the chunk-level drop (Invariant 4), with a
+derived rather than stored anchor.
 
 ### Per-cycle logic
 
@@ -311,16 +312,16 @@ anything.
 1. **Compute the ideal** (hash ring, replication factors, current worker set) — in memory.
 2. **Diff-and-patch `sched_ideal_chunk_workers`.** For each pair the ideal **removes** — for a
    chunk not being removed at the chunk level (gate A handles those) — insert a **pending**
-   `sched_stale_mappings` row (`superseded_at_worker_assignment_id = $new_worker_assignment_id`,
-   `dropped_at_portal_assignment_id = NULL`) if one does not exist. This mints even for chunks not
+   `sched_stale_mappings` row (`superseded_at_worker_assignment_id = $new_worker_assignment_id`)
+   if one does not exist. This mints even for chunks not
    yet portal-visible: a confirmed-but-not-promoted chunk can still have a pair dropped, and the
    row is what keeps `ideal ∪ stale` a superset of the confirmed routing.
 3. **Resolve flip-flops.** If a later ideal re-adds the pair, delete its stale row — the removal
    resolved itself.
-4. **Expire holdovers.** Delete any draining row whose `dropped_at_portal_assignment_id`
-   references a portal assignment older than M ticks; the worker drops it off the published
-   assignment automatically. The whole-chunk equivalent (tombstone a chunk whose portal-drop is ≥
-   M ticks old) runs here too.
+4. **Expire holdovers.** Delete rows at/under the newest `confirmed_up_to` among portal
+   assignments older than M ticks — exactly those whose derived drain anchor aged out; the worker
+   drops them off the published assignment automatically. The whole-chunk equivalent (tombstone a
+   chunk whose portal-drop is ≥ M ticks old) runs here too.
 
 **Confirmation** (a separate operation, when the caller reports a new watermark): replay the
 newly-confirmed worker-assignment diffs into `sched_confirmed_chunk_workers` — one mechanism both
@@ -329,9 +330,9 @@ what advances the confirmed routing portals read; it is **not** part of the visi
 
 **Visibility cycle** (starts the drain):
 
-5. **Start drains.** For each pending stale row whose `superseded_at_worker_assignment_id <=` the
-   confirmation watermark — i.e. whose removal the replay has already applied — stamp
-   `dropped_at_portal_assignment_id = $new_portal_assignment_id` to start the M-tick drain.
+5. **Drains start implicitly.** The cycle's portal-assignment row records the watermark it saw
+   (`confirmed_up_to`); every pending stale row at/under it — i.e. whose removal the replay has
+   already applied — is draining from this assignment on.
 
 When a chunk is removed entirely via the chunk-level mechanism (`dropped_from_worker_assignment_at`
 set — gate A), its stale rows and ideal row go too; the whole-chunk removal supersedes any per-pair
@@ -354,9 +355,9 @@ Three properties keep the scheme sound under repeated oscillation:
   ideal or stale. The stale row is deleted only when the ideal re-adds the pair, i.e. only once
   the ideal itself guarantees retention, so the worker is never instructed to delete data while
   portals may still route to it.
-- **Monotonic drain anchor.** Each re-mint anchors `dropped_at_portal_assignment_id` on the
-  current (strictly later) portal assignment, so the M-tick drain window only ever moves forward —
-  no stale-snapshot portal is under-served.
+- **Monotonic drain anchor.** Each re-mint carries the current (strictly later) worker assignment
+  id, so the derived drain anchor only ever moves forward — no stale-snapshot portal is
+  under-served.
 
 ### Capacity accounting
 

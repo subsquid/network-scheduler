@@ -37,11 +37,17 @@ impl StorageInspect for InMemoryStorage {
         self.sched_stale_mappings
             .iter()
             .filter_map(|((pk, worker_id), mapping)| {
+                // Derived drain anchor: first covering portal assignment.
+                let dropped_at_portal_assignment_id = self
+                    .sched_portal_assignments
+                    .iter()
+                    .find(|(_, e)| e.confirmed_up_to >= mapping.superseded_at_worker_assignment_id)
+                    .map(|(id, _)| *id);
                 let view = StaleMappingView {
                     chunk_pk: *pk,
                     worker_id: *worker_id,
                     superseded_at_worker_assignment_id: mapping.superseded_at_worker_assignment_id,
-                    dropped_at_portal_assignment_id: mapping.dropped_at_portal_assignment_id,
+                    dropped_at_portal_assignment_id,
                 };
                 filter(&view).then_some(view)
             })
@@ -116,7 +122,7 @@ impl StorageInspect for InMemoryStorage {
     }
 
     fn get_portal_assignment_created_at(&self, id: u64) -> Option<Tick> {
-        self.sched_portal_assignments.get(&id).copied()
+        self.sched_portal_assignments.get(&id).map(|e| e.created_at)
     }
 
     fn get_worker_assignment_confirmation(&self) -> u64 {

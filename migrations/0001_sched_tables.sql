@@ -63,19 +63,22 @@ CREATE INDEX IF NOT EXISTS chunks_dataset_range_gist ON chunks USING gist (
 
 -- One row per scheduling cycle.
 CREATE TABLE IF NOT EXISTS sched_worker_assignments (
-    id                BIGSERIAL   PRIMARY KEY,
+    id                SERIAL PRIMARY KEY,
     created_at        BIGINT NOT NULL,
     scheduler_version TEXT
 );
 
--- One row per visibility cycle. created_at anchors the M-tick drain window.
+-- One row per visibility cycle. created_at anchors the M-tick drain window; confirmed_up_to is
+-- the worker-assignment confirmation watermark the cycle saw (drain derivation: see
+-- sched_stale_mappings).
 CREATE TABLE IF NOT EXISTS sched_portal_assignments (
-    id         BIGSERIAL   PRIMARY KEY,
-    created_at BIGINT NOT NULL
+    id               SERIAL PRIMARY KEY,
+    created_at       BIGINT NOT NULL,
+    confirmed_up_to  INT    NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS sched_workers (
-    id             BIGSERIAL   PRIMARY KEY,
+    id             SERIAL      PRIMARY KEY,
     peer_id        TEXT        NOT NULL UNIQUE,
     version        TEXT,               -- semver e.g. '2.8.0'; NULL = unknown
     inactive_since BIGINT              -- NULL = currently active
@@ -83,68 +86,81 @@ CREATE TABLE IF NOT EXISTS sched_workers (
 
 -- Highest worker assignment confirmed by workers.
 CREATE TABLE IF NOT EXISTS sched_worker_confirmations (
-    assignment_id  BIGINT      PRIMARY KEY REFERENCES sched_worker_assignments(id),
+    assignment_id  INT    PRIMARY KEY REFERENCES sched_worker_assignments(id),
     confirmed_at   BIGINT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS sched_chunk_metadata (
     chunk_pk                        BIGINT PRIMARY KEY REFERENCES chunks(chunk_pk),
-    applied_at_worker_assignment_id BIGINT REFERENCES sched_worker_assignments(id),
-    applied_at_portal_assignment_id BIGINT REFERENCES sched_portal_assignments(id),
-    marked_for_removal              BIGINT,
+    applied_at_worker_assignment_id INT    REFERENCES sched_worker_assignments(id),
+    applied_at_portal_assignment_id INT    REFERENCES sched_portal_assignments(id),
+    marked_for_removal              BIGINT,  -- a tick, not an id: stays 64-bit
     -- True if the chunk was rejected at registration for overlapping a live chunk in its dataset;
     -- such a chunk is never scheduled or reconsidered. (A bool, not a tick: registration has no
     -- clock.)
     rejected                        BOOLEAN NOT NULL DEFAULT FALSE,
-    dropped_at_portal_assignment_id BIGINT REFERENCES sched_portal_assignments(id),
+    dropped_at_portal_assignment_id INT    REFERENCES sched_portal_assignments(id),
     -- Tick at which the chunk was tombstoned (pulled from the worker layer), m_ticks after its
     -- portal drop. NULL = not tombstoned.
     dropped_from_worker_assignment_at BIGINT
 );
 
 -- What the scheduler currently wants; published worker assignment = this ∪ sched_stale_mappings.
+-- No chunks FK, same as the twin below: the cycle re-stages the whole ideal via COPY, and an FK
+-- would cost a per-row check on every staged row. Integrity comes from sched_worker_assignment_diffs
+-- instead — a pk new to the ideal always differs from the live ideal, so the same cycle transaction
+-- diffs it into that table, whose chunks FK validates it once per pk. The parent side never fires;
+-- chunks rows are never deleted (sched_chunk_metadata's FK pins them).
 CREATE TABLE IF NOT EXISTS sched_ideal_chunk_workers (
-    chunk_pk    BIGINT   PRIMARY KEY REFERENCES chunks(chunk_pk),
-    worker_ids  BIGINT[] NOT NULL
+    chunk_pk    BIGINT PRIMARY KEY,
+    worker_ids  INT[]  NOT NULL
 );
 
 -- Twin of sched_ideal_chunk_workers. run_scheduling_cycle stages the freshly computed ideal here,
 -- derives the per-cycle stale/diff/flip-flop deltas by set-joining the live ideal against it
--- (server-side, no app-side diffing), then rename-swaps the two tables. The swap leaves this table
--- empty and sched_ideal_chunk_workers holding the new placement, ready for the next cycle.
---
--- Structure must stay identical to sched_ideal_chunk_workers: after a swap this table *is* the old
--- ideal (and vice versa), so both need the same PK + chunks FK to remain a valid drop-in.
+-- (server-side, no app-side diffing), then rename-swaps the two tables. Structure must stay identical
+-- to sched_ideal_chunk_workers: after a swap this table *is* the old ideal (and vice versa), so both
+-- need the same bare PK to remain a valid drop-in.
 CREATE TABLE IF NOT EXISTS sched_future_ideal_chunk_workers (
-    chunk_pk    BIGINT   PRIMARY KEY, -- deliberately do not reference chunks
-    worker_ids  BIGINT[] NOT NULL
+    chunk_pk    BIGINT PRIMARY KEY,
+    worker_ids  INT[]  NOT NULL
 );
 
 -- What portals route by; lags the ideal until the confirmation watermark advances.
 CREATE TABLE IF NOT EXISTS sched_confirmed_chunk_workers (
-    chunk_pk    BIGINT   PRIMARY KEY, -- deliberately do not reference chunks
-    worker_ids  BIGINT[] NOT NULL
+    chunk_pk    BIGINT PRIMARY KEY, -- deliberately do not reference chunks
+    worker_ids  INT[]  NOT NULL
 );
 
 -- Per-cycle routing deltas waiting to be replayed into sched_confirmed_chunk_workers.
 CREATE TABLE IF NOT EXISTS sched_worker_assignment_diffs (
-    worker_assignment_id  BIGINT   NOT NULL REFERENCES sched_worker_assignments(id),
-    chunk_pk              BIGINT   NOT NULL REFERENCES chunks(chunk_pk),
-    worker_ids            BIGINT[] NOT NULL,  -- empty array = remove from confirmed routing
+    worker_assignment_id  INT    NOT NULL REFERENCES sched_worker_assignments(id),
+    chunk_pk              BIGINT NOT NULL REFERENCES chunks(chunk_pk),
+    worker_ids            INT[]  NOT NULL,  -- empty array = remove from confirmed routing
     PRIMARY KEY (worker_assignment_id, chunk_pk)
 );
 
--- Grace-period holdovers for (chunk, worker) pairs removed from the ideal.
+-- Grace-period holdovers for (chunk, worker) pairs removed from the ideal; draining (not stored)
+-- once a portal assignment's confirmed_up_to covers superseded_at_worker_assignment_id.
 CREATE TABLE IF NOT EXISTS sched_stale_mappings (
     chunk_pk                            BIGINT NOT NULL REFERENCES chunks(chunk_pk),
-    worker_id                           BIGINT NOT NULL REFERENCES sched_workers(id),
-    superseded_at_worker_assignment_id  BIGINT NOT NULL REFERENCES sched_worker_assignments(id),
-    dropped_at_portal_assignment_id     BIGINT REFERENCES sched_portal_assignments(id),
+    worker_id                           INT    NOT NULL REFERENCES sched_workers(id),
+    superseded_at_worker_assignment_id  INT    NOT NULL REFERENCES sched_worker_assignments(id),
     PRIMARY KEY (chunk_pk, worker_id)
 );
 
 CREATE INDEX IF NOT EXISTS sched_stale_mappings_worker_id
     ON sched_stale_mappings (worker_id);
+
+-- Serves the expiry delete's watermark-cutoff range.
+CREATE INDEX IF NOT EXISTS sched_stale_mappings_superseded
+    ON sched_stale_mappings (superseded_at_worker_assignment_id);
+
+-- Reshuffles mint and expire millions of stale rows at once; reclaim dead tuples promptly.
+ALTER TABLE sched_stale_mappings SET (
+    autovacuum_vacuum_scale_factor = 0.02,
+    autovacuum_vacuum_cost_delay = 0
+);
 
 CREATE INDEX IF NOT EXISTS sched_chunk_metadata_portal_drop
     ON sched_chunk_metadata (dropped_at_portal_assignment_id)
@@ -165,12 +181,10 @@ CREATE INDEX IF NOT EXISTS sched_chunk_metadata_tombstoned
     ON sched_chunk_metadata (dropped_from_worker_assignment_at)
     WHERE dropped_from_worker_assignment_at IS NOT NULL;
 
--- Serves the promotion gate (visibility cycle): chunks confirmed by a worker assignment, not yet
--- portal-visible, not dropped, not marked for removal, not rejected. The partial predicate keeps it
--- to the small promotable frontier rather than the whole table. `NOT rejected` excludes
--- registration-rejected rows: they never get an applied_at_worker_assignment_id (so the query already
--- skips them via IS NOT NULL), but they do satisfy the other partial conditions — without this they'd
--- sit in the index as dead NULL-key entries.
+-- Serves the promotion gate (visibility cycle): the small frontier of chunks confirmed by a worker
+-- assignment but not yet portal-visible. `NOT rejected` is the non-obvious term — rejected rows never
+-- get an applied_at_worker_assignment_id so the query already skips them, but they satisfy the other
+-- predicates, and without it they'd sit in the index as dead NULL-key entries.
 CREATE INDEX IF NOT EXISTS sched_chunk_metadata_promotable
     ON sched_chunk_metadata (applied_at_worker_assignment_id)
     WHERE NOT rejected
@@ -178,13 +192,21 @@ CREATE INDEX IF NOT EXISTS sched_chunk_metadata_promotable
       AND dropped_at_portal_assignment_id IS NULL
       AND marked_for_removal IS NULL;
 
+-- The scheduling cycle stamps applied_at_worker_assignment_id onto chunks new to the ideal. The
+-- stamp is first-touch (never reset), so the unapplied set is the new-chunk frontier plus the
+-- never-placed/rejected residue — without this index the stamp joins the full future ideal
+-- against metadata every cycle to change a few thousand rows.
+CREATE INDEX IF NOT EXISTS sched_chunk_metadata_unapplied
+    ON sched_chunk_metadata (chunk_pk)
+    WHERE applied_at_worker_assignment_id IS NULL;
+
 -- 1-to-1 chunk swap mechanism; applied_at_portal_assignment_id NULL = pending.
 CREATE TABLE chunk_corrections (
     old_chunk_pk                    BIGINT   PRIMARY KEY REFERENCES chunks(chunk_pk),
     new_chunk_pk                    BIGINT   NOT NULL    REFERENCES chunks(chunk_pk),
     dataset_id                      SMALLINT NOT NULL    REFERENCES datasets(id),
-    created_at                      BIGINT   NOT NULL,
-    applied_at_portal_assignment_id BIGINT   REFERENCES sched_portal_assignments(id),
+    created_at                      BIGINT   NOT NULL,  -- a tick, not an id: stays 64-bit
+    applied_at_portal_assignment_id INT      REFERENCES sched_portal_assignments(id),
     CHECK (old_chunk_pk <> new_chunk_pk)
 );
 

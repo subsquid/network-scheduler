@@ -334,7 +334,7 @@ mod tests {
             .enumerate()
             .map(|(i, id)| {
                 (
-                    WorkerPk(i as i64 + 1),
+                    WorkerPk(i as i32 + 1),
                     Worker {
                         id: *id,
                         status: WorkerStatus::Online,
@@ -378,7 +378,7 @@ mod tests {
             .enumerate()
             .map(|(i, id)| {
                 (
-                    WorkerPk(i as i64 + 1),
+                    WorkerPk(i as i32 + 1),
                     Worker {
                         id,
                         status: WorkerStatus::Online,

@@ -223,7 +223,6 @@ fn update_worker_set_cleans_stale_mappings_for_departed() {
         (ChunkPk(1), worker_id),
         StaleMapping {
             superseded_at_worker_assignment_id: 1,
-            dropped_at_portal_assignment_id: None,
         },
     );
 
@@ -242,9 +241,13 @@ fn setup_for_tombstone(portal_drop_tick: TimeUnit) -> (InMemoryStorage, ChunkPk)
     let pk = storage.pk_of(&chunk);
 
     let portal_aid = 7;
-    storage
-        .sched_portal_assignments
-        .insert(portal_aid, portal_drop_tick);
+    storage.sched_portal_assignments.insert(
+        portal_aid,
+        PortalAssignmentEntry {
+            created_at: portal_drop_tick,
+            confirmed_up_to: 0,
+        },
+    );
     storage.sched_chunk_metadata.insert(
         pk,
         SchedulerChunkMetadata {
@@ -309,7 +312,6 @@ fn tombstone_clears_stale_mappings_for_chunk() {
     let (mut storage, pk) = setup_for_tombstone(100);
     let pending = |w_aid: u64| StaleMapping {
         superseded_at_worker_assignment_id: w_aid,
-        dropped_at_portal_assignment_id: None,
     };
     storage
         .sched_stale_mappings
@@ -403,7 +405,6 @@ fn build_worker_assignment_unions_ideal_and_stale() {
         (pk_1, WorkerPk(99)),
         StaleMapping {
             superseded_at_worker_assignment_id: 1,
-            dropped_at_portal_assignment_id: None,
         },
     ); // grace-period holdover
 
@@ -557,9 +558,8 @@ fn run_visibility_cycle_uses_ideal_not_stale() {
     storage.sched_stale_mappings.insert(
         (pk, WorkerPk(99)),
         StaleMapping {
-            // > watermark: stays pending so activation doesn't drain it
+            // > watermark: stays pending, never drains
             superseded_at_worker_assignment_id: 999,
-            dropped_at_portal_assignment_id: None,
         },
     );
 
