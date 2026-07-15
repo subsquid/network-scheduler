@@ -127,6 +127,14 @@ pub(super) fn published_coverage(
 /// `worker_assignment` is a cache only refreshed on a successful scheduling cycle, so during a
 /// shortage streak it can lag behind the freshly-regenerated `bundle` — a lagging chunk's schema
 /// may have already been legitimately GC'd from the bundle, which is not a resolution failure.
+///
+/// FIXME: the exclusion masks a real production hazard rather than a benign lag. During a shortage
+/// streak the published worker assignment stays frozen while the bundle keeps advancing, so a
+/// worker that joins mid-streak downloads that frozen assignment and then cannot resolve the
+/// GC'd schema of a still-named (removing) chunk — the exact failure this oracle exists to catch.
+/// Fix: don't advance the schema bundle when a cycle hits `Shortage`; keep it in lockstep with the
+/// worker assignment that clients actually consume, so a schema is never GC'd while an assignment
+/// still references its chunk. Once that holds, this exclusion can drop.
 pub(super) fn schema_bundle_consistency(
     bundle: &SchemaBundle,
     worker_assignment: Option<&WorkerAssignment>,

@@ -897,6 +897,11 @@ impl<D: SimStorage> SimUnderTest<D> {
                 Some(id)
             }
             Err(StorageError::Shortage) => {
+                // FIXME: on a shortage the published worker assignment stays frozen while the
+                // schema bundle keeps advancing, so a worker joining mid-streak downloads the
+                // frozen assignment and can't resolve the GC'd schema of a still-named (removing)
+                // chunk. Fix: don't advance the schema bundle on `Shortage` — keep it in lockstep
+                // with the worker assignment clients consume. See `schema_bundle_consistency`.
                 self.schedule_status = ScheduleStatus::NotEnoughCapacity;
                 self.is_infeasible = true;
                 None
