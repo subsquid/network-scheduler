@@ -64,6 +64,15 @@ fn dataset_names(config: &cli::Config) -> Vec<Arc<String>> {
         .collect_vec()
 }
 
+/// The lowest absolute block that can ever be scheduled for a dataset, used to skip
+/// loading chunks below it. `None` when the first segment's offset is relative to the
+/// head (negative), which can't be resolved to an absolute block before listing.
+fn min_scheduled_block(config: &cli::Config, dataset: &str) -> Option<u64> {
+    let bucket = dataset.strip_prefix("s3://")?;
+    let from = config.datasets.get(bucket)?.first()?.from;
+    (from >= 0).then_some(from as u64)
+}
+
 impl WithWorkers {
     pub async fn load_known_chunks(
         self,
@@ -158,9 +167,10 @@ impl WithChunks {
             .iter()
             .map(|dataset| {
                 let last = self.chunks.get(dataset).and_then(|chunks| chunks.last());
-                (dataset.clone(), last)
+                let from_block = min_scheduled_block(&self.config, dataset);
+                (dataset.clone(), last, from_block)
             })
-            .collect::<BTreeMap<_, _>>();
+            .collect::<Vec<_>>();
 
         let new_chunks = datasets_storage
             .load_newer_chunks(
