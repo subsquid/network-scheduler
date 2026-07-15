@@ -11,7 +11,8 @@ use crate::scheduler_storage::postgres::PostgresStorage;
 use crate::scheduler_storage::test_harness::inspect::StorageInspect;
 use crate::scheduler_storage::test_harness::utils::{StaticSchedulingAlgorithm, dataset, worker};
 use crate::scheduler_storage::{
-    ChunkPk, SchedulerStorage, SchemaId, StorageError, WorkerAssignment, WorkerPk,
+    BundleId, ChunkPk, SchedulerStorage, SchemaBundle, SchemaId, StorageError, WorkerAssignment,
+    WorkerPk,
 };
 use crate::types::{DatasetSchema, TableSchema};
 
@@ -145,6 +146,43 @@ fn chunk_tables_present_is_returned_with_schema_id() {
         chunk.tables_present,
         Some(bit_vec::BitVec::from_fn(3, |i| i != 1)),
         "and the presence bitmap the worker will interpret"
+    );
+}
+
+/// `active_schema_bundle` (the DB predicate) holds exactly the in-play schemas: a worker-held
+/// (then portal-served) chunk's schema is included, an unplaced chunk's is excluded, and the id is
+/// content-addressed over that set.
+#[test]
+fn active_schema_bundle_holds_only_in_play_schemas() {
+    let mut storage = fresh_storage("active_bundle");
+    storage
+        .insert_new_datasets(vec![
+            (dataset("a"), schema_with_tables(&["blocks"])),
+            (dataset("b"), schema_with_tables(&["logs"])),
+        ])
+        .expect("insert datasets");
+    let a_pk = register_chunk(&mut storage, "a", 1, 100);
+    let _b_pk = register_chunk(&mut storage, "b", 1, 100);
+    let a_schema = current_schema_id(&mut storage, dataset("a"));
+    let workers = one_worker(&mut storage);
+
+    // Place only "a"; "b" stays registered but unplaced (in no worker or portal assignment).
+    let wa = schedule(&mut storage, &[a_pk], &workers, 100);
+    let bundle = SchemaBundle::generate(&storage).unwrap();
+    // Whole-bundle content: exactly a's schema decoded from jsonb; b's is excluded, unplaced.
+    assert_eq!(
+        bundle.schemas(),
+        &BTreeMap::from([(a_schema, schema_with_tables(&["blocks"]))]),
+    );
+    assert_eq!(bundle.id(), BundleId::from_schema_ids([a_schema]));
+
+    // Promote "a" to the portal — still in play, so the set is unchanged.
+    storage.confirm_worker_assignment(wa.id, 100).unwrap();
+    storage.run_visibility_cycle(150).unwrap();
+    assert_eq!(
+        SchemaBundle::generate(&storage).unwrap().id(),
+        bundle.id(),
+        "portal-served keeps the same in-play schema set",
     );
 }
 

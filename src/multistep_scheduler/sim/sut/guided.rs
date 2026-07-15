@@ -8,6 +8,7 @@ use proptest::strategy::Union;
 
 use super::super::utils::{
     SimProfile, add_random_chunks, advance_clock, default_sim_config, register_correction,
+    set_dataset_schema,
 };
 use super::{
     Action, ConvergenceCheck, SimConfig, SimStorage, SimUnderTest, standard_preconditions,
@@ -84,6 +85,7 @@ impl<D: SimStorage + SimProfile> IterativeModelStateMachine for SimModel<D> {
             let weight = if floor == 1 { 5 } else { 1 };
             choices.push((weight, Just(Action::SetMinReplication(floor + 1)).boxed()));
         }
+        choices.push((1, set_dataset_schema(&config.datasets)));
         choices.extend(super::super::utils::fetch_choices(sut));
         Union::new_weighted(choices).boxed()
     }

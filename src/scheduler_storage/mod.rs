@@ -51,6 +51,8 @@ pub use ids::{ChunkPk, DatasetPk, SchemaId, WorkerPk};
 #[cfg(test)]
 pub(crate) mod in_memory;
 pub mod postgres;
+pub mod schema_bundle;
+pub use schema_bundle::{BundleId, SchemaBundle};
 
 #[cfg(any(test, feature = "pg-testkit"))]
 pub mod test_harness;
@@ -212,6 +214,11 @@ pub trait SchedulerStorage {
         &self,
         schema_ids: Option<&[SchemaId]>,
     ) -> Result<BTreeMap<SchemaId, DatasetSchema>, StorageError>;
+
+    /// Schemas of every chunk currently in play — held by workers or served by the portal (see
+    /// [`SchemaBundle`]). One round-trip; independent of the published `WorkerAssignment`/
+    /// `PortalAssignment`, which can lag or fail on their own.
+    fn active_schema_bundle(&self) -> Result<BTreeMap<SchemaId, DatasetSchema>, StorageError>;
 
     /// Register new chunk replacemet for an old chunk. New chunk must have the same block range as
     /// the old chunk. Also enabled by `pg-testkit` for offline tools (reshuffle-sim).

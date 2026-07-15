@@ -340,6 +340,58 @@ fn ideal_mapping<'a>(
     entries.into_iter().map(|(pk, ids)| (*pk, ids)).collect()
 }
 
+/// The bundle holds exactly the in-play schemas, with their payloads: a placed (then portal-served)
+/// chunk's schema is included, an unplaced chunk's is not, and the id is content-addressed over it.
+#[test]
+fn schema_bundle_holds_only_in_play_schemas() {
+    use crate::scheduler_storage::{BundleId, SchemaBundle};
+    use crate::types::{DatasetSchema, TableSchema};
+
+    let one_table =
+        |t: &str| DatasetSchema::new(BTreeMap::from([(t.to_owned(), TableSchema::default())]));
+    let schema_a = one_table("blocks");
+
+    // Distinct per-dataset schemas so the assertions check the bundle's content, not just its keys.
+    // (Trait method, qualified: the inherent `insert_new_datasets` takes schema-less names.)
+    let mut storage = InMemoryStorage::default();
+    SchedulerStorage::insert_new_datasets(
+        &mut storage,
+        vec![
+            (dataset("a"), schema_a.clone()),
+            (dataset("b"), one_table("logs")),
+        ],
+    )
+    .unwrap();
+    let a = chunk("a", 1, 100);
+    let b = chunk("b", 1, 100);
+    storage
+        .insert_new_chunks(vec![a.clone(), b.clone()])
+        .unwrap();
+    let a_pk = storage.pk_of(&a);
+    storage
+        .update_worker_set(&[worker(1, None)], 0, 1000)
+        .unwrap();
+    let w1 = workers(&storage)[0].worker_id;
+
+    // Place only "a"; "b" stays unplaced (in no worker or portal assignment).
+    let wa = run_cycle(&mut storage, &a_pk, vec![w1], CYCLE_INTERVAL);
+    let a_schema = wa.chunks.get(&a_pk).unwrap().schema_id;
+
+    let bundle = SchemaBundle::generate(&storage).unwrap();
+    assert_eq!(bundle.schemas(), &BTreeMap::from([(a_schema, schema_a)]));
+    assert_eq!(bundle.id(), BundleId::from_schema_ids([a_schema]));
+
+    // Promote "a" to the portal — still in play, so the bundle is unchanged.
+    storage
+        .confirm_worker_assignment(wa.id, CYCLE_INTERVAL)
+        .unwrap();
+    let portal = storage
+        .run_visibility_cycle(CYCLE_INTERVAL + DELTA)
+        .unwrap();
+    assert!(portal.chunk_workers.contains_key(&a_pk));
+    assert_eq!(SchemaBundle::generate(&storage).unwrap().id(), bundle.id());
+}
+
 /// Order-insensitive view of `chunk_workers` for literal comparison. Panics on
 /// duplicate worker ids, which the set conversion would otherwise hide.
 fn as_sets(

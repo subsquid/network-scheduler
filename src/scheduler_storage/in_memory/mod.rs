@@ -760,8 +760,8 @@ impl SchedulerStorage for InMemoryStorage {
 
     fn load_schemas(
         &self,
-        schema_ids: Option<&[crate::scheduler_storage::SchemaId]>,
-    ) -> Result<BTreeMap<crate::scheduler_storage::SchemaId, DatasetSchema>, StorageError> {
+        schema_ids: Option<&[SchemaId]>,
+    ) -> Result<BTreeMap<SchemaId, DatasetSchema>, StorageError> {
         Ok(match schema_ids {
             None => self
                 .schemas
@@ -773,6 +773,31 @@ impl SchedulerStorage for InMemoryStorage {
                 .filter_map(|id| self.schemas.get(id).cloned().map(|schema| (*id, schema)))
                 .collect(),
         })
+    }
+
+    fn active_schema_bundle(&self) -> Result<BTreeMap<SchemaId, DatasetSchema>, StorageError> {
+        let mut ids: BTreeSet<SchemaId> = BTreeSet::new();
+        // Worker-held: a live placement on a still-servable chunk.
+        for pk in self.current_placement().keys() {
+            let servable = self
+                .sched_chunk_metadata
+                .get(pk)
+                .is_none_or(|m| m.worker_servable());
+            if servable && let Some(chunk) = self.chunks.get(pk) {
+                ids.insert(chunk.schema_id);
+            }
+        }
+        for (pk, meta) in &self.sched_chunk_metadata {
+            if meta.portal_visible()
+                && let Some(chunk) = self.chunks.get(pk)
+            {
+                ids.insert(chunk.schema_id);
+            }
+        }
+        Ok(ids
+            .into_iter()
+            .filter_map(|id| self.schemas.get(&id).map(|s| (id, s.clone())))
+            .collect())
     }
 
     fn insert_new_chunks(&mut self, chunks: Vec<NewChunk>) -> Result<(), StorageError> {

@@ -303,6 +303,7 @@ pub(super) fn action_label(action: &Action) -> String {
         Action::SetMinReplication(min_replication) => {
             format!("SetMinReplication({min_replication})")
         }
+        Action::SetDatasetSchema { dataset, .. } => format!("SetDatasetSchema({dataset})"),
         Action::NoOp => "NoOp".to_string(),
     }
 }

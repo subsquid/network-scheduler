@@ -19,7 +19,9 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use crate::scheduler_storage::test_harness::inspect::Snapshot;
-use crate::scheduler_storage::{ChunkPk, PortalAssignment, Tick, WorkerAssignment, WorkerPk};
+use crate::scheduler_storage::{
+    ChunkPk, PortalAssignment, SchemaBundle, Tick, WorkerAssignment, WorkerPk,
+};
 
 /// Every chunk the portal routes must be held by at least one of its routed workers — by what the
 /// worker actually downloaded (`holds`), not the published assignment (that superset is
@@ -109,6 +111,44 @@ pub(super) fn published_coverage(
                      chunk {chunk:?} to active worker {w:?}, but the worker assignment \
                      (ideal ∪ stale) no longer includes that pair — the worker may delete data \
                      portals still route to",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Every chunk a published assignment names must resolve under a freshly-generated
+/// [`SchemaBundle`]: the schema it was stamped with at insert
+/// (`WorkerAssignmentChunk::schema_id`) must still be present in the bundle, or a worker/portal
+/// couldn't derive the chunk's file set. Either assignment may be absent (nothing published yet).
+///
+/// `excluded` (the SUT's `chunks_excluded_from_floor`) skips chunks already shedding:
+/// `worker_assignment` is a cache only refreshed on a successful scheduling cycle, so during a
+/// shortage streak it can lag behind the freshly-regenerated `bundle` — a lagging chunk's schema
+/// may have already been legitimately GC'd from the bundle, which is not a resolution failure.
+pub(super) fn schema_bundle_consistency(
+    bundle: &SchemaBundle,
+    worker_assignment: Option<&WorkerAssignment>,
+    portal_assignment: Option<&PortalAssignment>,
+    excluded: &BTreeSet<ChunkPk>,
+) -> Result<(), String> {
+    let sources = [
+        ("worker assignment", worker_assignment.map(|a| &a.chunks)),
+        ("portal assignment", portal_assignment.map(|a| &a.chunks)),
+    ];
+    for (label, chunks) in sources {
+        let Some(chunks) = chunks else { continue };
+        for (chunk_pk, chunk) in chunks {
+            if excluded.contains(chunk_pk) {
+                continue;
+            }
+            if !bundle.contains(chunk.schema_id) {
+                return Err(format!(
+                    "{label} names chunk {chunk_pk:?} with schema {}, absent from a \
+                     freshly-generated schema bundle — a worker or portal couldn't resolve this \
+                     chunk's file set",
+                    chunk.schema_id,
                 ));
             }
         }

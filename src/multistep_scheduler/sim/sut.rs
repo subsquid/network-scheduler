@@ -14,15 +14,16 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use super::super::SchedulingConfig;
 use super::utils::{
-    CHUNK_SIZE, CLOCK_STEP, DATASETS, GC_TICKS, M_TICKS, WEIGHTS, WORKER_CAPACITY, WeightTable,
-    chunk_from_view, mint_key, record_weights, sim_datasets, storage_chunk, trace_enabled,
+    CHUNK_SIZE, CLOCK_STEP, DATASETS, GC_TICKS, M_TICKS, SCHEMA_POOL, WEIGHTS, WORKER_CAPACITY,
+    WeightTable, chunk_from_view, mint_key, record_weights, sim_datasets, storage_chunk,
+    trace_enabled,
 };
 use crate::scheduler_storage::algorithm::{CurrentPlacement, SchedulingAlgorithm};
 use crate::scheduler_storage::in_memory::InMemoryStorage;
 use crate::scheduler_storage::test_harness::inspect::{Snapshot as RawSnapshot, StorageInspect};
 use crate::scheduler_storage::{
-    AlgoChunk, AssignmentId, ChunkPk, PortalAssignment, SchedulerStorage, StorageError, Tick,
-    WorkerAssignment, WorkerPk,
+    AlgoChunk, AssignmentId, ChunkPk, PortalAssignment, SchedulerStorage, SchemaBundle,
+    StorageError, Tick, WorkerAssignment, WorkerPk,
 };
 use crate::types::{DatasetSchema, Worker, WorkerStatus};
 use crate::weight::WeightStrategy;
@@ -197,6 +198,13 @@ pub(super) enum Action {
     /// lowering is the recovery lever the random walks pull after a confirmed shortage. The floor
     /// lives in the variant so captured regressions replay without a seed.
     SetMinReplication(u16),
+    /// Set `dataset`'s current read schema, drawn from a small canned pool
+    /// ([`SCHEMA_POOL`](super::utils::SCHEMA_POOL)). Only affects chunks inserted afterwards —
+    /// exercises the schema-bundle consistency invariant as schemas change mid-run.
+    SetDatasetSchema {
+        dataset: String,
+        schema: DatasetSchema,
+    },
     /// Do nothing — the idle tail after the run completes.
     NoOp,
 }
@@ -214,6 +222,7 @@ fn action_kind(action: &Action) -> &'static str {
         Action::PortalFetchAssignment { .. } => "action: portal-fetch",
         Action::RegisterCorrection { .. } => "action: register-correction",
         Action::SetMinReplication(_) => "action: set-min-replication",
+        Action::SetDatasetSchema { .. } => "action: set-dataset-schema",
         Action::NoOp => "action: no-op (idle tail)",
     }
 }
@@ -487,6 +496,18 @@ impl<D: SimStorage> SimUnderTest<D> {
             (std::cmp::Ordering::Equal, _) => "floor: unchanged",
         });
         self.trace_step(&format!("SetMinReplication({min_replication})"));
+    }
+
+    /// Retune `dataset`'s current read schema and reschedule. Only chunks inserted afterwards are
+    /// stamped with it — existing chunks keep the schema they were inserted under (see
+    /// [`SchedulerStorage::set_dataset_schema`]).
+    pub(super) fn do_set_dataset_schema(&mut self, dataset: &str, schema: DatasetSchema) {
+        self.storage
+            .set_dataset_schema(dataset, schema)
+            .expect("dataset is pre-registered by the sim config");
+        self.run_cycle();
+        statistics::label("schema: dataset schema changed");
+        self.trace_step(&format!("SetDatasetSchema({dataset})"));
     }
 
     /// Standard addition flow (record weights → insert → register), shared by adds and test
@@ -919,6 +940,10 @@ impl<D: SimStorage> SimUnderTest<D> {
     fn publish_portal_assignment(&mut self, assignment: PortalAssignment) {
         // Must run before we overwrite the previous assignment it compares against.
         self.assert_visibility_monotonicity(&assignment);
+        // Wired here (not separately inside `run_cycle`) so the schema-bundle invariant is
+        // checked after every visibility cycle in the harness, including the convergence-draining
+        // loop, from one call site.
+        self.assert_schema_bundle_consistency();
         self.latest_portal_watermark =
             self.storage.get_worker_assignment_confirmation() as AssignmentId;
         self.latest_portal_assignment = Some(assignment);
@@ -1096,6 +1121,21 @@ impl<D: SimStorage> SimUnderTest<D> {
         }
     }
 
+    /// Every chunk the latest worker/portal assignments name must resolve under a
+    /// freshly-generated [`SchemaBundle`]. Both are optional — either may not have been published
+    /// yet this early in the run.
+    fn assert_schema_bundle_consistency(&self) {
+        let bundle = SchemaBundle::generate(&self.storage).expect("schema bundle generates");
+        if let Err(message) = placement_oracles::schema_bundle_consistency(
+            &bundle,
+            self.latest_worker_assignment.as_ref(),
+            self.latest_portal_assignment.as_ref(),
+            &self.chunks_excluded_from_floor(),
+        ) {
+            panic!("{message}");
+        }
+    }
+
     // ---- Observation layer (fleet + portal) -------------------------------------------------
 
     /// Per-transition state telemetry — what regime the walk is in. No-op outside a proptest case.
@@ -1260,6 +1300,9 @@ impl<D: SimStorage> SimUnderTest<D> {
             }
             Action::SetMinReplication(min_replication) => {
                 self.do_set_min_replication(min_replication);
+            }
+            Action::SetDatasetSchema { dataset, schema } => {
+                self.do_set_dataset_schema(&dataset, schema);
             }
             Action::NoOp => {}
         }

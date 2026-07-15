@@ -248,6 +248,16 @@ impl SchedulerStorage for PostgresStorage {
         })
     }
 
+    fn active_schema_bundle(
+        &self,
+    ) -> Result<BTreeMap<crate::scheduler_storage::SchemaId, DatasetSchema>, StorageError> {
+        self.with_conn_ref(async move |conn| {
+            schema::active_schema_bundle(conn)
+                .await
+                .map_err(StorageError::from)
+        })
+    }
+
     fn insert_new_chunks(&mut self, chunks: Vec<NewChunk>) -> Result<(), StorageError> {
         let batch_size = self.batch_size;
         self.with_conn(async move |conn| {

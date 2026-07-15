@@ -278,6 +278,34 @@ fn dropping_min_replication_frees_capacity_for_more_chunks() {
     sim.check_converged(ConvergenceCheck::FloorLocallyFeasible);
 }
 
+/// A dataset's schema can change mid-run — new chunks land under the new schema, existing chunks
+/// keep the one they were stamped with — without breaking the schema-bundle consistency invariant
+/// `assert_schema_bundle_consistency` checks on every visibility cycle.
+#[test]
+fn schema_change_mid_run_keeps_schema_bundle_consistent() {
+    let mut sim = SimUnderTest::new();
+    let base = sim.total_chunk_count() as u64;
+    assert_eq!(
+        sim.do_add_chunks(uniform_chunks(base, 3)),
+        AddOutcome::AllPlaced,
+        "setup: the initial burst must place cleanly"
+    );
+
+    sim.do_set_dataset_schema(DATASETS[0], SCHEMA_POOL[1].clone());
+
+    // Chunks added after the schema change must still place cleanly and pass every per-cycle
+    // safety check (including the schema-bundle oracle) without panicking.
+    let base = sim.total_chunk_count() as u64;
+    assert_eq!(
+        sim.do_add_chunks(uniform_chunks(base, 3)),
+        AddOutcome::AllPlaced,
+        "chunks added after a schema change must still place cleanly"
+    );
+
+    // Drains to a fixed point, exercising the oracle again from `drain_to_fixed_point`.
+    sim.check_converged(ConvergenceCheck::FloorLocallyFeasible);
+}
+
 /// A successful WorkerFetch replaces a worker's holdings with exactly its slice of the latest
 /// published assignment.
 #[test]

@@ -70,6 +70,37 @@ pub(super) async fn load_schemas(
     Ok(rows.into_iter().map(|(id, json)| (id, json.0)).collect())
 }
 
+/// Schemas of chunks placed on a worker at some point and not yet tombstoned. Portal-served chunks
+/// are already covered: portal promotion requires prior worker placement, and tombstoning requires
+/// a prior portal drop. A per-schema existence probe (`LATERAL` + `LIMIT 1` over the
+/// `chunks_schema_id` index) lets the planner stop at the first live chunk per schema.
+///
+/// Approximate on purpose: a chunk that already drained off every worker still counts until
+/// `dropped_from_worker_assignment_at` is stamped, which only ever widens the bundle, never
+/// narrows it.
+pub(super) async fn active_schema_bundle(
+    conn: &mut PgConnection,
+) -> Result<std::collections::BTreeMap<SchemaId, DatasetSchema>> {
+    let mut timer = crate::metrics::PhaseTimer::new("active_schema_bundle");
+    let rows: Vec<(SchemaId, sqlx::types::Json<DatasetSchema>)> = sqlx::query_as(
+        "SELECT s.id, s.schema FROM schemas s WHERE EXISTS ( \
+             SELECT 1 FROM chunks c, LATERAL ( \
+                 SELECT 1 FROM sched_chunk_metadata m \
+                 WHERE m.chunk_pk = c.chunk_pk \
+                   AND m.applied_at_worker_assignment_id IS NOT NULL \
+                   AND m.dropped_from_worker_assignment_at IS NULL \
+                 LIMIT 1 \
+             ) hit \
+             WHERE c.schema_id = s.id \
+         )",
+    )
+    .fetch_all(conn)
+    .await
+    .context("active_schema_bundle")?;
+    timer.stmt(rows.len() as u64);
+    Ok(rows.into_iter().map(|(id, json)| (id, json.0)).collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
