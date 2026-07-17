@@ -34,6 +34,7 @@ fn run_cycle_multi(
     storage
         .run_scheduling_cycle(&algorithm, &(), at, GRACE_PERIOD)
         .expect("scheduling succeeds")
+        .0
 }
 
 // ---------------------------------------------------------------------------

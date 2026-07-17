@@ -1,5 +1,5 @@
 use libp2p_identity::PeerId;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ops::RangeInclusive;
 use std::sync::Arc;
 
@@ -138,6 +138,12 @@ pub struct WorkerAssignment {
     pub replication_by_weight: BTreeMap<u16, u16>,
 }
 
+impl WorkerAssignment {
+    pub(crate) fn schema_ids(&self) -> BTreeSet<SchemaId> {
+        self.chunks.values().map(|chunk| chunk.schema_id).collect()
+    }
+}
+
 /// The published portal assignment: confirmed routing for portal-visible chunks.
 #[derive(Debug, Clone)]
 pub struct PortalAssignment {
@@ -166,14 +172,17 @@ pub trait SchedulerStorage {
 
     /// Run one full scheduling cycle: tombstone expired chunks, expire stale
     /// mappings, run `algorithm` in-process, diff + commit results.
-    /// Returns the published WorkerAssignment (ideal ∪ stale).
+    ///
+    /// Returns the published `WorkerAssignment` (ideal ∪ stale) with the [`SchemaBundle`] frozen
+    /// with it — the schemas its chunks reference — so the two stay paired. On `Shortage` neither
+    /// advances.
     fn run_scheduling_cycle<Algo>(
         &mut self,
         algorithm: &Algo,
         config: &Algo::Config,
         now: Tick,
         m_ticks: u64,
-    ) -> Result<WorkerAssignment, StorageError>
+    ) -> Result<(WorkerAssignment, SchemaBundle), StorageError>
     where
         Algo: crate::scheduler_storage::algorithm::SchedulingAlgorithm + Send + Sync;
 

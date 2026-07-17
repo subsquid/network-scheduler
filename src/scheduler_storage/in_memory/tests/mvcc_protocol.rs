@@ -36,7 +36,7 @@ fn chunk_migration_through_grace_period() {
     let cycle_1 = StaticSchedulingAlgorithm {
         mapping: ideal_mapping([(chunk_pk, vec![w1])]),
     };
-    let worker_assignment_1 = storage
+    let (worker_assignment_1, _) = storage
         .run_scheduling_cycle(&cycle_1, &(), cycle_1_at, GRACE_PERIOD)
         .expect("scheduling succeeds");
 
@@ -61,7 +61,7 @@ fn chunk_migration_through_grace_period() {
     let cycle_2 = StaticSchedulingAlgorithm {
         mapping: ideal_mapping([(chunk_pk, vec![w2])]),
     };
-    let worker_assignment_2 = storage
+    let (worker_assignment_2, _) = storage
         .run_scheduling_cycle(&cycle_2, &(), cycle_2_at, GRACE_PERIOD)
         .expect("scheduling succeeds");
     assert_eq!(
@@ -92,7 +92,7 @@ fn chunk_migration_through_grace_period() {
     let cycle_3 = StaticSchedulingAlgorithm {
         mapping: ideal_mapping([(chunk_pk, vec![w2])]),
     };
-    let worker_assignment_3 = storage
+    let (worker_assignment_3, _) = storage
         .run_scheduling_cycle(&cycle_3, &(), cycle_3_at, GRACE_PERIOD)
         .expect("scheduling succeeds");
     assert_eq!(
@@ -123,7 +123,7 @@ fn chunk_migration_through_grace_period() {
     let cycle_4 = StaticSchedulingAlgorithm {
         mapping: ideal_mapping([(chunk_pk, vec![w2])]),
     };
-    let worker_assignment_4 = storage
+    let (worker_assignment_4, _) = storage
         .run_scheduling_cycle(&cycle_4, &(), cycle_4_at, GRACE_PERIOD)
         .expect("scheduling succeeds");
     assert_eq!(
@@ -332,6 +332,7 @@ fn run_cycle(
     storage
         .run_scheduling_cycle(&algorithm, &(), at, GRACE_PERIOD)
         .expect("scheduling succeeds")
+        .0
 }
 
 fn ideal_mapping<'a>(
@@ -390,6 +391,79 @@ fn schema_bundle_holds_only_in_play_schemas() {
         .unwrap();
     assert!(portal.chunk_workers.contains_key(&a_pk));
     assert_eq!(SchemaBundle::generate(&storage).unwrap().id(), bundle.id());
+}
+
+/// Retirement rides the chunk tombstone clock: a chunk dropped from the portal stays
+/// worker-servable — and its schema stays in the bundle — through the M-tick drain window, then
+/// leaves when it tombstones. This is what lets `schema_bundle_consistency` drop its exclusion.
+#[test]
+fn schema_bundle_retains_removing_chunk_until_tombstone() {
+    use crate::scheduler_storage::SchemaBundle;
+
+    let Setup {
+        mut storage,
+        worker_ids,
+        chunk_pks,
+    } = setup(1, 1);
+    let chunk_pk = &chunk_pks[0];
+    let w1 = worker_ids[0];
+
+    // Place, confirm, promote to the portal.
+    let (wa, _) = storage
+        .run_scheduling_cycle(
+            &StaticSchedulingAlgorithm {
+                mapping: ideal_mapping([(chunk_pk, vec![w1])]),
+            },
+            &(),
+            CYCLE_INTERVAL,
+            GRACE_PERIOD,
+        )
+        .expect("scheduling succeeds");
+    let schema_id = wa.chunks.get(chunk_pk).unwrap().schema_id;
+    storage
+        .confirm_worker_assignment(wa.id, CYCLE_INTERVAL)
+        .unwrap();
+    storage
+        .run_visibility_cycle(CYCLE_INTERVAL + DELTA)
+        .unwrap();
+    assert!(
+        SchemaBundle::generate(&storage)
+            .unwrap()
+            .contains(schema_id),
+        "placed and promoted: schema is in the bundle",
+    );
+
+    // Mark for removal and drop it from the portal (dropped_at_portal stamped at `drop_at`).
+    let drop_at = 2 * CYCLE_INTERVAL;
+    storage.mark_for_removal(*chunk_pk, drop_at).unwrap();
+    let portal = storage.run_visibility_cycle(drop_at).unwrap();
+    assert!(
+        portal.chunk_workers.is_empty(),
+        "removing: dropped from the portal",
+    );
+    assert!(
+        SchemaBundle::generate(&storage)
+            .unwrap()
+            .contains(schema_id),
+        "removing but pre-tombstone: worker still serves it, so its schema stays in the bundle",
+    );
+
+    // Past M ticks after the portal drop, a scheduling cycle tombstones it — the schema retires,
+    // and the bundle returned from that cycle no longer carries it.
+    let (_wa2, bundle) = storage
+        .run_scheduling_cycle(
+            &StaticSchedulingAlgorithm {
+                mapping: ideal_mapping([]),
+            },
+            &(),
+            drop_at + GRACE_PERIOD + 1,
+            GRACE_PERIOD,
+        )
+        .expect("scheduling succeeds");
+    assert!(
+        !bundle.contains(schema_id),
+        "tombstoned: schema leaves the bundle",
+    );
 }
 
 /// Order-insensitive view of `chunk_workers` for literal comparison. Panics on

@@ -318,6 +318,9 @@ pub(super) struct SimUnderTest<D: SimStorage> {
     /// Latest published worker assignment (what a `WorkerFetch` samples); `None` until the first
     /// scheduling cycle.
     latest_worker_assignment: Option<WorkerAssignment>,
+    /// Bundle frozen with `latest_worker_assignment`; both stay frozen together across a shortage
+    /// streak, so the oracle checks the assignment against the bundle it shipped with.
+    latest_worker_bundle: Option<SchemaBundle>,
     /// Latest published portal assignment (what a `PortalFetch` samples).
     latest_portal_assignment: Option<PortalAssignment>,
     /// Confirmation watermark at the latest portal assignment's publication — the consistency
@@ -886,7 +889,7 @@ impl<D: SimStorage> SimUnderTest<D> {
             .storage
             .run_scheduling_cycle(&self.algo, &self.config, self.now, M_TICKS)
         {
-            Ok(assignment) => {
+            Ok((assignment, bundle)) => {
                 self.schedule_status = ScheduleStatus::SchedulerPlaced;
                 self.is_infeasible = false;
                 // A successful schedule ends a saturation episode — re-arm the latch so the walk
@@ -894,14 +897,11 @@ impl<D: SimStorage> SimUnderTest<D> {
                 self.converge_checked = false;
                 let id = assignment.id;
                 self.latest_worker_assignment = Some(assignment);
+                // Freeze with the assignment; on a shortage (below) neither is reassigned.
+                self.latest_worker_bundle = Some(bundle);
                 Some(id)
             }
             Err(StorageError::Shortage) => {
-                // FIXME: on a shortage the published worker assignment stays frozen while the
-                // schema bundle keeps advancing, so a worker joining mid-streak downloads the
-                // frozen assignment and can't resolve the GC'd schema of a still-named (removing)
-                // chunk. Fix: don't advance the schema bundle on `Shortage` — keep it in lockstep
-                // with the worker assignment clients consume. See `schema_bundle_consistency`.
                 self.schedule_status = ScheduleStatus::NotEnoughCapacity;
                 self.is_infeasible = true;
                 None
@@ -1126,16 +1126,16 @@ impl<D: SimStorage> SimUnderTest<D> {
         }
     }
 
-    /// Every chunk the latest worker/portal assignments name must resolve under a
-    /// freshly-generated [`SchemaBundle`]. Both are optional — either may not have been published
-    /// yet this early in the run.
+    /// Every chunk the latest worker/portal assignments name must resolve under the frozen
+    /// `latest_worker_bundle`. `None` until the first successful cycle — nothing to check.
     fn assert_schema_bundle_consistency(&self) {
-        let bundle = SchemaBundle::generate(&self.storage).expect("schema bundle generates");
+        let Some(bundle) = self.latest_worker_bundle.as_ref() else {
+            return;
+        };
         if let Err(message) = placement_oracles::schema_bundle_consistency(
-            &bundle,
+            bundle,
             self.latest_worker_assignment.as_ref(),
             self.latest_portal_assignment.as_ref(),
-            &self.chunks_excluded_from_floor(),
         ) {
             panic!("{message}");
         }
@@ -1378,6 +1378,7 @@ impl<D: SimStorage> SimUnderTest<D> {
             workers_state: WorkerFleet::default(),
             portal_state: Portal::default(),
             latest_worker_assignment: None,
+            latest_worker_bundle: None,
             latest_portal_assignment: None,
             latest_portal_watermark: 0,
             confirm_threshold_pct: config.confirm_threshold_pct,

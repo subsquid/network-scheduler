@@ -118,28 +118,13 @@ pub(super) fn published_coverage(
     Ok(())
 }
 
-/// Every chunk a published assignment names must resolve under a freshly-generated
-/// [`SchemaBundle`]: the schema it was stamped with at insert
-/// (`WorkerAssignmentChunk::schema_id`) must still be present in the bundle, or a worker/portal
-/// couldn't derive the chunk's file set. Either assignment may be absent (nothing published yet).
-///
-/// `excluded` (the SUT's `chunks_excluded_from_floor`) skips chunks already shedding:
-/// `worker_assignment` is a cache only refreshed on a successful scheduling cycle, so during a
-/// shortage streak it can lag behind the freshly-regenerated `bundle` — a lagging chunk's schema
-/// may have already been legitimately GC'd from the bundle, which is not a resolution failure.
-///
-/// FIXME: the exclusion masks a real production hazard rather than a benign lag. During a shortage
-/// streak the published worker assignment stays frozen while the bundle keeps advancing, so a
-/// worker that joins mid-streak downloads that frozen assignment and then cannot resolve the
-/// GC'd schema of a still-named (removing) chunk — the exact failure this oracle exists to catch.
-/// Fix: don't advance the schema bundle when a cycle hits `Shortage`; keep it in lockstep with the
-/// worker assignment that clients actually consume, so a schema is never GC'd while an assignment
-/// still references its chunk. Once that holds, this exclusion can drop.
+/// Every chunk a published assignment names must resolve under the [`SchemaBundle`] frozen with
+/// that worker assignment: the chunk's pinned `schema_id` must be in the bundle, or a worker/portal
+/// couldn't derive its file set. Either assignment may be absent (nothing published yet).
 pub(super) fn schema_bundle_consistency(
     bundle: &SchemaBundle,
     worker_assignment: Option<&WorkerAssignment>,
     portal_assignment: Option<&PortalAssignment>,
-    excluded: &BTreeSet<ChunkPk>,
 ) -> Result<(), String> {
     let sources = [
         ("worker assignment", worker_assignment.map(|a| &a.chunks)),
@@ -148,14 +133,11 @@ pub(super) fn schema_bundle_consistency(
     for (label, chunks) in sources {
         let Some(chunks) = chunks else { continue };
         for (chunk_pk, chunk) in chunks {
-            if excluded.contains(chunk_pk) {
-                continue;
-            }
             if !bundle.contains(chunk.schema_id) {
                 return Err(format!(
-                    "{label} names chunk {chunk_pk:?} with schema {}, absent from a \
-                     freshly-generated schema bundle — a worker or portal couldn't resolve this \
-                     chunk's file set",
+                    "{label} names chunk {chunk_pk:?} with schema {}, absent from the schema \
+                     bundle frozen with the worker assignment — a worker or portal couldn't \
+                     resolve this chunk's file set",
                     chunk.schema_id,
                 ));
             }

@@ -1,11 +1,14 @@
-//! The dataset schemas of every chunk currently in play, with a content [`BundleId`] clients use
-//! to detect changes. A per-cycle, DB-level snapshot ([`SchedulerStorage::active_schema_bundle`]).
+//! The dataset schemas the chunks of a worker assignment reference, with a content [`BundleId`]
+//! clients can use to detect changes. Built from the assignment's own chunks and frozen with it —
+//! the two stay paired.
 
 use std::collections::BTreeMap;
 
 use sha2::{Digest, Sha256};
 
-use super::{SchedulerStorage, SchemaId, StorageError, WorkerAssignmentChunk};
+#[cfg(test)]
+use super::{SchedulerStorage, StorageError};
+use super::{SchemaId, WorkerAssignmentChunk};
 use crate::types::DatasetSchema;
 
 /// Content id of a [`SchemaBundle`]: SHA-256 over its sorted `schema_id`s. Ids are content-deduped
@@ -62,11 +65,17 @@ pub struct SchemaBundle {
 }
 
 impl SchemaBundle {
-    /// Load the in-play schemas (one round-trip) and stamp the content id.
-    pub fn generate(storage: &impl SchedulerStorage) -> Result<Self, StorageError> {
-        let schemas = storage.active_schema_bundle()?;
+    /// Wrap the assignment's schemas and stamp the content id.
+    pub(crate) fn from_schemas(schemas: BTreeMap<SchemaId, DatasetSchema>) -> Self {
         let id = BundleId::from_schema_ids(schemas.keys().copied());
-        Ok(Self { id, schemas })
+        Self { id, schemas }
+    }
+
+    /// Snapshot of the in-play schemas for tests; production uses the bundle returned from
+    /// `run_scheduling_cycle`.
+    #[cfg(test)]
+    pub(crate) fn generate(storage: &impl SchedulerStorage) -> Result<Self, StorageError> {
+        Ok(Self::from_schemas(storage.active_schema_bundle()?))
     }
 
     pub fn id(&self) -> BundleId {
@@ -137,8 +146,7 @@ mod tests {
             .iter()
             .map(|(id, s)| (SchemaId(*id), s.clone()))
             .collect();
-        let id = BundleId::from_schema_ids(schemas.keys().copied());
-        SchemaBundle { id, schemas }
+        SchemaBundle::from_schemas(schemas)
     }
 
     fn chunk(schema_id: i32, tables_present: Option<bit_vec::BitVec>) -> WorkerAssignmentChunk {

@@ -5,8 +5,8 @@
 use crate::scheduler_storage::algorithm::{CurrentPlacement, ScheduleOutput, SchedulingAlgorithm};
 use crate::scheduler_storage::{
     AlgoChunk, AssignmentId, AssignmentWorker, ChunkPk, NewChunk, PortalAssignment,
-    SchedulerStorage, SchemaId, StorageError, Tick, WorkerAssignment, WorkerAssignmentChunk,
-    WorkerPk,
+    SchedulerStorage, SchemaBundle, SchemaId, StorageError, Tick, WorkerAssignment,
+    WorkerAssignmentChunk, WorkerPk,
 };
 use crate::types::{BlockNumber, DatasetSchema, Worker, WorkerStatus};
 use anyhow::{Context, Result};
@@ -776,19 +776,13 @@ impl SchedulerStorage for InMemoryStorage {
     }
 
     fn active_schema_bundle(&self) -> Result<BTreeMap<SchemaId, DatasetSchema>, StorageError> {
+        // Every worker-servable chunk's schema: entered a worker assignment, not yet tombstoned —
+        // the postgres predicate verbatim. Deriving from `current_placement` instead would drop a
+        // chunk reshuffled out of the ideal but still served through its drain window.
         let mut ids: BTreeSet<SchemaId> = BTreeSet::new();
-        // Worker-held: a live placement on a still-servable chunk.
-        for pk in self.current_placement().keys() {
-            let servable = self
-                .sched_chunk_metadata
-                .get(pk)
-                .is_none_or(|m| m.worker_servable());
-            if servable && let Some(chunk) = self.chunks.get(pk) {
-                ids.insert(chunk.schema_id);
-            }
-        }
         for (pk, meta) in &self.sched_chunk_metadata {
-            if meta.portal_visible()
+            if meta.entered_worker_assignment()
+                && !meta.tombstoned()
                 && let Some(chunk) = self.chunks.get(pk)
             {
                 ids.insert(chunk.schema_id);
@@ -889,7 +883,7 @@ impl SchedulerStorage for InMemoryStorage {
         config: &Algo::Config,
         now: Tick,
         m_ticks: u64,
-    ) -> Result<WorkerAssignment, StorageError>
+    ) -> Result<(WorkerAssignment, SchemaBundle), StorageError>
     where
         Algo: SchedulingAlgorithm + Send + Sync,
     {
@@ -970,7 +964,14 @@ impl SchedulerStorage for InMemoryStorage {
             }
         }
 
-        Ok(assignment)
+        // Bundle from the assignment's own chunks — consistent by construction, no storage scan.
+        let schemas: BTreeMap<SchemaId, DatasetSchema> = assignment
+            .schema_ids()
+            .into_iter()
+            .filter_map(|id| self.schemas.get(&id).map(|schema| (id, schema.clone())))
+            .collect();
+        let bundle = SchemaBundle::from_schemas(schemas);
+        Ok((assignment, bundle))
     }
 
     /// Record that workers have confirmed up to this assignment: advances the

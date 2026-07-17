@@ -14,8 +14,8 @@ use network_scheduler::{
     cli::{Config, DatasetsConfig},
     multistep_scheduler::SchedulingConfig as MultistepConfig,
     scheduler_storage::{
-        AssignmentId, ChunkPk, NewChunk, SchedulerStorage, SchemaBundle, StorageError,
-        WorkerAssignment, WorkerAssignmentChunk, WorkerPk,
+        AssignmentId, ChunkPk, NewChunk, SchedulerStorage, StorageError, WorkerAssignment,
+        WorkerAssignmentChunk, WorkerPk,
         algorithm::MultistepAlgorithm,
         postgres::PostgresStorage,
         test_harness::pg_harness::{self, PgData},
@@ -238,7 +238,7 @@ impl MultistepScheduler {
             self.clock,
             M_TICKS,
         ) {
-            Ok(assignment) => assignment,
+            Ok((assignment, _bundle)) => assignment,
             Err(StorageError::Shortage) => {
                 return Ok(CycleResult::Shortage(
                     "scheduling shortage: worker capacity cannot satisfy all replication floors \
@@ -261,13 +261,6 @@ impl MultistepScheduler {
             .storage
             .confirm_worker_assignment(watermark, self.clock)?;
         let portal = self.backend.storage.run_visibility_cycle(self.clock)?;
-
-        // Validate: every chunk this cycle handed to workers or the portal must be decodable
-        // under a schema the active bundle carries. A miss means a chunk was stamped with (or
-        // kept referencing) a schema that `SchemaBundle::generate` no longer bundles.
-        let bundle = SchemaBundle::generate(&self.backend.storage)?;
-        check_schema_bundle_covers("worker assignment", &bundle, &assignment.chunks)?;
-        check_schema_bundle_covers("portal assignment", &bundle, &portal.chunks)?;
 
         Ok(CycleResult::Scheduled {
             assignment,
@@ -619,27 +612,6 @@ fn to_storage_chunk(chunk: Chunk) -> NewChunk {
         schema_id: None,
         tables_present: None,
     }
-}
-
-/// Every chunk in `chunks` must be decodable under a schema in `bundle` (see
-/// `SchemaBundle::contains`); `label` names which assignment (`worker`/`portal`) is being checked,
-/// for the error message.
-fn check_schema_bundle_covers(
-    label: &str,
-    bundle: &SchemaBundle,
-    chunks: &BTreeMap<ChunkPk, WorkerAssignmentChunk>,
-) -> anyhow::Result<()> {
-    for (chunk_pk, chunk) in chunks {
-        if !bundle.contains(chunk.schema_id) {
-            return Err(anyhow!(
-                "{label}: chunk {chunk_pk:?} (dataset {}) references schema {:?}, which is not \
-                 in the active schema bundle",
-                chunk.dataset,
-                chunk.schema_id
-            ));
-        }
-    }
-    Ok(())
 }
 
 #[cfg(test)]

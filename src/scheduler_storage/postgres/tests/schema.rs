@@ -109,6 +109,7 @@ fn schedule(
     storage
         .run_scheduling_cycle(&algorithm, &(), at, 60)
         .expect("scheduling succeeds")
+        .0
 }
 
 fn one_worker(storage: &mut PostgresStorage) -> Vec<WorkerPk> {
