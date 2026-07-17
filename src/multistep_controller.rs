@@ -159,6 +159,8 @@ fn register_chunks(
     Ok(())
 }
 
+/// This path's clock: a tick is one wall-clock unix second (elsewhere, e.g. the sim, it's an
+/// abstract counter), which is why the drain-window and worker-GC durations convert via `as_secs`.
 fn now_ticks() -> Tick {
     SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
