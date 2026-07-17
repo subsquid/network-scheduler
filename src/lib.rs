@@ -5,6 +5,8 @@ pub mod controller;
 pub mod dataset_data_storage;
 pub mod metrics;
 #[cfg(feature = "mvcc-chunks")]
+pub mod multistep_controller;
+#[cfg(feature = "mvcc-chunks")]
 pub mod multistep_scheduler;
 pub mod parquet;
 pub mod pool;

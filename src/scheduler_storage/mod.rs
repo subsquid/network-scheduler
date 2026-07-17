@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use std::ops::RangeInclusive;
 use std::sync::Arc;
 
-use crate::types::{BlockNumber, DatasetSchema, Worker};
+use crate::types::{BlockNumber, ChunkId, DatasetId, DatasetSchema, Worker};
 use crate::weight::SchedulingChunk;
 
 /// Logical integer timestamp; the caller supplies the clock (test ticks, or a monotonic clock
@@ -47,7 +47,7 @@ impl From<anyhow::Error> for StorageError {
 
 pub mod algorithm;
 pub mod ids;
-pub use ids::{ChunkPk, DatasetId, SchemaId, WorkerPk};
+pub use ids::{ChunkPk, DatasetPk, SchemaId, WorkerPk};
 #[cfg(test)]
 pub(crate) mod in_memory;
 pub mod postgres;
@@ -58,8 +58,8 @@ pub mod test_harness;
 /// The scheduling algorithms' input view of a chunk.
 #[derive(Debug, Clone, PartialEq)]
 pub struct AlgoChunk {
-    pub dataset: Arc<String>,
-    pub id: Arc<String>,
+    pub dataset: DatasetId,
+    pub id: ChunkId,
     pub size: u32,
     pub blocks: RangeInclusive<BlockNumber>,
 }
@@ -82,8 +82,8 @@ impl SchedulingChunk for AlgoChunk {
 /// A chunk to insert ([`SchedulerStorage::insert_new_chunks`] / corrections).
 #[derive(Debug, Clone, PartialEq)]
 pub struct NewChunk {
-    pub dataset: Arc<String>,
-    pub id: Arc<String>,
+    pub dataset: DatasetId,
+    pub id: ChunkId,
     pub size: u32,
     pub blocks: RangeInclusive<BlockNumber>,
     /// `None` = stamp with the dataset's current schema.
@@ -96,8 +96,8 @@ pub struct NewChunk {
 /// (`schema_id` + `tables_present`) at assignment construction.
 #[derive(Debug, Clone, PartialEq)]
 pub struct WorkerAssignmentChunk {
-    pub dataset: Arc<String>,
-    pub id: Arc<String>,
+    pub dataset: DatasetId,
+    pub id: ChunkId,
     pub size: u32,
     pub blocks: RangeInclusive<BlockNumber>,
     /// The schema the chunk was written under (stamped at insert).

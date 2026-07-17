@@ -1,6 +1,6 @@
 use std::{collections::BTreeMap, str::FromStr, sync::Arc, time::Duration};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clickhouse::{Client, Row};
 use itertools::Itertools;
 use semver::Version;
@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use tracing::instrument;
 
 use crate::{
-    cli::ClickhouseArgs,
+    cli::{ClickhouseArgs, Config},
     pool,
     types::{Chunk, ChunkSummary, Worker, WorkerStatus},
 };
@@ -112,6 +112,18 @@ impl ClickhouseClient {
 
         crate::metrics::report_workers(&results);
         Ok(results)
+    }
+
+    /// Active worker set, taking the thresholds from `config`. Shared by the ordinary and
+    /// multistep paths.
+    pub async fn active_workers(&self, config: &Config) -> Result<Vec<Worker>> {
+        self.get_active_workers(
+            config.worker_inactive_timeout,
+            config.worker_stale_bytes,
+            &config.min_supported_worker_version,
+        )
+        .await
+        .context("Can't read active workers from ClickHouse")
     }
 
     #[instrument(skip_all)]

@@ -5,13 +5,13 @@ use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
 use sqlx::{Postgres, Transaction, postgres::PgConnection};
 
-use crate::scheduler_storage::{DatasetId, SchemaId};
+use crate::scheduler_storage::{DatasetPk, SchemaId};
 use crate::types::DatasetSchema;
 
 /// Make `schema` the current read schema for `dataset_id`, reusing a canonically identical row.
 pub(super) async fn ensure_current_schema(
     tx: &mut Transaction<'_, Postgres>,
-    dataset_id: DatasetId,
+    dataset_id: DatasetPk,
     schema: &DatasetSchema,
 ) -> Result<SchemaId> {
     schema.validate().context("invalid dataset schema")?;

@@ -2,12 +2,12 @@ use std::{ops::RangeInclusive, str::FromStr, sync::Arc};
 
 use crate::{pool, types::ChunkSummary};
 
-use super::BlockNumber;
+use super::{BlockNumber, ChunkId, DatasetId};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Chunk {
-    pub dataset: Arc<String>,
-    pub id: Arc<String>,
+    pub dataset: DatasetId,
+    pub id: ChunkId,
     pub size: u32,
     pub blocks: RangeInclusive<BlockNumber>,
     pub files: Arc<Vec<String>>,
@@ -16,7 +16,7 @@ pub struct Chunk {
 
 impl Chunk {
     pub fn new(
-        dataset: Arc<String>,
+        dataset: DatasetId,
         id: String,
         size: u32,
         mut files: Vec<String>,

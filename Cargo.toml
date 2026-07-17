@@ -9,7 +9,7 @@ edition = "2024"
 [features]
 default = []
 # The MVCC chunk-lifecycle storage / multi-step scheduler (Postgres backend + sim tests).
-mvcc-chunks = ["dep:sqlx", "dep:bit-vec", "sqd-assignments/mvcc-chunks"]
+mvcc-chunks = ["dep:sqlx", "dep:bit-vec", "dep:humantime", "sqd-assignments/mvcc-chunks"]
 # Exposes the Postgres testcontainer harness (`scheduler_storage::test_harness::pg_harness`) to other
 # crates — e.g. reshuffle-sim. Implies the Postgres backend. The crate's own tests get the harness via
 # `cfg(test)` + dev-dependencies, so they don't need this feature.
@@ -28,6 +28,7 @@ dotenv = "0.15.0"
 flatbuffers = "25.2.10"
 flate2 = "1.1.1"
 futures = "0.3.31"
+humantime = { version = "2.1", optional = true }
 itertools = "0.14.0"
 lazy_static = "1.5.0"
 libp2p-identity = { version = "0.2.10", features = ["peerid", "rand", "serde"] }
@@ -39,7 +40,7 @@ rand = "0.9.1"
 rayon = "1.10.0"
 seahash = "4.1.0"
 semver = { version = "1.0.26", features = ["serde"] }
-serde = { version = "1.0.219", features = ["derive"] }
+serde = { version = "1.0.219", features = ["derive", "rc"] }
 serde_json = "1.0.140"
 serde_with = "3.12.0"
 serde_yaml = "0.9.34"

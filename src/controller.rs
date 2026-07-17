@@ -23,14 +23,7 @@ impl Controller {
         self,
         db: &clickhouse::ClickhouseClient,
     ) -> anyhow::Result<WithWorkers> {
-        let workers = db
-            .get_active_workers(
-                self.config.worker_inactive_timeout,
-                self.config.worker_stale_bytes,
-                &self.config.min_supported_worker_version,
-            )
-            .await
-            .context("Can't read active workers from ClickHouse")?;
+        let workers = db.active_workers(&self.config).await?;
 
         tracing::info!("Found {} workers", workers.len());
 
@@ -153,18 +146,20 @@ impl WithChunks {
     ) -> anyhow::Result<Self> {
         tracing::info!("Reading new chunks from storage");
 
-        let last_chunks = self
-            .datasets
-            .iter()
-            .map(|dataset| {
-                let last = self.chunks.get(dataset).and_then(|chunks| chunks.last());
-                (dataset.clone(), last)
-            })
-            .collect::<BTreeMap<_, _>>();
+        let watermarks = self.datasets.iter().map(|dataset| {
+            let last = self.chunks.get(dataset).and_then(|chunks| chunks.last());
+            types::DatasetWatermark {
+                dataset: types::Dataset {
+                    id: dataset.clone(),
+                    height: last.map(|c| *c.blocks.end()),
+                },
+                last_chunk_id: last.map(|c| c.id.clone()),
+            }
+        });
 
         let new_chunks = datasets_storage
             .load_newer_chunks(
-                last_chunks,
+                watermarks,
                 self.config.concurrent_dataset_downloads,
                 self.config.dataset_load_timeout,
             )
@@ -207,7 +202,7 @@ impl WithChunks {
 
             let height = chunks.last().map(|c| *c.blocks.end());
             datasets.push(types::Dataset {
-                id: dataset_name.to_string(),
+                id: dataset_name.clone(),
                 height,
             });
 
