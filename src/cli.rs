@@ -62,27 +62,10 @@ pub struct Args {
     pub multistep_drain_window: Duration,
 
     /// Multistep departed-worker retention: a worker inactive for longer than this is deleted from
-    /// the scheduler's worker set. Must exceed the drain window.
+    /// the scheduler's worker set.
     #[cfg(feature = "mvcc-chunks")]
     #[arg(long, env = "MULTISTEP_WORKER_GC", default_value = "24h", value_parser = humantime::parse_duration)]
     pub multistep_worker_gc: Duration,
-}
-
-impl Args {
-    /// Validate cross-argument invariants clap can't express declaratively.
-    pub fn validate(&self) -> anyhow::Result<()> {
-        // A worker must be retained at least until its dropped pairs finish draining.
-        #[cfg(feature = "mvcc-chunks")]
-        if self.multistep_scheduler {
-            ensure!(
-                self.multistep_worker_gc > self.multistep_drain_window,
-                "--multistep-worker-gc ({:?}) must exceed --multistep-drain-window ({:?})",
-                self.multistep_worker_gc,
-                self.multistep_drain_window,
-            );
-        }
-        Ok(())
-    }
 }
 
 #[derive(Debug, Clone, Copy, clap::ValueEnum)]

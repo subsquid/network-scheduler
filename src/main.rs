@@ -11,7 +11,6 @@ async fn main() -> anyhow::Result<()> {
     dotenv::dotenv().ok();
     let args = cli::Args::parse();
     setup_tracing(&args);
-    args.validate()?;
     let config = cli::Config::load(&args.config).context("Can't parse config")?;
     tracing::info!(
         "Scheduler configuration:\n{}",
