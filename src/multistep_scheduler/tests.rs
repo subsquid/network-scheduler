@@ -524,3 +524,38 @@ fn version_restriction_preserved() {
         }
     }
 }
+
+/// The reliable-first partition shifts every position behind a non-Online worker, so
+/// [`partition_reliable`](super::partition_reliable) must translate `current` alongside —
+/// every translated position has to resolve to the worker the caller meant.
+#[test]
+fn partition_reliable_translates_current_positions() {
+    let mut workers = online_workers(4);
+    workers[1].status = WorkerStatus::Offline;
+
+    // chunk 0 held at caller positions {1, 3}; chunk 1 at {0}; chunk 2 unheld.
+    let current: Vec<Vec<WorkerIndex>> = vec![vec![1, 3], vec![0], vec![]];
+    let (sorted, reliable, translated) = super::partition_reliable(&workers, &current);
+
+    assert_eq!(reliable, 3);
+    assert_eq!(
+        sorted[3].id, workers[1].id,
+        "the unreliable worker moves to the back"
+    );
+    for (chunk, held) in current.iter().enumerate() {
+        assert_eq!(held.len(), translated[chunk].len());
+        for (&old, &new) in held.iter().zip(&translated[chunk]) {
+            assert_eq!(
+                sorted[new as usize].id, workers[old as usize].id,
+                "chunk {chunk}: caller position {old} resolves to a different worker after translation",
+            );
+        }
+    }
+
+    // An all-reliable fleet partitions to the identity: nothing moves, nothing translates.
+    let all_online = online_workers(3);
+    let current: Vec<Vec<WorkerIndex>> = vec![vec![2, 0]];
+    let (_, reliable, translated) = super::partition_reliable(&all_online, &current);
+    assert_eq!(reliable, 3);
+    assert_eq!(translated, current);
+}
