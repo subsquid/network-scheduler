@@ -48,7 +48,7 @@ pub struct ScheduledChunk<'a> {
     pub minimum_worker_version: Option<&'a Version>,
 }
 
-/// `current[i]` — **positions into `workers`** of the peers physically holding chunk `i` now,
+/// `current_placement[i]` — **positions into `workers`** of the peers physically holding chunk `i` now,
 /// draining copies included. The caller owns the PeerId↔position mapping; copies on a departed
 /// worker must be left out (they become a shortfall). Returns the full published placement
 /// (new copies plus current copies retained to hold the floor).
@@ -56,18 +56,11 @@ pub fn schedule(
     chunks: &[ScheduledChunk<'_>],
     workers: &[Worker],
     config: &SchedulingConfig,
-    current: &[Vec<WorkerIndex>],
+    current_placement: &[Vec<WorkerIndex>],
     cache: &mut WorkerRingCache,
 ) -> Result<Assignment, ReplicationError> {
     let _timer = crate::metrics::Timer::new("schedule");
-    debug_assert_eq!(chunks.len(), current.len());
-
-    // Schedule the reliable subset first, then (unless reliability is ignored) overlay
-    // a pass over all workers so unreliable workers also get chunks.
-    let mut sorted = Vec::with_capacity(workers.len());
-    sorted.extend(workers.iter().filter(|w| w.reliable()));
-    let reliable = sorted.len();
-    sorted.extend(workers.iter().filter(|w| !w.reliable()));
+    debug_assert_eq!(chunks.len(), current_placement.len());
 
     if config.ignore_reliability {
         tracing::info!(
@@ -75,25 +68,49 @@ pub fn schedule(
             chunks.len(),
             workers.len()
         );
-        return schedule_to_workers(chunks, &sorted, config, current, cache);
+        let workers: Vec<&Worker> = workers.iter().collect();
+        return schedule_to_workers(chunks, &workers, config, current_placement, cache);
+    }
+
+    // Schedule the reliable subset first, then overlay a pass over all workers so unreliable
+    // workers also get chunks. The partition reorders the fleet, so `current` is translated into
+    // the partitioned position space.
+    let (sorted, reliable_count, translated) = partition_reliable(workers, current_placement);
+    if reliable_count == workers.len() {
+        // Fully reliable fleet: the partition is the identity and one pass covers everyone.
+        return schedule_to_workers(chunks, &sorted, config, &translated, cache);
     }
 
     tracing::info!(
         "Scheduling {} chunks to {} reliable workers",
         chunks.len(),
-        reliable
+        reliable_count
     );
-    let mut assignment = schedule_to_workers(chunks, &sorted[..reliable], config, current, cache)?;
-    if reliable == workers.len() {
-        return Ok(assignment);
-    }
+    // Copies on unreliable workers are outside the prefix this pass schedules to; they are
+    // filtered out and become a shortfall, like copies on a departed worker.
+    let prefix_current: Vec<Vec<WorkerIndex>> = translated
+        .iter()
+        .map(|held| {
+            held.iter()
+                .copied()
+                .filter(|&w| (w as usize) < reliable_count)
+                .collect()
+        })
+        .collect();
+    let mut assignment = schedule_to_workers(
+        chunks,
+        &sorted[..reliable_count],
+        config,
+        &prefix_current,
+        cache,
+    )?;
 
     tracing::info!(
         "Scheduling {} chunks to {} total workers",
         chunks.len(),
         workers.len()
     );
-    let all = schedule_to_workers(chunks, &sorted, config, current, cache)?;
+    let all = schedule_to_workers(chunks, &sorted, config, &translated, cache)?;
     // Reliable workers keep their assignment; unreliable ones take theirs from `all`.
     for (worker_id, chunk_indexes) in all.worker_chunks {
         assignment
@@ -102,6 +119,36 @@ pub fn schedule(
             .or_insert(chunk_indexes);
     }
     Ok(assignment)
+}
+
+/// Reorder the fleet reliable-first and translate `current_placement`'s caller positions into the reordered
+/// space, so each held copy still refers to the same worker. Returns the reordered fleet, the
+/// reliable-prefix length, and the translated placement.
+fn partition_reliable<'a>(
+    workers: &'a [Worker],
+    current_placement: &[Vec<WorkerIndex>],
+) -> (Vec<&'a Worker>, usize, Vec<Vec<WorkerIndex>>) {
+    // `order[new] = old` — caller positions, reliable first; `partition` keeps input order.
+    let (reliable_positions, unreliable_positions): (Vec<usize>, Vec<usize>) =
+        (0..workers.len()).partition(|&i| workers[i].reliable());
+    let reliable = reliable_positions.len();
+    let order: Vec<usize> = reliable_positions
+        .into_iter()
+        .chain(unreliable_positions)
+        .collect();
+
+    // `new_pos[old] = new` — where each caller position landed.
+    let mut new_pos: Vec<WorkerIndex> = vec![0; workers.len()];
+    for (new, &old) in order.iter().enumerate() {
+        new_pos[old] = new as WorkerIndex;
+    }
+
+    let sorted = order.iter().map(|&i| &workers[i]).collect();
+    let translated = current_placement
+        .iter()
+        .map(|held| held.iter().map(|&w| new_pos[w as usize]).collect())
+        .collect();
+    (sorted, reliable, translated)
 }
 
 fn schedule_to_workers(
@@ -119,8 +166,7 @@ fn schedule_to_workers(
 
     let rings = cache.rings(workers.iter().map(|w| w.id));
 
-    // Under `ignore_reliability = true` — the only mode this scheduler is exercised in — the
-    // reliable-first sort preserves order, so the caller's positions index `workers` directly.
+    // `current` positions index `workers` — `schedule` translates them whenever it reorders.
     let held = current;
 
     // Version-pinned chunks first: they compete for the scarcest eligible workers, so they claim
