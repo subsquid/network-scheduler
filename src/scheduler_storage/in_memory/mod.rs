@@ -498,10 +498,21 @@ impl InMemoryStorage {
         fired
     }
 
-    /// Evict workers that went stale strictly before `stale_cutoff`.
+    /// Evict workers that went stale strictly before `stale_cutoff`, taking their stale mappings
+    /// along (the Postgres FK does this via `ON DELETE CASCADE`).
     fn evict_stale_workers(&mut self, stale_cutoff: TimeUnit) {
-        self.sched_workers
-            .retain(|_, entry| !matches!(entry.inactive_since, Some(ts) if ts < stale_cutoff));
+        let evicted: HashSet<WorkerPk> = self
+            .sched_workers
+            .iter()
+            .filter(|(_, entry)| matches!(entry.inactive_since, Some(ts) if ts < stale_cutoff))
+            .map(|(id, _)| *id)
+            .collect();
+        if evicted.is_empty() {
+            return;
+        }
+        self.sched_workers.retain(|id, _| !evicted.contains(id));
+        self.sched_stale_mappings
+            .retain(|(_, worker_id), _| !evicted.contains(worker_id));
     }
 
     /// True if `dropped_at_portal` names a portal assignment created at or before `cutoff` — i.e.
@@ -575,6 +586,7 @@ impl InMemoryStorage {
     fn record_reshuffle_stale_mappings(
         &mut self,
         ideal_mappings: &BTreeMap<ChunkPk, HashSet<WorkerPk>>,
+        evicted: &HashSet<(ChunkPk, WorkerPk)>,
         new_worker_aid: WorkerAssignmentId,
     ) {
         for (pk, current_workers) in &self.sched_ideal_chunk_workers {
@@ -588,7 +600,14 @@ impl InMemoryStorage {
             let ideal_workers = ideal_mappings.get(pk);
             for &worker_id in current_workers {
                 let still_assigned = ideal_workers.is_some_and(|iw| iw.contains(&worker_id));
-                if !still_assigned {
+                // Only an active worker drains: a departed one serves nothing, so its copies
+                // vanish. Mirrors the Postgres mint's `inactive_since IS NULL` filter.
+                let worker_active = self
+                    .sched_workers
+                    .get(&worker_id)
+                    .is_some_and(|entry| entry.inactive_since.is_none());
+                // An evicted pair is deleted this cycle, not drained: never mint it as stale.
+                if !still_assigned && worker_active && !evicted.contains(&(*pk, worker_id)) {
                     self.sched_stale_mappings
                         .entry((*pk, worker_id))
                         .or_insert(StaleMapping {
@@ -866,9 +885,11 @@ impl SchedulerStorage for InMemoryStorage {
             );
         }
 
-        let departed_set: HashSet<WorkerPk> = departed.iter().copied().collect();
-        self.sched_stale_mappings
-            .retain(|(_, worker_id), _| !departed_set.contains(worker_id));
+        if !departed.is_empty() {
+            let departed_set: HashSet<WorkerPk> = departed.iter().copied().collect();
+            self.sched_stale_mappings
+                .retain(|(_, worker_id), _| !departed_set.contains(worker_id));
+        }
 
         self.evict_stale_workers(now.saturating_sub(gc_ticks));
 
@@ -896,6 +917,28 @@ impl SchedulerStorage for InMemoryStorage {
         // `BTreeMap` the snapshot is built as.
         let current_placement: CurrentPlacement = self.current_placement().into_iter().collect();
 
+        // Split-role inputs for eviction (see `SchedulingAlgorithm::schedule`): `committed` is the
+        // pre-cycle committed ideal (durability floor — hard), `confirmed_routing` is the confirmed
+        // routing (best-effort victim ordering). The routing is filtered to portal-visible chunks,
+        // mirroring the Postgres `fetch_confirmed_routing` predicate, so both backends see the same
+        // routed set. Departed holders are dropped downstream by the same position mapping as
+        // `current_placement`, so no active-worker filter is needed here.
+        let committed: CurrentPlacement = self
+            .sched_ideal_chunk_workers
+            .iter()
+            .map(|(pk, workers)| (*pk, workers.clone()))
+            .collect();
+        let confirmed_routing: CurrentPlacement = self
+            .sched_confirmed_chunk_workers
+            .iter()
+            .filter(|(pk, _)| {
+                self.sched_chunk_metadata
+                    .get(pk)
+                    .is_some_and(|meta| meta.portal_visible())
+            })
+            .map(|(pk, workers)| (*pk, workers.clone()))
+            .collect();
+
         let chunks: Vec<(ChunkPk, AlgoChunk)> = self
             .chunks
             .iter()
@@ -904,11 +947,19 @@ impl SchedulerStorage for InMemoryStorage {
                     .get(pk)
                     .is_none_or(|m| m.worker_servable())
             })
-            .map(|(pk, chunk)| (*pk, chunk.into()))
+            .map(|(pk, chunk)| {
+                let is_portal_visible = self
+                    .sched_chunk_metadata
+                    .get(pk)
+                    .is_some_and(|meta| meta.portal_visible());
+                (*pk, AlgoChunk::new(chunk, is_portal_visible))
+            })
             .collect();
+        // Departed workers are not capacity. Mirrors the Postgres `decode_workers` filter.
         let workers: Vec<(WorkerPk, Worker)> = self
             .sched_workers
             .iter()
+            .filter(|(_, entry)| entry.inactive_since.is_none())
             .map(|(id, entry)| {
                 (
                     *id,
@@ -925,8 +976,16 @@ impl SchedulerStorage for InMemoryStorage {
         let ScheduleOutput {
             mapping,
             replication_by_weight,
+            evicted,
         } = algorithm
-            .schedule(chunks, workers, &current_placement, config)
+            .schedule(
+                chunks,
+                workers,
+                &current_placement,
+                &committed,
+                &confirmed_routing,
+                config,
+            )
             .map_err(|_| StorageError::Shortage)?;
 
         // This oracle keeps set-based bookkeeping, so index the returned `Vec` into a map once.
@@ -947,7 +1006,15 @@ impl SchedulerStorage for InMemoryStorage {
         let new_worker_aid = self.counters.worker_assignment_id.next();
         self.sched_worker_assignments.insert(new_worker_aid, now);
 
-        self.record_reshuffle_stale_mappings(&ideal_mappings, new_worker_aid);
+        // Evicted copies are DELETED this cycle, not drained. Drop any pre-existing stale row so the
+        // pair is in neither ideal nor stale -> the worker assignment omits it -> the worker deletes
+        // it. The mint below skips these too, covering a pair that was in the OLD ideal.
+        let evicted: HashSet<(ChunkPk, WorkerPk)> = evicted.into_iter().collect();
+        for pair in &evicted {
+            self.sched_stale_mappings.remove(pair);
+        }
+
+        self.record_reshuffle_stale_mappings(&ideal_mappings, &evicted, new_worker_aid);
 
         // Must precede commit_ideal_mappings, which overwrites the old ideal.
         self.record_worker_assignment_diff(&ideal_mappings, new_worker_aid);
@@ -964,9 +1031,20 @@ impl SchedulerStorage for InMemoryStorage {
             }
         }
 
-        // Bundle from the assignment's own chunks — consistent by construction, no storage scan.
-        let schemas: BTreeMap<SchemaId, DatasetSchema> = assignment
-            .schema_ids()
+        // Bundle covers every chunk that has entered a worker assignment and is not yet tombstoned —
+        // its whole routable lifetime, not just the chunks placed this cycle (ADR 0002). The portal can
+        // still route a chunk the latest assignment dropped (it was promoted off an earlier confirmed
+        // entry and drains for M ticks), so keying the bundle on current placement would drop the
+        // schema out from under a chunk still being read. `entered ∧ ¬tombstoned` holds for exactly the
+        // window a reader can be routed to the chunk.
+        let mut schema_ids: BTreeSet<SchemaId> = assignment.schema_ids();
+        schema_ids.extend(
+            self.sched_chunk_metadata
+                .iter()
+                .filter(|(_, meta)| meta.entered_worker_assignment() && !meta.tombstoned())
+                .filter_map(|(pk, _)| self.chunks.get(pk).map(|c| c.schema_id)),
+        );
+        let schemas: BTreeMap<SchemaId, DatasetSchema> = schema_ids
             .into_iter()
             .filter_map(|id| self.schemas.get(&id).map(|schema| (id, schema.clone())))
             .collect();

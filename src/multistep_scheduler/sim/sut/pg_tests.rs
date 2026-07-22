@@ -69,6 +69,7 @@ proptest! {
             chunk_cap: None,
             datasets: datasets.clone(),
             confirm_threshold_pct: 100,
+            gc_ticks: 0,
         };
         let storage = fresh_db("pg_drain_churn", id);
         let mut sim = SimUnderTest::<PostgresStorage>::from_config_with(&config, storage);

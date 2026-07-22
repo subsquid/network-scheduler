@@ -148,7 +148,9 @@ CREATE TABLE IF NOT EXISTS sched_worker_assignment_diffs (
 -- once a portal assignment's confirmed_up_to covers superseded_at_worker_assignment_id.
 CREATE TABLE IF NOT EXISTS sched_stale_mappings (
     chunk_pk                            BIGINT NOT NULL REFERENCES chunks(chunk_pk),
-    worker_id                           INT    NOT NULL REFERENCES sched_workers(id),
+    -- Cascade: a departed worker keeps collecting stale rows until its row is deleted (the
+    -- stale-mint filter checks worker existence only), so the delete must take them along.
+    worker_id                           INT    NOT NULL REFERENCES sched_workers(id) ON DELETE CASCADE,
     superseded_at_worker_assignment_id  INT    NOT NULL REFERENCES sched_worker_assignments(id),
     PRIMARY KEY (chunk_pk, worker_id)
 );

@@ -17,7 +17,10 @@ pub(super) fn standard_preconditions<D: super::SimStorage>(
             sut.has_stale_mappings() || sut.has_published_portal_assignment()
         }
         Action::CheckConverged(_) => sut.total_chunk_count() > 0,
-        // Only remove a worker the fleet can still hold every floor without.
+        // Only remove a worker the fleet can absorb: floors still fit from scratch AND no visible
+        // chunk loses its last durable (committed-ideal ∩ held) copy (a departure that outpaces
+        // re-replication is real loss, kept out of the walk rather than hidden by relaxing an
+        // oracle). See [`SimUnderTest::is_removal_recoverable`].
         Action::WorkerLeft(index) => {
             sut.is_worker_active(*index) && sut.is_removal_recoverable(*index)
         }

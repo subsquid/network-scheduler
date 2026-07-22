@@ -1,6 +1,8 @@
 //! Churn model: the guided walk of [`SimModel`](super::guided::SimModel) plus infrequent worker
-//! joins and departures. The standard precondition rejects departures the fleet couldn't absorb,
-//! so the run stays feasible.
+//! joins and departures. The standard precondition rejects departures the fleet couldn't absorb —
+//! both an aggregate floor shortage and one that takes a visible chunk's last durable (committed
+//! ideal ∩ held) copy with no re-replication headroom (genuine loss) — so the run stays feasible
+//! while still churning.
 
 use std::marker::PhantomData;
 

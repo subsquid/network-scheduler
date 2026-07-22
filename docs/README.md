@@ -91,13 +91,18 @@ built.
   `minimum_worker_version` that few workers run) can be handed a target `R` larger than its eligible
   pool can ever hold, leaving it under-replicated against its own target. Deriving `R` from the
   eligible subset is not yet implemented.
-- **Confirmed routing is not scrubbed when a worker departs (suspected; not yet reproduced in a
-  test).** Confirmation is the only writer of `sched_confirmed_chunk_workers`; worker GC purges
-  stale mappings but not confirmed routing. So an already-visible chunk can keep routing portals to
-  a worker that has left and lost its data. *Example:* a saturated chunk's only copy sits on worker
-  `W`; `W` departs and is GC-evicted, yet the chunk stays visible and reads for it still route to
-  `W` — those queries fail. "Suspected" because the structural gap is clear from the code, but the
-  query-failure impact was only seen once via throwaway instrumentation — no committed test pins it,
-  and it isn't confirmed that a later cycle doesn't re-route first. Needs a routing-plane test to
-  confirm, then a scrub-on-departure fix. (Couples to the sim oracle's `held_before_by_pk`, which
-  currently relies on the un-scrubbed behaviour.)
+- **Confirmed routing lags a worker's departure.** Confirmation is the only writer of
+  `sched_confirmed_chunk_workers`: departure and worker GC purge stale mappings, never routing. The
+  scheduler drops a departed worker from the ideal and the routing sheds it only once that
+  assignment confirms, so in between portals keep routing reads to a worker that has left and lost
+  its data — and to an empty disk if it rejoined meanwhile. This is accepted, not a gap to close:
+  workers and portals act on published assignments, and a scrub-on-departure hook would in any case
+  be undone by the pre-departure diffs still queued for replay. *Example:* a saturated chunk's only
+  copy sits on worker `W`; `W` departs, the chunk stays visible, and reads route to `W` until the
+  next assignment confirms — those queries fail. The residual risk is the window's length: it is
+  bounded by the confirmation watermark, so a stalled watermark holds it open.
+  `portal_routes_to_a_rejoined_worker_with_empty_disk`,
+  `portal_fetches_pre_departure_routing_before_republication` and
+  `diff_replay_carries_a_departed_workers_routing` (`sim/regression.rs`) pin the window; the sim's
+  routing oracles hold a departed worker to nothing until the watermark passes the last assignment
+  that placed it.

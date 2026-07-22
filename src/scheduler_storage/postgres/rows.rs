@@ -44,6 +44,14 @@ pub(super) struct ActiveChunkRow {
     #[sqlx(flatten)]
     pub(super) chunk: ChunkRow,
     pub(super) worker_ids: Option<Vec<WorkerPk>>,
+    /// The committed ideal holders alone (pre-merge, no stale), for the eviction durability floor.
+    /// `None` when the chunk has no committed ideal row yet (pending/holderless).
+    pub(super) ideal_worker_ids: Option<Vec<WorkerPk>>,
+    pub(super) is_portal_visible: bool,
+    /// Has ever entered a worker assignment (`applied_at_worker_assignment_id IS NOT NULL`). With the
+    /// query's `dropped_from_worker_assignment_at IS NULL` filter, this marks the chunks whose schema
+    /// the bundle must carry — the whole routable window.
+    pub(super) entered_worker_assignment: bool,
 }
 
 /// Ticks are non-negative logical timestamps, so they always fit in `i64`.

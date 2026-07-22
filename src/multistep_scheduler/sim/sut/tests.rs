@@ -161,6 +161,7 @@ fn removing_a_needed_worker_records_a_shortage() {
         chunk_cap: None,
         datasets: sim_datasets(),
         confirm_threshold_pct: 100,
+        gc_ticks: 0,
     };
     let mut sim = SimUnderTest::from_config(&config);
     let key = sim.total_chunk_count() as u64;
@@ -178,6 +179,9 @@ fn removing_a_needed_worker_records_a_shortage() {
         "the worker leaves even though it strands the chunk"
     );
     assert_eq!(sim.active_workers_count(), 1);
+    // Departure only updates the registry; the shortage is recorded when a cycle next schedules
+    // against it, and the departed worker no longer counts toward the floor of 2.
+    sim.run_cycle();
     assert!(sim.is_infeasible, "the shortage is recorded, not panicked");
 }
 
@@ -246,6 +250,7 @@ fn dropping_min_replication_frees_capacity_for_more_chunks() {
         chunk_cap: None,
         datasets: sim_datasets(),
         confirm_threshold_pct: 100,
+        gc_ticks: 0,
     };
     let mut sim = SimUnderTest::from_config(&config);
 
@@ -395,7 +400,10 @@ fn consistency_oracle_tolerates_beyond_m() {
     sim.assert_portal_consistency(); // no panic
 }
 
-/// Wipe every active worker's holdings while they stay active — a stand-in for premature deletion.
+/// Wipe every active worker's holdings *and* drop all coverage from the latest worker assignment,
+/// while the workers stay active — a stand-in for premature deletion. Both must go: the ADR-0001
+/// oracle treats a physical-only wipe (assignment still covers the chunk) as bounded routing-lag, so
+/// only a globally-uncovered routed chunk is genuinely unanswerable and fires the check.
 #[cfg(test)]
 fn wipe_fleet_holdings(sim: &mut SimUnderTest<InMemoryStorage>) {
     let active = sim.active_worker_pks();
@@ -407,6 +415,7 @@ fn wipe_fleet_holdings(sim: &mut SimUnderTest<InMemoryStorage>) {
         replication_by_weight: BTreeMap::new(),
     };
     sim.workers_state.catch_up_all(&active, &empty, sim.now);
+    sim.latest_worker_assignment = Some(empty);
 }
 
 #[cfg(test)]
@@ -456,6 +465,7 @@ mod convergence_under_shortage {
                 chunk_cap: None,
                 datasets: datasets.clone(),
                 confirm_threshold_pct: 100,
+                gc_ticks: 0,
             };
             let mut sim = SimUnderTest::from_config(&config);
             let mut key = 0u64;

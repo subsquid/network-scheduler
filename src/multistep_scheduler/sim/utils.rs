@@ -70,7 +70,7 @@ pub(super) fn seed_hex(seed: &Seed) -> String {
     seed.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-fn seed_from_hex(text: &str) -> Option<Seed> {
+pub(super) fn seed_from_hex(text: &str) -> Option<Seed> {
     if text.len() != 64 {
         return None;
     }
@@ -204,9 +204,24 @@ pub(super) const CLOCK_STEP: Tick = 1;
 /// Stale drain window: `AdvanceClock(M_TICKS)` flushes all currently-draining stale; smaller jumps
 /// land mid-window.
 pub(super) const M_TICKS: Tick = 5;
-/// Worker GC horizon: `0` evicts a departed worker promptly, so it stops counting as scheduler
-/// capacity before the next reschedule.
-pub(super) const GC_TICKS: Tick = 0;
+/// Silence before the roster drops a worker (production: a day of missed pings). Past [`M_TICKS`],
+/// so a snapshot from before the departure is expired by the time it is detected.
+pub(super) const DEPARTURE_DETECTION_TICKS: Tick = 4 * M_TICKS;
+
+/// Retention longer than any run — departed workers are never deleted.
+pub(super) const NEVER_GC_TICKS: Tick = 1_000_000_000;
+
+/// Per-case departed-worker retention: deletion eligible at the next membership sync, racing the
+/// drain window, production-shaped `retention > M`, or never.
+pub(super) fn gc_ticks() -> BoxedStrategy<Tick> {
+    prop_oneof![
+        2 => Just(0),
+        3 => Just(M_TICKS),
+        3 => Just(3 * M_TICKS),
+        1 => Just(NEVER_GC_TICKS),
+    ]
+    .boxed()
+}
 
 /// Per-worker capacity: `SIM_WORKER_CAPACITY=<MiB>` overrides [`WORKER_CAPACITY`] (chunks are
 /// 1 MiB, so the value reads directly as chunk-slots).
@@ -258,17 +273,26 @@ fn confirm_threshold() -> BoxedStrategy<u32> {
 pub(super) fn default_sim_config<D: SimProfile>() -> BoxedStrategy<SimConfig> {
     // Initial min_replication is 2..=4, never 1: recovery at saturation lowers it one step, so a
     // walk starting at 1 has no lever and idles. 1 is still explored by recovering down.
-    (D::worker_count(), 2u16..=4, 70u32..=98, confirm_threshold())
+    (
+        D::worker_count(),
+        2u16..=4,
+        70u32..=98,
+        confirm_threshold(),
+        gc_ticks(),
+    )
         .prop_map(
-            |(worker_count, min_replication, saturation_pct, confirm_threshold_pct)| SimConfig {
-                worker_count,
-                worker_capacity: worker_capacity(),
-                min_replication: min_replication.min(worker_count),
-                saturation: f64::from(saturation_pct) / 100.0,
-                converge_is_terminal: false,
-                chunk_cap: env_usize("SIM_CHUNKS"),
-                datasets: sim_datasets(),
-                confirm_threshold_pct,
+            |(worker_count, min_replication, saturation_pct, confirm_threshold_pct, gc_ticks)| {
+                SimConfig {
+                    worker_count,
+                    worker_capacity: worker_capacity(),
+                    min_replication: min_replication.min(worker_count),
+                    saturation: f64::from(saturation_pct) / 100.0,
+                    converge_is_terminal: false,
+                    chunk_cap: env_usize("SIM_CHUNKS"),
+                    datasets: sim_datasets(),
+                    confirm_threshold_pct,
+                    gc_ticks,
+                }
             },
         )
         .boxed()
@@ -575,6 +599,8 @@ pub(super) fn record_weights(weights: &WeightTable, chunks: &[NewChunk]) {
 /// Read-path counterpart of [`storage_chunk`]: the algorithm's view of a chunk already in storage.
 pub(super) fn chunk_from_view(view: &ChunkView) -> AlgoChunk {
     AlgoChunk {
+        // The probe places from an empty fleet, so no chunk is treated as already routed.
+        is_portal_visible: false,
         dataset: Arc::new(view.dataset.clone()),
         id: Arc::new(view.chunk_id.clone()),
         size: view.size,

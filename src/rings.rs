@@ -88,6 +88,27 @@ impl Rings {
         let start = index * self.n_workers;
         &self.entries[start..start + self.n_workers]
     }
+
+    /// Test-only ring with a fixed, predictable geometry: every ring lists workers in index order
+    /// with `hash == index`. A replica whose hash is `h` (in `0..n_workers`) therefore walks the
+    /// ring starting at worker `h`, then `h+1`, … wrapping — so a test can steer each replica onto
+    /// exact workers by choosing its per-tag hashes, instead of depending on the real hash geometry.
+    // Only the `mvcc-chunks` reconcile tests use this; `rings` compiles without that feature, so gate
+    // the helper to match its users or it reads as dead code in a default-feature build.
+    #[cfg(all(test, feature = "mvcc-chunks"))]
+    pub(crate) fn test_identity(n_workers: usize) -> Self {
+        let one_ring: Vec<(u64, WorkerIndex)> = (0..n_workers)
+            .map(|i| (i as u64, i as WorkerIndex))
+            .collect();
+        let entries: Vec<(u64, WorkerIndex)> = std::iter::repeat_with(|| one_ring.iter().copied())
+            .take(N_RINGS)
+            .flatten()
+            .collect();
+        Rings {
+            entries: entries.into_boxed_slice(),
+            n_workers,
+        }
+    }
 }
 
 /// Walk the ring `chunk_hash` selects, from `chunk_hash` and wrapping, returning the first worker
