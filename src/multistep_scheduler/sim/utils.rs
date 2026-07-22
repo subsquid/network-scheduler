@@ -2,7 +2,7 @@
 //! ⇄ storage-chunk codec with its weight table.
 
 use std::collections::{BTreeMap, HashMap};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 
 use bytesize::ByteSize;
 use proptest::prelude::*;
@@ -17,7 +17,7 @@ use crate::scheduler_storage::in_memory::InMemoryStorage;
 use crate::scheduler_storage::postgres::PostgresStorage;
 use crate::scheduler_storage::test_harness::inspect::ChunkView;
 use crate::scheduler_storage::{AlgoChunk, NewChunk as StorageNewChunk};
-use crate::types::ChunkWeight;
+use crate::types::{ChunkWeight, DatasetSchema, TableSchema};
 use crate::weight::{SchedulingChunk, WeightStrategy};
 
 pub(super) type Seed = [u8; 32];
@@ -177,6 +177,24 @@ pub(super) const MAX_CHUNK_SIZE: u32 = ByteSize::mib(2).as_u64() as u32;
 pub(super) const WORKER_CAPACITY: u64 = ByteSize::mib(10).as_u64();
 pub(super) const WEIGHTS: [u16; 3] = [1, 4, 12];
 pub(super) const DATASETS: [&str; 3] = ["s3://sim-0", "s3://sim-1", "s3://sim-2"];
+
+/// Small fixed pool `set_dataset_schema` samples from — not a general `Arbitrary`/`Strategy`
+/// generator for [`DatasetSchema`] (none exists; building one is out of scope). Just enough
+/// variety (empty, one table) to exercise schema-bundle consistency as a dataset's schema changes
+/// mid-run. `LazyLock`, not a plain `const`, because `DatasetSchema` holds a `BTreeMap`/`String`s,
+/// which aren't const-constructible.
+pub(super) static SCHEMA_POOL: LazyLock<[DatasetSchema; 2]> = LazyLock::new(|| {
+    [
+        DatasetSchema::default(),
+        DatasetSchema::new(BTreeMap::from([(
+            "blocks".to_string(),
+            TableSchema {
+                fields: vec!["number".to_string(), "hash".to_string()],
+                default_fields: vec!["number".to_string()],
+            },
+        )])),
+    ]
+});
 
 // ---- Storage-lifecycle timing -----------------------------------------------------------------
 
@@ -450,6 +468,18 @@ pub(super) fn register_correction(olds: Vec<CorrectableOld>) -> BoxedStrategy<Ac
                     }
                 })
         })
+        .boxed()
+}
+
+/// A `SetDatasetSchema` for a random dataset, drawing its new schema from the canned
+/// [`SCHEMA_POOL`]. Needs no precondition data (unlike [`register_correction`]) — any dataset
+/// accepts any schema at any time, so this can always be offered.
+pub(super) fn set_dataset_schema(datasets: &[String]) -> BoxedStrategy<Action> {
+    (
+        prop::sample::select(datasets.to_vec()),
+        prop::sample::select(SCHEMA_POOL.to_vec()),
+    )
+        .prop_map(|(dataset, schema)| Action::SetDatasetSchema { dataset, schema })
         .boxed()
 }
 

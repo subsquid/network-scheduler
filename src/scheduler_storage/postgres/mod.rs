@@ -35,8 +35,8 @@ use sqlx::postgres::PgConnection;
 use crate::metrics::{PhaseTimer, Timer};
 use crate::scheduler_storage::algorithm::{ScheduleOutput, SchedulingAlgorithm};
 use crate::scheduler_storage::{
-    AssignmentId, ChunkPk, DatasetPk, NewChunk, PortalAssignment, SchedulerStorage, StorageError,
-    Tick, WorkerAssignment,
+    AssignmentId, ChunkPk, DatasetPk, NewChunk, PortalAssignment, SchedulerStorage, SchemaBundle,
+    SchemaId, StorageError, Tick, WorkerAssignment,
 };
 use crate::types::{Dataset, DatasetSchema, DatasetWatermark, Worker};
 
@@ -248,6 +248,16 @@ impl SchedulerStorage for PostgresStorage {
         })
     }
 
+    fn active_schema_bundle(
+        &self,
+    ) -> Result<BTreeMap<crate::scheduler_storage::SchemaId, DatasetSchema>, StorageError> {
+        self.with_conn_ref(async move |conn| {
+            schema::active_schema_bundle(conn)
+                .await
+                .map_err(StorageError::from)
+        })
+    }
+
     fn insert_new_chunks(&mut self, chunks: Vec<NewChunk>) -> Result<(), StorageError> {
         let batch_size = self.batch_size;
         self.with_conn(async move |conn| {
@@ -322,7 +332,7 @@ impl SchedulerStorage for PostgresStorage {
         config: &A::Config,
         now: Tick,
         m_ticks: u64,
-    ) -> Result<WorkerAssignment, StorageError>
+    ) -> Result<(WorkerAssignment, SchemaBundle), StorageError>
     where
         A: SchedulingAlgorithm + Send + Sync,
     {
@@ -397,7 +407,14 @@ impl SchedulerStorage for PostgresStorage {
                 published_chunks,
             )
             .await?;
-            Ok::<_, StorageError>(wa)
+
+            // Bundle schemas come from the assignment's own chunks, so it's consistent with the
+            // assignment by construction. Only the content load hits the DB, and schema content is
+            // immutable per id, so the by-id read is safe under concurrent writers.
+            let schema_ids: Vec<SchemaId> = wa.schema_ids().into_iter().collect();
+            let bundle =
+                SchemaBundle::from_schemas(schema::load_schemas(conn, Some(&schema_ids)).await?);
+            Ok::<_, StorageError>((wa, bundle))
         })
     }
 

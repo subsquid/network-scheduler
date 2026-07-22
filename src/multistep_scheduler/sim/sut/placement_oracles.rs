@@ -19,7 +19,9 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use crate::scheduler_storage::test_harness::inspect::Snapshot;
-use crate::scheduler_storage::{ChunkPk, PortalAssignment, Tick, WorkerAssignment, WorkerPk};
+use crate::scheduler_storage::{
+    ChunkPk, PortalAssignment, SchemaBundle, Tick, WorkerAssignment, WorkerPk,
+};
 
 /// Every chunk the portal routes must be held by at least one of its routed workers — by what the
 /// worker actually downloaded (`holds`), not the published assignment (that superset is
@@ -109,6 +111,34 @@ pub(super) fn published_coverage(
                      chunk {chunk:?} to active worker {w:?}, but the worker assignment \
                      (ideal ∪ stale) no longer includes that pair — the worker may delete data \
                      portals still route to",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Every chunk a published assignment names must resolve under the [`SchemaBundle`] frozen with
+/// that worker assignment: the chunk's pinned `schema_id` must be in the bundle, or a worker/portal
+/// couldn't derive its file set. Either assignment may be absent (nothing published yet).
+pub(super) fn schema_bundle_consistency(
+    bundle: &SchemaBundle,
+    worker_assignment: Option<&WorkerAssignment>,
+    portal_assignment: Option<&PortalAssignment>,
+) -> Result<(), String> {
+    let sources = [
+        ("worker assignment", worker_assignment.map(|a| &a.chunks)),
+        ("portal assignment", portal_assignment.map(|a| &a.chunks)),
+    ];
+    for (label, chunks) in sources {
+        let Some(chunks) = chunks else { continue };
+        for (chunk_pk, chunk) in chunks {
+            if !bundle.contains(chunk.schema_id) {
+                return Err(format!(
+                    "{label} names chunk {chunk_pk:?} with schema {}, absent from the schema \
+                     bundle frozen with the worker assignment — a worker or portal couldn't \
+                     resolve this chunk's file set",
+                    chunk.schema_id,
                 ));
             }
         }

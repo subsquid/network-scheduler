@@ -603,7 +603,7 @@ fn run_scheduling_cycle_applies_mapping_from_algorithm() {
     ];
     let algorithm = StaticSchedulingAlgorithm { mapping };
 
-    let assignment = storage
+    let (assignment, _) = storage
         .run_scheduling_cycle(&algorithm, &(), 100, 60)
         .expect("scheduling succeeds");
 
@@ -650,7 +650,7 @@ fn worker_assignment_diffs_recorded_after_cycle_then_cleared_on_confirm() {
     let mapping: IdealMapping = vec![(pk_1, vec![worker_id])];
     let algorithm = StaticSchedulingAlgorithm { mapping };
 
-    let assignment = storage
+    let (assignment, _) = storage
         .run_scheduling_cycle(&algorithm, &(), 100, 60)
         .expect("scheduling succeeds");
 

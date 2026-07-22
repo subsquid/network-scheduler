@@ -57,8 +57,8 @@ pub struct ReplacePlan {
     pub at_step: u32,
 }
 
-/// When ephemeral, the container is the shared `pg_harness` one (reaped at process exit), so there's
-/// nothing to hold or drop here.
+/// Owns the run's storage. When ephemeral, the container is the shared `pg_harness` one (reaped at
+/// process exit), so there's nothing to hold or drop here.
 struct Backend {
     storage: PostgresStorage,
 }
@@ -238,7 +238,7 @@ impl MultistepScheduler {
             self.clock,
             M_TICKS,
         ) {
-            Ok(assignment) => assignment,
+            Ok((assignment, _bundle)) => assignment,
             Err(StorageError::Shortage) => {
                 return Ok(CycleResult::Shortage(
                     "scheduling shortage: worker capacity cannot satisfy all replication floors \
@@ -261,6 +261,7 @@ impl MultistepScheduler {
             .storage
             .confirm_worker_assignment(watermark, self.clock)?;
         let portal = self.backend.storage.run_visibility_cycle(self.clock)?;
+
         Ok(CycleResult::Scheduled {
             assignment,
             stale,
@@ -374,8 +375,9 @@ impl StepScheduler for MultistepScheduler {
             .storage
             .update_worker_set(ctx.workers, self.clock, GC_TICKS)?;
 
-        // Replace before this step's new chunks, so one `register_new_chunks` covers both.
         self.current_step += 1;
+
+        // Replace before this step's new chunks, so one `register_new_chunks` covers both.
         let due_replaces: Vec<String> = self
             .replace
             .iter()

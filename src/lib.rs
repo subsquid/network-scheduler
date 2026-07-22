@@ -15,8 +15,6 @@ pub mod rings;
 #[cfg(feature = "mvcc-chunks")]
 pub mod scheduler_storage;
 pub mod scheduling;
-#[cfg(feature = "mvcc-chunks")]
-mod schema_files;
 #[cfg(test)]
 mod tests;
 pub mod types;

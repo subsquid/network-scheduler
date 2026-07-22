@@ -97,6 +97,7 @@ fn run_real_cycle<S: SchedulerStorage>(storage: &mut S, at: TimeUnit) -> WorkerA
             GRACE_PERIOD,
         )
         .expect("scheduling succeeds")
+        .0
 }
 
 // ---------------------------------------------------------------------------

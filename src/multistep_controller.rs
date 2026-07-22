@@ -68,7 +68,7 @@ pub async fn run(
         min_replication: config.min_replication,
         ignore_reliability: config.ignore_reliability,
     };
-    let assignment = {
+    let (assignment, _) = {
         let _timer = metrics::Timer::new("multistep:schedule");
         storage
             .run_scheduling_cycle(

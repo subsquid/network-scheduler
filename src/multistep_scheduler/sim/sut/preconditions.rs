@@ -9,7 +9,10 @@ pub(super) fn standard_preconditions<D: super::SimStorage>(
     transition: &Action,
 ) -> bool {
     match transition {
-        Action::AddChunks(_) | Action::NoOp | Action::WorkerJoined(_) => true,
+        Action::AddChunks(_)
+        | Action::NoOp
+        | Action::WorkerJoined(_)
+        | Action::SetDatasetSchema { .. } => true,
         Action::AdvanceClock(_) => {
             sut.has_stale_mappings() || sut.has_published_portal_assignment()
         }
