@@ -12,7 +12,8 @@ placement algorithm that feeds it is in [capacity-aware-scheduling.md](capacity-
 The scheduler maintains two independent assignment streams:
 
 - **Worker assignment** — what each worker must physically hold. A superset of every active
-  portal assignment. Minted **once per scheduling cycle**.
+  portal assignment, except pairs deleted by same-cycle floor preemption
+  ([ADR 0001](adr/0001-same-cycle-floor-preemption.md)). Minted **once per scheduling cycle**.
 - **Portal assignment** — a point-in-time view of the data lake that portals route by. Multiple
   portals may sit on different (recent) portal assignments and are expected to converge. Minted
   **once per visibility cycle**.
@@ -298,6 +299,12 @@ Because a stale row is minted the instant a pair leaves the ideal, `ideal ∪ st
 **superset of the confirmed portal routing**, so the worker side never needs to consult the
 portal view. The drain follows the same timing rule as the chunk-level drop (Invariant 4), with a
 derived rather than stored anchor.
+
+One deliberate exception ([ADR 0001](adr/0001-same-cycle-floor-preemption.md)): a pair deleted by
+same-cycle floor preemption is *not* minted stale — the space is what the starved floor claimed —
+so a still-routed evicted pair can lag outside `ideal ∪ stale` until confirmation sheds it. That
+routing lag is bounded and counted (`portal_consistency_misses`); the strand invariant is that the
+chunk keeps a covered holder somewhere.
 
 ### Per-cycle logic
 

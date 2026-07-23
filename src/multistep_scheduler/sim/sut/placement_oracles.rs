@@ -133,13 +133,13 @@ pub(super) fn portal_consistency_misses(
 /// The caller also stands this check down during a recorded shortage (`is_infeasible`): an
 /// over-subscribed fleet cannot hold every floor, so a visible chunk reaching zero copies there is
 /// unavoidable, not a defect — the same category as the departed-worker exemption.
-/// With `require_physical` (a full-quorum run, where the confirmation watermark cannot advance past
-/// an unfetched worker), "covered" is additionally required to be *physical*: at least one active
+/// With `require_physical`, "covered" is additionally required to be *physical*: at least one active
 /// listed holder must really hold the chunk (`holds`). A listing row alone doesn't prove possession —
-/// a committed-but-never-fetched replacement can lag unboundedly — so a chunk whose only listed
-/// holders never downloaded it is unanswerable despite being "covered" on paper. Below a full quorum
-/// possession genuinely lags the listing (the documented X% tradeoff), so there the physical side is
-/// telemetry, not fatal (the caller classifies it).
+/// a committed-but-never-fetched replacement can lag unboundedly. Callers use this mode for
+/// **classification only, at every quorum**: a paper-only state is legitimate in departure→rejoin
+/// windows (a rejoined worker is listed while its disk is still empty), so it can never be fatal
+/// state-wise. Eviction-caused physical loss is made fatal by the edge-triggered
+/// `assert_physical_retention` in the SUT, not by this predicate.
 pub(super) fn published_coverage(
     portal: &PortalAssignment,
     worker: Option<&WorkerAssignment>,
@@ -171,9 +171,9 @@ pub(super) fn published_coverage(
         if require_physical && !covered_physically {
             return Err(format!(
                 "published worker assignment covers chunk {chunk:?} on paper only: it lists active \
-                 holders, but none of them physically holds the chunk — at a full quorum every \
-                 confirmed copy is fetched, so a listing with zero physical copies means a real copy \
-                 was deleted for an unfetched replacement and the chunk is unanswerable",
+                 holders, but none of them physically holds the chunk — legitimate transiently in a \
+                 departure→rejoin window, a defect when eviction caused it (which the \
+                 physical-retention edge check polices)",
             ));
         }
     }

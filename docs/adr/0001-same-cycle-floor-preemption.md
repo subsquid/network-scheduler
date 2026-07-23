@@ -201,7 +201,11 @@ only fetched copy for a never-fetched survivor) was invisible to the one oracle 
 Four measures keep the envelope checked rather than asserted:
 
 - **Possession-confirmed eviction** (the guard rules above): the scheduler can no longer produce the
-  zero-physical-copy state by preemption.
+  zero-physical-copy state by preemption **for routed or portal-visible chunks**. A donor that is
+  neither (confirmed-but-not-yet-promoted — both backends feed `routed` visibility-filtered, so the
+  possession rule is vacuous for it) is still guarded only by its committed floor, which an unfetched
+  survivor satisfies on paper; that pre-promotion window has no readers and is exactly what the
+  required applied-report possession follow-up closes.
 - **Physical retention, edge-triggered** (`assert_physical_retention`): a routed chunk that had ≥ 1
   physical copy must not reach zero physical copies in a single transition unless that transition was
   a departure (data leaves with the worker) or a recorded shortage (drain expiry under a stalled

@@ -1375,6 +1375,202 @@ fn reclaim_never_takes_the_only_routed_copy_for_an_unfetched_survivor() {
     );
 }
 
+// KNOWN LIMITATION, pinned: the possession rule is scoped to routed donors, and both backends feed
+// `routed` visibility-filtered — so a confirmed-but-not-yet-promoted donor arrives with routed = ∅
+// and its only fetched copy IS evictable in favor of an unfetched committed survivor (the committed
+// floor is satisfied on paper). Accepted for now: a non-visible chunk has no readers until
+// promotion, and the per-worker applied-report possession view (ADR 0001, possession follow-up)
+// closes the window. This test pins the permissive behavior so that follow-up flips it consciously.
+#[test]
+fn reclaim_may_take_a_nonvisible_donors_fetched_copy_for_an_unfetched_survivor() {
+    let (holders, evicted) = drive_reconcile(
+        2,
+        1000,
+        1,
+        &[
+            // X: not yet portal-visible (routed = ∅ by the backends' visibility filter); fetched on
+            // w0, committed replacement on w1 unfetched; floor walk republishes w1.
+            ChunkLayout {
+                size: 1000,
+                ideal: vec![0, 1],
+                held: vec![0, 1],
+                committed: vec![0, 1],
+                routed: vec![],
+                hashes: vec![1],
+                is_portal_visible: false,
+            },
+            // C: starved, wants w0 — takes X's only fetched copy; nothing vetoes it today.
+            ChunkLayout {
+                size: 1000,
+                ideal: vec![0],
+                held: vec![],
+                committed: vec![],
+                routed: vec![],
+                hashes: vec![0],
+                is_portal_visible: false,
+            },
+        ],
+    );
+    assert_eq!(
+        evicted,
+        vec![(0, 0)],
+        "pre-promotion donors are currently unprotected by the possession rule; got {evicted:?}",
+    );
+    assert_eq!(
+        holders[0],
+        vec![1],
+        "X keeps only the (possibly unfetched) survivor row; got {holders:?}"
+    );
+}
+
+// Cumulative possession accounting: two starved floors preempting the SAME donor in one cycle must
+// not use each other's victim as the surviving routed copy. X is committed on w0,w1,w2 but routed
+// (possession-confirmed) only on w0,w1. C1 takes the routed copy on w0 — legal, w1 survives routed.
+// C2 then wants the routed copy on w1; its only routed "survivor" is w0, already evicted THIS cycle.
+// Without subtracting same-cycle evictions inside the possession rule, C2's eviction passes and X
+// loses both possession-confirmed copies, keeping only the unfetched w2 row. The subtraction vetoes.
+#[test]
+fn cumulative_preemption_never_takes_both_routed_copies_of_one_donor() {
+    let (holders, evicted) = drive_reconcile(
+        3,
+        1000,
+        1,
+        &[
+            // X: committed everywhere, routed (fetched-confirmed) only on w0,w1; floor lands on w2.
+            ChunkLayout {
+                size: 1000,
+                ideal: vec![0, 1, 2],
+                held: vec![0, 1, 2],
+                committed: vec![0, 1, 2],
+                routed: vec![0, 1],
+                hashes: vec![2],
+                is_portal_visible: true,
+            },
+            // C1: starved & visible, ring starts at w0 — takes X's routed copy there (w1 survives).
+            ChunkLayout {
+                size: 1000,
+                ideal: vec![0],
+                held: vec![],
+                committed: vec![],
+                routed: vec![],
+                hashes: vec![0],
+                is_portal_visible: true,
+            },
+            // C2: starved & visible, ring starts at w1 — must NOT take X's last routed copy.
+            ChunkLayout {
+                size: 1000,
+                ideal: vec![1],
+                held: vec![],
+                committed: vec![],
+                routed: vec![],
+                hashes: vec![1],
+                is_portal_visible: true,
+            },
+        ],
+    );
+    assert_eq!(
+        evicted,
+        vec![(0, 0)],
+        "only X's w0 copy may go; w1 is its last un-evicted routed copy; got {evicted:?}",
+    );
+    assert!(
+        holders[1].contains(&0),
+        "C1 seats on the reclaimed w0; got {holders:?}"
+    );
+    assert!(
+        holders[2].is_empty(),
+        "C2 stays short rather than taking the donor's last routed copy; got {holders:?}"
+    );
+}
+
+// Cumulative held accounting for the visible-donor rule: two starved floors must not each treat the
+// other's victim as the donor's surviving held copy. Visible Z (committed floor vacuous) has two
+// lingering held copies on w1,w2 while its replacement downloads on w0. C1 takes w1 — legal, w2
+// survives held. C2 then wants w2; without subtracting same-cycle evictions inside the visible-donor
+// rule, w1 still "survives" on paper and Z is stripped to zero held copies. The subtraction vetoes.
+#[test]
+fn cumulative_preemption_never_strips_a_visible_donors_held_copies() {
+    let (holders, evicted) = drive_reconcile(
+        3,
+        1000,
+        1,
+        &[
+            // Z: visible, committed floor vacuous; held drains on w1,w2; replacement placing on w0.
+            ChunkLayout {
+                size: 500,
+                ideal: vec![0],
+                held: vec![1, 2],
+                committed: vec![],
+                routed: vec![],
+                hashes: vec![0],
+                is_portal_visible: true,
+            },
+            // G: pins the other half of w0 at its floor.
+            ChunkLayout {
+                size: 500,
+                ideal: vec![0],
+                held: vec![0],
+                committed: vec![0],
+                routed: vec![0],
+                hashes: vec![0],
+                is_portal_visible: false,
+            },
+            // F1/F2: pin the other halves of w1/w2 at their floors.
+            ChunkLayout {
+                size: 500,
+                ideal: vec![1],
+                held: vec![1],
+                committed: vec![1],
+                routed: vec![1],
+                hashes: vec![1],
+                is_portal_visible: false,
+            },
+            ChunkLayout {
+                size: 500,
+                ideal: vec![2],
+                held: vec![2],
+                committed: vec![2],
+                routed: vec![2],
+                hashes: vec![2],
+                is_portal_visible: false,
+            },
+            // C1: starved & visible, ring starts at w1 — takes Z's drain there (w2 survives).
+            ChunkLayout {
+                size: 500,
+                ideal: vec![1],
+                held: vec![],
+                committed: vec![],
+                routed: vec![],
+                hashes: vec![1],
+                is_portal_visible: true,
+            },
+            // C2: starved & visible, ring starts at w2 — must NOT take Z's last held copy.
+            ChunkLayout {
+                size: 500,
+                ideal: vec![2],
+                held: vec![],
+                committed: vec![],
+                routed: vec![],
+                hashes: vec![2],
+                is_portal_visible: true,
+            },
+        ],
+    );
+    assert_eq!(
+        evicted,
+        vec![(0, 1)],
+        "only Z's drain on w1 may go; w2 is its last un-evicted held copy; got {evicted:?}",
+    );
+    assert!(
+        holders[4].contains(&1),
+        "C1 seats on the reclaimed w1; got {holders:?}"
+    );
+    assert!(
+        holders[5].is_empty(),
+        "C2 stays short rather than stripping the visible donor holderless; got {holders:?}"
+    );
+}
+
 // A portal-visible donor keeps its last held copy even when its committed floor is vacuous.
 // X is visible with |committed| = 0 (its committed holders departed) and one lingering held copy
 // on w1 while its replacement downloads on w0. Under the bare `|committed| = 0 ⇒ floor 0` rule

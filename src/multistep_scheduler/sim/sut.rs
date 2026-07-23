@@ -1596,8 +1596,10 @@ impl<D: SimStorage> SimUnderTest<D> {
     /// Physical-retention oracle (edge-triggered): a routed chunk that had ≥ 1 physical copy on an
     /// active worker must not reach zero physical copies in one transition, unless that transition
     /// was a departure (`WorkerLeft` — the data leaves with the worker, a documented availability
-    /// event) or the fleet is in a recorded shortage (drain expiry under a stalled scrub is the
-    /// documented unavoidable residual).
+    /// event). The shortage latch is deliberately NOT an excuse at a full quorum: shortage cycles
+    /// commit nothing, so every assignment a worker applies during a streak was guard-vetted while
+    /// feasible — loss under the latch is a guard bug, not a shortage effect. Below a full quorum
+    /// the latch (like everything else) downgrades the check to classification.
     ///
     /// This is the check the state-based coverage oracles cannot make: "listed holder with an empty
     /// disk" is legitimate in departure→rejoin windows, so paper-only coverage can't be fatal by
@@ -1642,17 +1644,31 @@ impl<D: SimStorage> SimUnderTest<D> {
                     .collect()
             })
             .unwrap_or_default();
-        let excused = self.last_transition_shed_a_worker || self.is_infeasible;
-        let breached = !lost.is_empty() && !excused;
-        if breached && self.confirm_threshold_pct >= 100 {
+        let strict = self.confirm_threshold_pct >= 100;
+        let lost_without_departure = !lost.is_empty() && !self.last_transition_shed_a_worker;
+        // At a full quorum the shortage latch is NOT an excuse: a shortage cycle commits nothing, so
+        // the only assignments workers apply during a streak were guard-vetted while feasible —
+        // physical loss landing under the latch is a guard bug wearing a shortage as camouflage.
+        // Below a full quorum, quorum-keyed drain expiry can legitimately outrun a laggard
+        // replacement, so there the loss is classified (both in and out of shortage), not fatal.
+        if lost_without_departure && strict {
             panic!(
                 "physical retention breached: routed chunk(s) {lost:?} went from ≥1 physical copy \
-                 to zero in a single non-departure transition — a worker deleted a routed chunk's \
+                 to zero in a single non-departure transition{} — a worker deleted a routed chunk's \
                  last downloaded copy for a replacement that hasn't downloaded yet",
+                if self.is_infeasible {
+                    " (during a recorded shortage, which commits nothing and so cannot justify it)"
+                } else {
+                    ""
+                },
             );
         }
         statistics::classify(
-            breached,
+            lost_without_departure && self.is_infeasible,
+            "physical retention: loss coincided with shortage latch (<100% quorum)",
+        );
+        statistics::classify(
+            lost_without_departure && !self.is_infeasible,
             "physical retention: routed chunk lost its last copy without a departure (<100% quorum)",
         );
         self.physically_covered = covered_now;

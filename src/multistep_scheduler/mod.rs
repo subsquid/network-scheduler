@@ -878,6 +878,13 @@ impl<'a> Reconcile<'a> {
                         // possession proof the algorithm has (the confirmed routing only addresses
                         // workers that confirmed holding), so deleting a routed copy additionally
                         // requires a surviving committed copy that is itself routed.
+                        //
+                        // Scope: both backends feed `routed` visibility-filtered, so this rule is
+                        // vacuous for a not-yet-visible donor (`routed[xi]` empty) — its copies are
+                        // guarded by the committed floor only, and its sole fetched copy remains
+                        // evictable for an unfetched survivor until the per-worker applied-report
+                        // possession view lands (ADR 0001, possession follow-up). Bounded harm: a
+                        // non-visible chunk has no readers until promotion.
                         && (!routed[xi].contains(&worker)
                             || committed[xi].iter().any(|&w2| {
                                 w2 != worker
