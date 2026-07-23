@@ -50,24 +50,22 @@ pub struct ScheduledChunk<'a> {
     pub is_portal_visible: bool,
 }
 
-/// `current[i]` — **positions into `workers`** of the peers physically holding chunk `i` now,
-/// draining copies included. The caller owns the PeerId↔position mapping; copies on a departed
-/// worker must be left out (they become a shortfall). Returns the full published placement
-/// (new copies plus current copies retained to hold the floor).
+/// Compute this cycle's placement from the current one.
 ///
-/// `committed[i]` and `routed[i]` share the **positions-into-`workers`** shape and split out the two
-/// roles the flattened `current` mixes (see `docs/adr/0001-same-cycle-floor-preemption.md`):
-/// - `committed[i]` — pre-cycle *committed ideal* holders: the durability floor `step_safety`
-///   retention measures against. **Hard**: a donor always keeps
-///   ≥ `min(min_replication, |committed|)` committed copies un-evicted.
-/// - `routed[i]` — holders the *confirmed routing* still addresses. **Best-effort**: orders eviction
-///   victims (still-routed sacrificed last) but never blocks an eviction — confirmation lag is
-///   unbounded below a full quorum, so hard-protecting routing could pin disk indefinitely.
+/// The three placement views are per-chunk lists of **positions into `workers`**; the caller owns
+/// the PeerId↔position mapping:
+/// - `current[i]` — who physically holds chunk `i` now, draining copies included. Leave out copies
+///   on departed workers; they count as missing.
+/// - `committed[i]` — the previous cycle's committed ideal. Eviction never takes a donor below
+///   `min(min_replication, |committed|)` of these copies — its durability floor.
+/// - `routed[i]` — who the confirmed routing still points at. Orders eviction victims
+///   (still-routed last) but never blocks one: confirmation lag is unbounded, so routing must not
+///   pin disk. See `docs/adr/0001-same-cycle-floor-preemption.md`.
 ///
-/// Returns the published placement plus the `(chunk, holder)` pairs force-dropped this cycle to
-/// floor a starved chunk. Evictions are **not** part of the assignment — a worker removes a copy
-/// simply because it is absent from its assignment; the list only tells storage not to re-mint the
-/// dropped copies as draining `stale` mappings (which would re-add them and overcommit the worker).
+/// Returns the new placement (fresh copies plus retained current ones), and the `(chunk, holder)`
+/// pairs preemption deleted this cycle. Evicted pairs are not part of the assignment — workers
+/// delete by omission. The list exists so storage skips re-minting those copies as draining
+/// `stale` mappings, which would re-add their bytes and overcommit the worker.
 pub fn schedule(
     chunks: &[ScheduledChunk<'_>],
     workers: &[Worker],

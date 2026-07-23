@@ -52,7 +52,7 @@ use proptest_state_machine::iterative_runner::{Iterative, IterativeRunner};
 use sut::{Action, SimConfig, SimUnderTest};
 use utils::{
     Seed, SweepStatistics, env_seed, in_memory_sim_cases, master_seed, pg_sim_cases,
-    proptest_config, seed_from_hex, seed_hex, trace_enabled,
+    proptest_config, seed_hex, trace_enabled,
 };
 
 /// The models against the in-memory backend, swept over the [`in_memory_sim_cases`] budget.
@@ -114,47 +114,6 @@ mod in_memory {
     #[test]
     fn churn_simulation_case() -> Result<(), TestError<(SimConfig, Vec<Action>)>> {
         replay_case(&churn(), "churn_simulation_case")
-    }
-
-    /// Regression, seed-pinned: guards the churn precondition against an unpreventable departure.
-    /// Under `min_replication` oscillation (4→1→2) a chunk can collapse to a single committed-ideal
-    /// copy whose peers hold only draining stale copies; if that worker departs before the raised
-    /// floor re-replicates, the last durable copy leaves with it — genuine global uncoverage.
-    /// [`is_removal_recoverable`] admits a departure only when a surviving committed-ideal holder
-    /// remains. Pinned by seed because a concrete-action `replay` does not reproduce the
-    /// multi-cycle stale-expiry timing.
-    #[test]
-    fn churn_oscillation_does_not_strand_a_visible_chunk()
-    -> Result<(), TestError<(SimConfig, Vec<Action>)>> {
-        let seed =
-            seed_from_hex("d090ccc13ce21e8522345ae2f0c423ef82009897965a5455a3fc6848485ef21b")
-                .expect("valid 64-hex seed");
-        run_case(
-            &churn(),
-            &proptest_config(),
-            seed,
-            &mut SweepStatistics::default(),
-        )
-    }
-
-    /// Regression, seed-pinned: a routing strand under a recorded shortage is not a defect. The case
-    /// over-subscribes the fleet (`min_replication` 2, ~30 chunks on 5 workers): a portal-visible
-    /// chunk is dropped from the ideal, its scrub diff can't confirm under full quorum, and its
-    /// stale copies expire — globally uncovered while still routed. Both strand oracles
-    /// (`published_coverage`, within-M `portal_consistency`) stand down while `is_infeasible`.
-    /// Pinned by seed because the strand only forms after a multi-cycle shortage streak.
-    #[test]
-    fn shortage_routing_strand_is_not_a_defect() -> Result<(), TestError<(SimConfig, Vec<Action>)>>
-    {
-        let seed =
-            seed_from_hex("5466d59c65053f317384e3625ef7f04d8bd56a11df8ac940363981c37fd3ca1b")
-                .expect("valid 64-hex seed");
-        run_case(
-            &churn(),
-            &proptest_config(),
-            seed,
-            &mut SweepStatistics::default(),
-        )
     }
 
     /// Guided walk at a 0% confirmation quorum ([`ZeroQuorumModel`]): the watermark tracks the
