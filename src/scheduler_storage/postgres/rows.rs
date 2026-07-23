@@ -36,11 +36,10 @@ pub(super) struct WorkerRow {
     pub(super) inactive_since: Option<i64>,
 }
 
-/// An active chunk with its current holders (ideal ∪ stale), committed ideal, and confirmed
-/// routing — every placement the cycle needs in one round-trip. The chunk columns mirror
-/// [`ChunkRow`], except `dataset_id` replaces the name, which resolves through the per-cycle
-/// dataset list (see `fetch_active_chunks_with_placement`). `worker_ids` is `None` for a chunk
-/// with no current placement, distinguishing "unplaced" from a placed-but-empty set.
+/// An active chunk with its committed ideal and confirmed routing — the current placement
+/// (ideal ∪ stale) is derived by the caller from the separately fetched stale rows. The chunk
+/// columns mirror [`ChunkRow`], except `dataset_id` replaces the name, which resolves through
+/// the per-cycle dataset list (see `fetch_active_chunks_with_placement`).
 #[derive(sqlx::FromRow)]
 pub(super) struct ActiveChunkRow {
     pub(super) chunk_pk: ChunkPk,
@@ -51,9 +50,9 @@ pub(super) struct ActiveChunkRow {
     pub(super) tables_present: Option<bit_vec::BitVec>,
     pub(super) first_block: i64,
     pub(super) last_block_delta: i32,
-    pub(super) worker_ids: Option<Vec<WorkerPk>>,
-    /// The committed ideal holders alone (pre-merge, no stale), for the eviction durability floor.
-    /// `None` when the chunk has no committed ideal row yet (pending/holderless).
+    /// The committed ideal holders, for the eviction durability floor. `None` when the chunk has
+    /// no committed ideal row yet (pending/holderless), distinguishing "unplaced" from a
+    /// placed-but-empty set.
     pub(super) ideal_worker_ids: Option<Vec<WorkerPk>>,
     /// Confirmed routing — the eviction victim-ordering input. NULL for non-portal-visible chunks.
     pub(super) routed_worker_ids: Option<Vec<WorkerPk>>,

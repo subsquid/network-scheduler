@@ -25,26 +25,6 @@ use super::rows::{
     ActiveChunkRow, WorkerRow, assignment_worker_from_row, chunk_from_active_row, tick_to_i64,
 };
 
-/// Per-chunk stale holders aggregated once, for `LEFT JOIN stale_agg st` — pairs with
-/// [`PLACEMENT_MERGE`].
-const STALE_AGG_CTE: &str = "\
-        WITH stale_agg AS (
-            SELECT chunk_pk, array_agg(worker_id) AS extra
-            FROM sched_stale_mappings
-            GROUP BY chunk_pk
-        )";
-
-/// Placement = ideal ∪ stale. The ideal already stores each chunk's holders as a (sorted) array,
-/// so it passes through untouched; only chunks that actually have a stale row pay the unnest+merge
-/// — the whole ideal isn't decomposed and re-aggregated every read.
-const PLACEMENT_MERGE: &str = "\
-               CASE
-                   WHEN st.extra IS NULL THEN i.worker_ids
-                   WHEN i.worker_ids IS NULL
-                       THEN (SELECT array_agg(DISTINCT v ORDER BY v) FROM unnest(st.extra) AS v)
-                   ELSE (SELECT array_agg(DISTINCT v ORDER BY v) FROM unnest(i.worker_ids || st.extra) AS v)
-               END AS worker_ids";
-
 pub(super) async fn open_worker_assignment(
     tx: &mut Transaction<'_, Postgres>,
     now: u64,
@@ -176,9 +156,18 @@ pub(super) async fn fetch_active_chunks_with_placement(
         rank_of.insert(name, rank as u32);
     }
 
-    let sql = format!(
-        r#"
-        {STALE_AGG_CTE}
+    // Stale is a sliver of the chunk set, so the current placement (ideal ∪ stale) is derived
+    // client-side: the big query ships one holder array per chunk (the ideal), not two
+    // near-identical ones, and only chunks with a stale row pay the merge.
+    let stale_rows: Vec<(ChunkPk, Vec<WorkerPk>)> = sqlx::query_as(
+        "SELECT chunk_pk, array_agg(worker_id) FROM sched_stale_mappings GROUP BY chunk_pk",
+    )
+    .fetch_all(&mut **tx)
+    .await
+    .context("run_scheduling_cycle: fetch stale holders")?;
+    let mut stale_extra: FxHashMap<ChunkPk, Vec<WorkerPk>> = stale_rows.into_iter().collect();
+
+    let sql = r#"
         SELECT c.chunk_pk, c.dataset_id, c.chunk_id, c.size,
                c.schema_id, c.tables_present,
                c.first_block, c.last_block_delta,
@@ -188,18 +177,15 @@ pub(super) async fn fetch_active_chunks_with_placement(
                i.worker_ids AS ideal_worker_ids,
                CASE WHEN s.applied_at_portal_assignment_id IS NOT NULL
                      AND s.dropped_at_portal_assignment_id IS NULL
-                    THEN ccw.worker_ids END AS routed_worker_ids,
-               {PLACEMENT_MERGE}
+                    THEN ccw.worker_ids END AS routed_worker_ids
         FROM chunks c
         JOIN sched_chunk_metadata s ON s.chunk_pk = c.chunk_pk
         LEFT JOIN sched_ideal_chunk_workers i ON i.chunk_pk = c.chunk_pk
         LEFT JOIN sched_confirmed_chunk_workers ccw ON ccw.chunk_pk = c.chunk_pk
-        LEFT JOIN stale_agg st ON st.chunk_pk = c.chunk_pk
         WHERE s.dropped_from_worker_assignment_at IS NULL
           AND NOT s.rejected
-        "#
-    );
-    let mut stream = sqlx::query_as::<_, ActiveChunkRow>(sqlx::AssertSqlSafe(sql)).fetch(&mut **tx);
+        "#;
+    let mut stream = sqlx::query_as::<_, ActiveChunkRow>(sql).fetch(&mut **tx);
 
     let with_capacity =
         || CurrentPlacement::with_capacity_and_hasher(capacity_hint, Default::default());
@@ -223,11 +209,25 @@ pub(super) async fn fetch_active_chunks_with_placement(
             .clone();
         let pk = row.chunk_pk;
         let is_portal_visible = row.is_portal_visible;
-        if let Some(holders) = row.worker_ids.take() {
-            out.current_placement.insert(pk, holders);
-        }
-        if let Some(committed) = row.ideal_worker_ids.take() {
-            out.committed_placement.insert(pk, committed);
+        match (row.ideal_worker_ids.take(), stale_extra.remove(&pk)) {
+            (Some(ideal), None) => {
+                out.current_placement.insert(pk, ideal.clone());
+                out.committed_placement.insert(pk, ideal);
+            }
+            (Some(ideal), Some(extra)) => {
+                let mut merged = ideal.clone();
+                merged.extend(extra);
+                merged.sort_unstable();
+                merged.dedup();
+                out.current_placement.insert(pk, merged);
+                out.committed_placement.insert(pk, ideal);
+            }
+            (None, Some(mut extra)) => {
+                extra.sort_unstable();
+                extra.dedup();
+                out.current_placement.insert(pk, extra);
+            }
+            (None, None) => {}
         }
         if let Some(routed) = row.routed_worker_ids.take() {
             out.confirmed_routing.insert(pk, routed);
