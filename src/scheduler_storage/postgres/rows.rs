@@ -38,12 +38,11 @@ pub(super) struct WorkerRow {
 
 /// An active chunk paired with its current holders (ideal ∪ stale), fetched in one round-trip so the
 /// cycle needn't query the placement separately. `worker_ids` is `None` for a chunk with no current
-/// placement distinguishing "unplaced" from a placed-but-empty set.
+/// placement, distinguishing "unplaced" from a placed-but-empty set.
 #[derive(sqlx::FromRow)]
 pub(super) struct ActiveChunkRow {
     #[sqlx(flatten)]
     pub(super) chunk: ChunkRow,
-    ///
     pub(super) worker_ids: Option<Vec<WorkerPk>>,
     /// The committed ideal holders alone (pre-merge, no stale), for the eviction durability floor.
     /// `None` when the chunk has no committed ideal row yet (pending/holderless).
