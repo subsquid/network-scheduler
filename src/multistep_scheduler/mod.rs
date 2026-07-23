@@ -8,6 +8,7 @@
 //! - **held** — copies the current assignment keeps on a worker. Workers apply assignments
 //!   asynchronously, so a held copy is *instructed*, not necessarily downloaded yet; retaining
 //!   one costs no new bytes.
+//!
 //! Draining copies are not distinguished from other held copies — that split lives in the caller.
 //!
 //! Stage 1 ([`ideal_chunk_workers`]) computes the ideal. Stage 2 ([`Reconcile`]) re-walks the same
