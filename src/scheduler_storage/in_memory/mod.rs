@@ -889,6 +889,50 @@ impl SchedulerStorage for InMemoryStorage {
             let departed_set: HashSet<WorkerPk> = departed.iter().copied().collect();
             self.sched_stale_mappings
                 .retain(|(_, worker_id), _| !departed_set.contains(worker_id));
+
+            // A departure can make the confirmation of a handoff vacuous: the quorum shrank, so
+            // the watermark may pass an assignment its recipients never applied
+            // (docs/mvcc-storage.md, Invariant 2 at pair granularity). If a chunk's
+            // committed-ideal holders are now all departed, re-promote its active stale holders
+            // to committed ideal — the superseded copy becomes a first-class holder again before
+            // Invariant 4's clock can destroy the only fetched copy. Excess copies shed as
+            // ordinary drains in later cycles; the departed ideal rows are left for the next
+            // cycle's diff (the stale mint already skips inactive workers).
+            let handoff_void: HashSet<ChunkPk> = self
+                .sched_ideal_chunk_workers
+                .iter()
+                .filter(|(_, holders)| {
+                    !holders.is_empty()
+                        && holders.iter().all(|w| {
+                            self.sched_workers
+                                .get(w)
+                                .is_none_or(|entry| entry.inactive_since.is_some())
+                        })
+                })
+                .map(|(pk, _)| *pk)
+                .collect();
+            let promoted: Vec<(ChunkPk, WorkerPk)> = self
+                .sched_stale_mappings
+                .keys()
+                .filter(|(pk, worker_id)| {
+                    handoff_void.contains(pk)
+                        && self
+                            .sched_workers
+                            .get(worker_id)
+                            .is_some_and(|entry| entry.inactive_since.is_none())
+                })
+                .copied()
+                .collect();
+            for (pk, worker_id) in promoted {
+                self.sched_stale_mappings.remove(&(pk, worker_id));
+                let holders = self
+                    .sched_ideal_chunk_workers
+                    .get_mut(&pk)
+                    .expect("promoted chunk came from the ideal");
+                if !holders.contains(&worker_id) {
+                    holders.push(worker_id);
+                }
+            }
         }
 
         self.evict_stale_workers(now.saturating_sub(gc_ticks));

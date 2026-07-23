@@ -319,6 +319,7 @@ impl SchedulerStorage for PostgresStorage {
             workers::upsert_active(&mut tx, &peer_ids, &versions).await?;
             let departed = workers::mark_departed(&mut tx, &peer_ids, now).await?;
             workers::delete_stale_mappings(&mut tx, &departed).await?;
+            workers::promote_orphaned_drains(&mut tx, &departed).await?;
             workers::gc_inactive(&mut tx, now, gc_ticks).await?;
             tx.commit().await.context("update_worker_set: commit")?;
 

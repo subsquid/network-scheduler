@@ -1255,3 +1255,107 @@ fn shortage_routing_strand_is_not_a_defect() {
         ],
     );
 }
+
+/// Captured by the in-memory `churn_simulation` (`SIM_CASE_SEED=21d9bddcd17fdb94cd8ed990d2163ca32fa970ad2480f65c2d3fd3247e36e17c`, shrunk to 19
+/// actions). A reshuffle hands one chunk (`ChunkPk(31)` in-memory) from W10 — its only fetched
+/// holder — to the just-joined W8, minting W10's drain row; W8 departs before fetching anything,
+/// and `SetMinReplication(2)` opens a shortage streak. During the streak the confirmation
+/// watermark passes the reshuffle without W8 (a departed worker leaves the quorum denominator —
+/// a *vacuous* confirmation), the chunk is promoted routed only at the absent W8, and the M-tick
+/// expiry deletes the drain row: the only record that W10 holds the fleet's sole fetched copy.
+/// W8 then rejoins empty, the next feasible cycle publishes without W10, and W10's fetch deletes
+/// that copy — `assert_physical_retention` fires. The fix re-promotes: when the departure leaves
+/// the chunk with every committed-ideal holder departed, its active stale holders (W10) return
+/// to the committed ideal, protected by the ordinary retention floor.
+fn vacuous_confirmation_must_not_expire_the_last_drain_case() -> (SimConfig, Vec<Action>) {
+    let config = SimConfig {
+        worker_count: 8,
+        min_replication: 4,
+        saturation: 0.72,
+        gc_ticks: 15,
+        ..base_config()
+    };
+    let nc = |key: u64, weight: u16, dataset: &str| {
+        new_chunk((mint_key(key), CHUNK_SIZE, weight, dataset.to_string()))
+    };
+    let actions = vec![
+        Action::AddChunks(vec![nc(23300, 1, "s3://sim-1"), nc(37376, 4, "s3://sim-0")]),
+        Action::AddChunks(vec![
+            nc(6240, 12, "s3://sim-2"),
+            nc(18125, 4, "s3://sim-2"),
+            nc(20397, 4, "s3://sim-1"),
+            nc(16404, 12, "s3://sim-2"),
+        ]),
+        Action::AddChunks(vec![
+            nc(46355, 1, "s3://sim-2"),
+            nc(31766, 4, "s3://sim-0"),
+            nc(65379, 4, "s3://sim-2"),
+            nc(39489, 1, "s3://sim-0"),
+        ]),
+        Action::AddChunks(vec![
+            nc(1563, 1, "s3://sim-1"),
+            nc(43984, 4, "s3://sim-1"),
+            nc(16344, 12, "s3://sim-2"),
+            nc(36142, 1, "s3://sim-2"),
+            nc(15851, 4, "s3://sim-2"),
+        ]),
+        Action::WorkerJoined(10),
+        Action::AddChunks(vec![
+            nc(64399, 1, "s3://sim-2"),
+            nc(42583, 1, "s3://sim-1"),
+            nc(3816, 1, "s3://sim-1"),
+            nc(23951, 1, "s3://sim-1"),
+            nc(31852, 1, "s3://sim-1"),
+        ]),
+        Action::AddChunks(vec![
+            nc(65156, 4, "s3://sim-2"),
+            nc(13194, 12, "s3://sim-0"),
+            nc(62901, 4, "s3://sim-1"),
+            nc(49684, 12, "s3://sim-0"),
+            nc(60849, 12, "s3://sim-1"),
+        ]),
+        Action::SetMinReplication(1),
+        Action::AddChunks(vec![
+            nc(77, 12, "s3://sim-2"),
+            nc(36179, 12, "s3://sim-2"),
+            nc(28930, 12, "s3://sim-0"),
+        ]),
+        Action::AddChunks(vec![
+            nc(23261, 4, "s3://sim-0"),
+            nc(16087, 4, "s3://sim-1"),
+            nc(48532, 4, "s3://sim-0"),
+            nc(17745, 12, "s3://sim-0"),
+        ]),
+        // W8 joins and the reshuffle hands the chunk to it (drain minted for W10)...
+        Action::WorkerJoined(8),
+        Action::SetMinReplication(1),
+        Action::AddChunks(vec![nc(16568, 1, "s3://sim-0")]),
+        // ...then departs without ever fetching, voiding the handoff.
+        Action::WorkerLeft(8),
+        // Shortage streak: nothing commits, but clock-driven expiry keeps running.
+        Action::SetMinReplication(2),
+        Action::CheckConverged(ConvergenceCheck::FloorLocallyFeasible),
+        Action::WorkerJoined(8),
+        Action::SetMinReplication(1),
+        // W10 (the only fetched holder) applies the post-shortage assignment.
+        Action::WorkerFetchAssignment {
+            worker: 10,
+            succeeds: true,
+        },
+    ];
+    (config, actions)
+}
+
+#[test]
+fn vacuous_confirmation_must_not_expire_the_last_drain() {
+    let (config, actions) = vacuous_confirmation_must_not_expire_the_last_drain_case();
+    replay(&config, actions);
+}
+
+/// Postgres twin: the re-promotion is a `update_worker_set` SQL phase — exercise it on the real
+/// backend, keeping the two storages at parity on the fix.
+#[test]
+fn vacuous_confirmation_must_not_expire_the_last_drain_pg() {
+    let (config, actions) = vacuous_confirmation_must_not_expire_the_last_drain_case();
+    replay_pg(&config, actions);
+}
