@@ -36,30 +36,26 @@ pub(super) struct WorkerRow {
     pub(super) inactive_since: Option<i64>,
 }
 
-/// An active chunk paired with its current holders (ideal ∪ stale), its committed ideal, and its
-/// confirmed routing, fetched in one round-trip so the cycle needn't query any placement
-/// separately. Carries `dataset_id`, not the dataset name: the name is resolved through the
-/// (tiny) dataset list fetched once per cycle, keeping 6M+ text values off the wire.
-/// `worker_ids` is `None` for a chunk with no current placement, distinguishing "unplaced" from a
-/// placed-but-empty set.
+/// An active chunk with its current holders (ideal ∪ stale), committed ideal, and confirmed
+/// routing — every placement the cycle needs in one round-trip. The chunk columns mirror
+/// [`ChunkRow`], except `dataset_id` replaces the name, which resolves through the per-cycle
+/// dataset list (see `fetch_active_chunks_with_placement`). `worker_ids` is `None` for a chunk
+/// with no current placement, distinguishing "unplaced" from a placed-but-empty set.
 #[derive(sqlx::FromRow)]
 pub(super) struct ActiveChunkRow {
     pub(super) chunk_pk: ChunkPk,
     pub(super) dataset_id: i16,
     pub(super) chunk_id: String,
     pub(super) size: i32,
-    /// The chunk's schema pin (stamped at insert, never NULL).
     pub(super) schema_id: SchemaId,
     pub(super) tables_present: Option<bit_vec::BitVec>,
     pub(super) first_block: i64,
-    /// last_block - first_block; add to `first_block` to recover the inclusive end.
     pub(super) last_block_delta: i32,
     pub(super) worker_ids: Option<Vec<WorkerPk>>,
     /// The committed ideal holders alone (pre-merge, no stale), for the eviction durability floor.
     /// `None` when the chunk has no committed ideal row yet (pending/holderless).
     pub(super) ideal_worker_ids: Option<Vec<WorkerPk>>,
-    /// Confirmed routing (portal-visible chunks only; the SQL nulls it for the rest), for the
-    /// eviction victim ordering.
+    /// Confirmed routing — the eviction victim-ordering input. NULL for non-portal-visible chunks.
     pub(super) routed_worker_ids: Option<Vec<WorkerPk>>,
     pub(super) is_portal_visible: bool,
     /// Has ever entered a worker assignment (`applied_at_worker_assignment_id IS NOT NULL`). With the

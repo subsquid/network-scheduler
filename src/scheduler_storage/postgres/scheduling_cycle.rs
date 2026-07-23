@@ -141,8 +141,7 @@ pub(super) struct ActiveChunks {
     pub(super) current_placement: CurrentPlacement,
     /// ideal alone
     pub(super) committed_placement: CurrentPlacement,
-    /// Confirmed routing of portal-visible chunks (the eviction victim-ordering hint), read in the
-    /// same scan instead of a second full-table query.
+    /// Confirmed routing of portal-visible chunks — the eviction victim-ordering hint.
     pub(super) confirmed_routing: CurrentPlacement,
     /// Full-column decode of the active rows, reused by the post-commit
     /// [`build_worker_assignment`] so it needn't re-read the chunks; shares `for_algo`'s `Arc`s.
@@ -154,20 +153,16 @@ pub(super) struct ActiveChunks {
 /// Reads every active chunk — registered, and neither `rejected` nor removed (tombstoned) — spanning
 /// the lifecycle from **pending** (registered but not yet placed) through **marked-for-removal**.
 /// Pending chunks are included so the algorithm can place them; they carry no `current_placement` entry.
-/// `capacity_hint` pre-sizes the 6M+-entry decode maps; the caller passes the previous cycle's
-/// active-chunk count (exact to within one cycle's churn, 0 on the first cycle — plain growth).
+/// `capacity_hint` pre-sizes the decode maps — the previous cycle's active-chunk count.
 pub(super) async fn fetch_active_chunks_with_placement(
     tx: &mut Transaction<'_, Postgres>,
     capacity_hint: usize,
 ) -> Result<ActiveChunks> {
     let mut timer = PhaseTimer::new("run_scheduling_cycle:fetch_active_chunks_with_placement");
 
-    // The (tiny) dataset list, in the exact order the server's collation sorts names — the
-    // per-chunk feed order below reuses it, so the big query neither joins `datasets` nor sorts:
-    // the 6M+ per-row name texts stay off the wire and the widest sort in the cycle moves client-
-    // side onto integer keys.
-    // `id` tiebreaker: names are byte-unique, but a non-C collation may compare two distinct
-    // names equal — the rank must still be deterministic.
+    // The dataset list in the server's collation order; the sort below uses its ranks, so the
+    // big query neither joins `datasets` (6M+ name texts stay off the wire) nor sorts. `id`
+    // tiebreaks names a non-C collation may compare equal.
     let dataset_rows: Vec<(i16, String)> =
         sqlx::query_as("SELECT id, name FROM datasets ORDER BY name, id")
             .fetch_all(&mut **tx)
@@ -246,9 +241,8 @@ pub(super) async fn fetch_active_chunks_with_placement(
         out.published.insert(pk, chunk);
         count += 1;
     }
-    // Same feed order the SQL `ORDER BY d.name, c.first_block` used to produce (stage-1 packing is
-    // order-sensitive, so the order is part of the algorithm's observable behaviour), rebuilt from
-    // the server-collated dataset ranks — an integer-key sort instead of a 6M+-row text sort.
+    // The exact order `ORDER BY d.name, c.first_block` would produce — stage-1 packing is
+    // order-sensitive, so the feed order is observable behaviour — as an integer-key sort.
     out.for_algo
         .sort_by_cached_key(|(_, chunk)| (rank_of[&*chunk.dataset], *chunk.blocks.start()));
     timer.stmt(count);

@@ -1,7 +1,6 @@
-//! Pins the scheduling cycle's chunk feed order. Stage-1 packing is order-sensitive, so the
-//! order the backend feeds the algorithm is observable behaviour: `(dataset name, first_block)`,
-//! collated by the server. The fetch reproduces it client-side from the ranked dataset list
-//! instead of a 6M+-row SQL sort — this test fails if that reconstruction drifts.
+//! Pins the scheduling cycle's chunk feed order: `(dataset name, first_block)`, server-collated.
+//! Stage-1 packing is order-sensitive, so the feed order is observable behaviour, and the fetch
+//! reconstructs it client-side rather than sorting in SQL.
 
 use sqlx::Connection;
 

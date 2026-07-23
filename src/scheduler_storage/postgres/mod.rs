@@ -56,8 +56,8 @@ pub struct PostgresStorage {
     rt: tokio::runtime::Runtime,
     conn: std::cell::RefCell<PgConnection>,
     batch_size: usize,
-    /// Last cycle's active-chunk count — the capacity hint for the next cycle's decode maps.
-    /// Exact to within one cycle's churn; 0 before the first cycle (plain map growth).
+    /// Last cycle's active-chunk count, pre-sizing the next cycle's decode maps. Exact to within
+    /// one cycle's churn; 0 before the first cycle.
     active_chunk_hint: usize,
 }
 
@@ -360,11 +360,9 @@ impl SchedulerStorage for PostgresStorage {
             // Phase B — placement reconcile; rolls back on shortage, leaving Phase A committed.
             let mut tx = conn.begin().await.context("run_scheduling_cycle: begin")?;
 
-            // One streamed round-trip decoding the algorithm's inputs and the published chunk
-            // columns together, so the post-commit assignment build needn't re-read them.
-            // `confirmed_routing` (the eviction victim-ordering hint) rides in the same scan,
-            // filtered to portal-visible chunks in the SQL, matching the in-memory backend's
-            // routed set.
+            // One streamed round-trip decoding the algorithm's inputs — confirmed routing
+            // included, filtered to portal-visible chunks like the in-memory backend's routed
+            // set — and the published chunk columns the post-commit assignment build reuses.
             let phase::ActiveChunks {
                 for_algo: chunks_for_algo,
                 current_placement,
