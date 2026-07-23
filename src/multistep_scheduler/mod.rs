@@ -207,16 +207,14 @@ fn schedule_to_workers(
     routed: &[Vec<WorkerIndex>],
     cache: &mut WorkerRingCache,
 ) -> Result<(Assignment, Vec<(ChunkIndex, PeerId)>), ReplicationError> {
-    let caps = replication_cap(chunks, workers.len(), config)?;
+    let replication_by_weight = target_replication_by_weight(chunks, workers.len(), config)?;
     // Hash every replica once here; Stage 1 and Stage 2 both index these instead of re-hashing.
-    let hashes = hash_chunks(chunks, &caps, config.min_replication);
-    let replicated = to_replicated(chunks, &caps, &hashes);
-    tracing::info!("Replication caps by weight: {caps:?}");
+    let hashes = hash_chunks(chunks, &replication_by_weight, config.min_replication);
+    let replicated: Vec<ReplicatedChunk<'_>> =
+        to_replicated(chunks, &replication_by_weight, &hashes);
+    tracing::info!("Target replication by weight: {replication_by_weight:?}");
 
     let rings = cache.rings(workers.iter().map(|w| w.id));
-
-    // `current` positions index `workers` — `schedule` translates them whenever it reorders.
-    let held = current;
 
     // Version-pinned chunks first: they compete for the scarcest eligible workers, so they claim
     // capacity before unrestricted ones. `partition` keeps input order, so placement is deterministic.
@@ -226,7 +224,8 @@ fn schedule_to_workers(
     let restricted_count = restricted.len();
     let placement_order: Vec<usize> = restricted.into_iter().chain(unrestricted).collect();
 
-    let ideal = ideal_chunk_workers(
+    // Calculate what the ideal position for each (chunk, tag) if the workers were empty
+    let ideal: Vec<Vec<WorkerIndex>> = ideal_chunk_workers(
         &replicated,
         workers,
         rings,
@@ -243,17 +242,17 @@ fn schedule_to_workers(
         config.worker_capacity,
         PlacementViews {
             ideal: &ideal,
-            held,
+            held: current,
             committed,
             routed,
         },
     );
-    let (worker_chunks, achieved, evicted) =
+    let (worker_chunks, achieved_replicatio, evicted_replicas) =
         reconcile.run(config.min_replication, &placement_order);
 
     // Positions index `workers` directly here; emit `PeerId` so evicted pairs survive the
     // reliable/all merge intact (the merge re-keys `worker_chunks` by `PeerId` too).
-    let evicted = evicted
+    let evicted = evicted_replicas
         .into_iter()
         .map(|(ci, w)| (ci, workers[w as usize].id))
         .collect();
@@ -261,14 +260,14 @@ fn schedule_to_workers(
     Ok((
         Assignment {
             worker_chunks,
-            replication_by_weight: min_replication_by_weight(chunks, &achieved),
+            replication_by_weight: min_replication_by_weight(chunks, &achieved_replicatio),
         },
         evicted,
     ))
 }
 
 /// Per-weight replication from the saturated byte budget (at least `config.min_replication`).
-fn replication_cap(
+fn target_replication_by_weight(
     chunks: &[ScheduledChunk<'_>],
     n_workers: usize,
     config: &SchedulingConfig,
@@ -326,7 +325,7 @@ pub(crate) struct ReplicatedChunk<'a> {
 /// pass walks — so both placement stages index them rather than hash during the ring walk.
 fn hash_chunks(
     chunks: &[ScheduledChunk<'_>],
-    caps: &BTreeMap<ChunkWeight, ReplicationFactor>,
+    replication_by_weight: &BTreeMap<ChunkWeight, ReplicationFactor>,
     min_replication: ReplicationFactor,
 ) -> Vec<Vec<u64>> {
     use rayon::prelude::*;
@@ -341,7 +340,7 @@ fn hash_chunks(
             buffer.extend_from_slice(chunk.chunk_id.as_bytes());
             buffer.push(b':');
             let prefix = buffer.len();
-            let tags = min_replication.max(caps[&chunk.weight]);
+            let tags = min_replication.max(replication_by_weight[&chunk.weight]);
             (0..tags)
                 .map(|tag| {
                     buffer.truncate(prefix);
@@ -381,9 +380,14 @@ trait FillToCap {
     /// Place one replica of `chunk_index`; `true` if it landed.
     fn place_one(&mut self, chunk_index: usize, tag: ReplicationFactor) -> bool;
 
-    fn fill_to_cap(&mut self, order: &[usize], from_tag: ReplicationFactor) {
-        let max_cap = order.iter().map(|&i| self.cap_of(i)).max().unwrap_or(0);
-        let mut active: Vec<usize> = order
+    // Continue filling chunks starting from the `from_tag` replication factor
+    fn fill_to_cap(&mut self, chunks_placement_order: &[usize], from_tag: ReplicationFactor) {
+        let max_cap = chunks_placement_order
+            .iter()
+            .map(|&i| self.cap_of(i))
+            .max()
+            .unwrap_or(0);
+        let mut active: Vec<usize> = chunks_placement_order
             .iter()
             .copied()
             .filter(|&i| self.fillable(i) && self.cap_of(i) > from_tag)
@@ -474,11 +478,11 @@ impl<'a> Placement<'a> {
 
     fn ensure_minimum(
         &mut self,
-        subset: &[usize],
+        chunks_indexes: &[usize],
         min_replication: ReplicationFactor,
     ) -> Result<(), ReplicationError> {
         for tag in 0..min_replication {
-            for &chunk_index in subset {
+            for &chunk_index in chunks_indexes {
                 if !self.place(chunk_index, tag) {
                     return Err(ReplicationError::NotEnoughCapacity);
                 }
@@ -668,10 +672,10 @@ impl<'a> Reconcile<'a> {
         let n_chunks = chunks.len();
         let mut allocated = vec![0u64; workers.len()];
         let mut held_by_worker = vec![Vec::new(); workers.len()];
-        for ci in 0..n_chunks {
-            for &w in &held[ci] {
-                allocated[w as usize] += chunks[ci].size as u64;
-                held_by_worker[w as usize].push(ci as ChunkIndex);
+        for chunk_index in 0..n_chunks {
+            for &worker in &held[chunk_index] {
+                allocated[worker as usize] += chunks[chunk_index].size as u64;
+                held_by_worker[worker as usize].push(chunk_index as ChunkIndex);
             }
         }
         Self {
