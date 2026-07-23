@@ -1069,13 +1069,15 @@ fn rejoined_worker_covers_its_chunks() {
         Action::AddChunks(vec![nc(42038, 12, "sim-0"), nc(38427, 12, "sim-1"), nc(45246, 1, "sim-2"), nc(2114, 4, "sim-2")]),
     ]);
 }
-
-/// Captured from the seed-pinned churn walk
-/// (`SIM_CASE_SEED=d090ccc13ce21e8522345ae2f0c423ef82009897965a5455a3fc6848485ef21b`), now a
-/// concrete replay. Under `min_replication` oscillation (4→5→…) with worker churn, a visible
-/// chunk can collapse to a single committed copy whose peers hold only draining stale copies;
-/// the replay pins that the scheduler keeps every routed chunk covered through the whole walk
-/// (the generator-side departure precondition itself is exercised by the churn sweeps).
+/// Floor-oscillation knife edge, minimised from the churn walk that surfaced the departure-loss
+/// precondition (`SIM_CASE_SEED=d090ccc1…85ef21b`; delta-debugged 226 → 12 actions against "a
+/// routed chunk reaches exactly one active committed copy, peers only draining, while the floor
+/// demands ≥ 2"). Saturate seven workers at floor 4, converge, drop the floor to 1 — every chunk
+/// sheds to one committed copy plus drains — then raise it to 2: chunks now sit **under-floor
+/// with only draining peers**. A departure taking that last committed copy would be
+/// unrecoverable loss, which is exactly what the churn generator's `is_removal_recoverable`
+/// refuses to produce; this replay pins the recovery half — the scheduler re-floors every routed
+/// chunk without loss.
 #[test]
 fn churn_oscillation_does_not_strand_a_visible_chunk() {
     let config = SimConfig {
@@ -1085,435 +1087,18 @@ fn churn_oscillation_does_not_strand_a_visible_chunk() {
         gc_ticks: 15,
         ..base_config()
     };
-    let nc = |seed: u64, weight: u16, ds: &str| {
-        new_chunk((mint_key(seed), CHUNK_SIZE, weight, format!("s3://{ds}")))
+    let nc = |key: u64, weight: u16, dataset: &str| {
+        new_chunk((mint_key(key), CHUNK_SIZE, weight, format!("s3://{dataset}")))
     };
     let sut = replay(
         &config,
         vec![
-            Action::AddChunks(vec![nc(42924, 12, "sim-1"), nc(43293, 4, "sim-1")]),
-            Action::AddChunks(vec![nc(21290, 4, "sim-1"), nc(37070, 4, "sim-1")]),
-            Action::CheckConverged(ConvergenceCheck::FloorLocallyFeasible),
-            Action::SetMinReplication(5),
-            Action::WorkerFetchAssignment {
-                worker: 2,
-                succeeds: true,
-            },
-            Action::AddChunks(vec![nc(25710, 12, "sim-1"), nc(49382, 1, "sim-1")]),
-            Action::PortalFetchAssignment { succeeds: true },
-            Action::WorkerFetchAssignment {
-                worker: 1,
-                succeeds: true,
-            },
-            Action::AddChunks(vec![
-                nc(59426, 12, "sim-2"),
-                nc(26454, 12, "sim-0"),
-                nc(40765, 4, "sim-0"),
-                nc(36563, 1, "sim-0"),
-            ]),
-            Action::AddChunks(vec![
-                nc(56823, 1, "sim-2"),
-                nc(364, 1, "sim-1"),
-                nc(8344, 1, "sim-2"),
-            ]),
-            Action::CheckConverged(ConvergenceCheck::FloorLocallyFeasible),
-            Action::SetMinReplication(4),
-            Action::WorkerFetchAssignment {
-                worker: 1,
-                succeeds: true,
-            },
-            Action::AddChunks(vec![
-                nc(1940, 12, "sim-1"),
-                nc(37781, 1, "sim-1"),
-                nc(56642, 1, "sim-1"),
-                nc(64305, 1, "sim-0"),
-                nc(5381, 4, "sim-2"),
-            ]),
-            Action::WorkerFetchAssignment {
-                worker: 4,
-                succeeds: true,
-            },
-            Action::PortalFetchAssignment { succeeds: true },
-            Action::WorkerJoined(10),
-            Action::WorkerFetchAssignment {
-                worker: 10,
-                succeeds: true,
-            },
-            Action::AdvanceClock(6),
-            Action::PortalFetchAssignment { succeeds: true },
-            Action::WorkerFetchAssignment {
-                worker: 2,
-                succeeds: false,
-            },
-            Action::WorkerFetchAssignment {
-                worker: 1,
-                succeeds: true,
-            },
-            Action::PortalFetchAssignment { succeeds: true },
-            Action::WorkerFetchAssignment {
-                worker: 1,
-                succeeds: false,
-            },
-            Action::PortalFetchAssignment { succeeds: true },
-            Action::WorkerFetchAssignment {
-                worker: 4,
-                succeeds: true,
-            },
-            Action::CheckConverged(ConvergenceCheck::FloorLocallyFeasible),
-            Action::WorkerJoined(9),
-            Action::WorkerJoined(7),
-            Action::SetMinReplication(3),
-            Action::WorkerFetchAssignment {
-                worker: 0,
-                succeeds: true,
-            },
-            Action::PortalFetchAssignment { succeeds: true },
-            Action::SetMinReplication(4),
-            Action::PortalFetchAssignment { succeeds: true },
-            Action::PortalFetchAssignment { succeeds: true },
-            Action::AddChunks(vec![nc(49291, 1, "sim-2"), nc(57221, 12, "sim-2")]),
-            Action::AddChunks(vec![nc(26928, 4, "sim-1")]),
-            Action::WorkerFetchAssignment {
-                worker: 10,
-                succeeds: false,
-            },
-            Action::WorkerFetchAssignment {
-                worker: 9,
-                succeeds: true,
-            },
-            Action::SetMinReplication(5),
-            Action::WorkerFetchAssignment {
-                worker: 7,
-                succeeds: true,
-            },
-            Action::WorkerFetchAssignment {
-                worker: 9,
-                succeeds: true,
-            },
-            Action::WorkerJoined(8),
-            Action::WorkerFetchAssignment {
-                worker: 4,
-                succeeds: true,
-            },
-            Action::PortalFetchAssignment { succeeds: true },
-            Action::PortalFetchAssignment { succeeds: true },
-            Action::PortalFetchAssignment { succeeds: true },
-            Action::PortalFetchAssignment { succeeds: true },
-            Action::CheckConverged(ConvergenceCheck::FloorLocallyFeasible),
-            Action::SetMinReplication(4),
-            Action::CheckConverged(ConvergenceCheck::FloorLocallyFeasible),
-            Action::PortalFetchAssignment { succeeds: true },
-            Action::WorkerFetchAssignment {
-                worker: 1,
-                succeeds: true,
-            },
-            Action::PortalFetchAssignment { succeeds: true },
-            Action::WorkerFetchAssignment {
-                worker: 0,
-                succeeds: true,
-            },
-            Action::WorkerFetchAssignment {
-                worker: 9,
-                succeeds: true,
-            },
-            Action::WorkerFetchAssignment {
-                worker: 9,
-                succeeds: true,
-            },
-            Action::WorkerFetchAssignment {
-                worker: 6,
-                succeeds: true,
-            },
-            Action::WorkerFetchAssignment {
-                worker: 3,
-                succeeds: true,
-            },
-            Action::SetDatasetSchema {
-                dataset: "s3://sim-1".to_string(),
-                schema: SCHEMA_POOL[1].clone(),
-            },
-            Action::WorkerFetchAssignment {
-                worker: 0,
-                succeeds: true,
-            },
-            Action::PortalFetchAssignment { succeeds: true },
-            Action::AdvanceClock(5),
-            Action::AddChunks(vec![
-                nc(9902, 4, "sim-2"),
-                nc(1700, 4, "sim-2"),
-                nc(39971, 12, "sim-1"),
-                nc(47535, 4, "sim-0"),
-            ]),
-            Action::PortalFetchAssignment { succeeds: true },
-            Action::SetDatasetSchema {
-                dataset: "s3://sim-2".to_string(),
-                schema: SCHEMA_POOL[1].clone(),
-            },
-            Action::PortalFetchAssignment { succeeds: true },
-            Action::SetDatasetSchema {
-                dataset: "s3://sim-1".to_string(),
-                schema: SCHEMA_POOL[1].clone(),
-            },
-            Action::SetDatasetSchema {
-                dataset: "s3://sim-2".to_string(),
-                schema: SCHEMA_POOL[1].clone(),
-            },
-            Action::WorkerFetchAssignment {
-                worker: 1,
-                succeeds: true,
-            },
-            Action::WorkerFetchAssignment {
-                worker: 6,
-                succeeds: true,
-            },
-            Action::CheckConverged(ConvergenceCheck::FloorLocallyFeasible),
-            Action::SetMinReplication(3),
-            Action::AddChunks(vec![nc(17734, 12, "sim-0")]),
-            Action::AddChunks(vec![
-                nc(49920, 4, "sim-2"),
-                nc(38559, 1, "sim-1"),
-                nc(63871, 12, "sim-2"),
-            ]),
-            Action::AddChunks(vec![nc(18196, 4, "sim-1")]),
-            Action::WorkerFetchAssignment {
-                worker: 4,
-                succeeds: true,
-            },
-            Action::RegisterCorrection {
-                old_dataset: "s3://sim-1".to_string(),
-                old_chunk_id: mint_key(37070),
-                replacement: NewChunk {
-                    key: mint_key(39631),
-                    size: CHUNK_SIZE,
-                    weight: 12,
-                    dataset: "s3://sim-1".to_string(),
-                    blocks: 37070000..=37070999,
-                },
-            },
-            Action::PortalFetchAssignment { succeeds: true },
-            Action::AddChunks(vec![
-                nc(49777, 1, "sim-1"),
-                nc(41211, 12, "sim-2"),
-                nc(56885, 1, "sim-0"),
-            ]),
-            Action::WorkerFetchAssignment {
-                worker: 5,
-                succeeds: true,
-            },
-            Action::SetDatasetSchema {
-                dataset: "s3://sim-2".to_string(),
-                schema: SCHEMA_POOL[1].clone(),
-            },
-            Action::AdvanceClock(5),
-            Action::PortalFetchAssignment { succeeds: true },
-            Action::WorkerFetchAssignment {
-                worker: 10,
-                succeeds: true,
-            },
-            Action::WorkerFetchAssignment {
-                worker: 9,
-                succeeds: true,
-            },
-            Action::PortalFetchAssignment { succeeds: true },
-            Action::WorkerFetchAssignment {
-                worker: 2,
-                succeeds: true,
-            },
-            Action::PortalFetchAssignment { succeeds: true },
-            Action::PortalFetchAssignment { succeeds: true },
-            Action::WorkerFetchAssignment {
-                worker: 8,
-                succeeds: true,
-            },
-            Action::PortalFetchAssignment { succeeds: true },
-            Action::WorkerFetchAssignment {
-                worker: 0,
-                succeeds: true,
-            },
-            Action::WorkerFetchAssignment {
-                worker: 6,
-                succeeds: true,
-            },
-            Action::WorkerFetchAssignment {
-                worker: 6,
-                succeeds: true,
-            },
-            Action::AdvanceClock(5),
-            Action::WorkerFetchAssignment {
-                worker: 2,
-                succeeds: true,
-            },
-            Action::PortalFetchAssignment { succeeds: true },
-            Action::WorkerFetchAssignment {
-                worker: 4,
-                succeeds: true,
-            },
-            Action::WorkerFetchAssignment {
-                worker: 10,
-                succeeds: true,
-            },
-            Action::WorkerFetchAssignment {
-                worker: 0,
-                succeeds: true,
-            },
-            Action::WorkerFetchAssignment {
-                worker: 10,
-                succeeds: true,
-            },
-            Action::CheckConverged(ConvergenceCheck::FloorLocallyFeasible),
-            Action::SetMinReplication(2),
-            Action::WorkerFetchAssignment {
-                worker: 8,
-                succeeds: true,
-            },
-            Action::PortalFetchAssignment { succeeds: true },
-            Action::WorkerFetchAssignment {
-                worker: 7,
-                succeeds: true,
-            },
-            Action::AddChunks(vec![
-                nc(48677, 1, "sim-1"),
-                nc(17053, 12, "sim-2"),
-                nc(3259, 1, "sim-0"),
-                nc(33895, 4, "sim-2"),
-            ]),
-            Action::WorkerFetchAssignment {
-                worker: 1,
-                succeeds: true,
-            },
-            Action::PortalFetchAssignment { succeeds: true },
-            Action::AddChunks(vec![nc(60957, 4, "sim-2"), nc(58255, 4, "sim-2")]),
-            Action::WorkerFetchAssignment {
-                worker: 9,
-                succeeds: true,
-            },
-            Action::AddChunks(vec![
-                nc(14252, 4, "sim-2"),
-                nc(56384, 12, "sim-1"),
-                nc(54203, 1, "sim-2"),
-                nc(14238, 4, "sim-1"),
-                nc(19423, 12, "sim-0"),
-            ]),
-            Action::AddChunks(vec![nc(27435, 4, "sim-1"), nc(57787, 12, "sim-1")]),
-            Action::PortalFetchAssignment { succeeds: true },
-            Action::PortalFetchAssignment { succeeds: true },
-            Action::WorkerFetchAssignment {
-                worker: 6,
-                succeeds: true,
-            },
-            Action::CheckConverged(ConvergenceCheck::FloorLocallyFeasible),
-            Action::CheckConverged(ConvergenceCheck::FloorLocallyFeasible),
-            Action::SetMinReplication(3),
-            Action::AdvanceClock(1),
-            Action::CheckConverged(ConvergenceCheck::FloorLocallyFeasible),
-            Action::SetMinReplication(2),
-            Action::WorkerFetchAssignment {
-                worker: 6,
-                succeeds: true,
-            },
-            Action::AddChunks(vec![
-                nc(8608, 1, "sim-2"),
-                nc(36453, 4, "sim-2"),
-                nc(56119, 12, "sim-0"),
-                nc(37029, 4, "sim-0"),
-                nc(46183, 1, "sim-2"),
-            ]),
-            Action::WorkerFetchAssignment {
-                worker: 0,
-                succeeds: false,
-            },
-            Action::AdvanceClock(6),
-            Action::WorkerFetchAssignment {
-                worker: 9,
-                succeeds: true,
-            },
-            Action::PortalFetchAssignment { succeeds: true },
-            Action::PortalFetchAssignment { succeeds: true },
-            Action::PortalFetchAssignment { succeeds: false },
-            Action::WorkerFetchAssignment {
-                worker: 1,
-                succeeds: true,
-            },
-            Action::SetDatasetSchema {
-                dataset: "s3://sim-0".to_string(),
-                schema: SCHEMA_POOL[1].clone(),
-            },
-            Action::WorkerFetchAssignment {
-                worker: 2,
-                succeeds: true,
-            },
-            Action::WorkerFetchAssignment {
-                worker: 8,
-                succeeds: true,
-            },
-            Action::PortalFetchAssignment { succeeds: true },
-            Action::PortalFetchAssignment { succeeds: true },
-            Action::WorkerFetchAssignment {
-                worker: 8,
-                succeeds: true,
-            },
-            Action::WorkerFetchAssignment {
-                worker: 2,
-                succeeds: true,
-            },
-            Action::CheckConverged(ConvergenceCheck::FloorLocallyFeasible),
-            Action::SetMinReplication(1),
-            Action::SetDatasetSchema {
-                dataset: "s3://sim-0".to_string(),
-                schema: SCHEMA_POOL[1].clone(),
-            },
-            Action::WorkerFetchAssignment {
-                worker: 1,
-                succeeds: true,
-            },
-            Action::PortalFetchAssignment { succeeds: true },
-            Action::WorkerFetchAssignment {
-                worker: 8,
-                succeeds: true,
-            },
-            Action::PortalFetchAssignment { succeeds: true },
-            Action::AddChunks(vec![
-                nc(23693, 12, "sim-2"),
-                nc(58006, 12, "sim-0"),
-                nc(59636, 4, "sim-0"),
-            ]),
-            Action::AddChunks(vec![
-                nc(6790, 12, "sim-0"),
-                nc(45727, 1, "sim-2"),
-                nc(6606, 12, "sim-0"),
-            ]),
-            Action::PortalFetchAssignment { succeeds: true },
-            Action::PortalFetchAssignment { succeeds: true },
-            Action::WorkerFetchAssignment {
-                worker: 1,
-                succeeds: true,
-            },
-            Action::WorkerFetchAssignment {
-                worker: 0,
-                succeeds: false,
-            },
-            Action::WorkerFetchAssignment {
-                worker: 2,
-                succeeds: true,
-            },
             Action::AddChunks(vec![
                 nc(3452, 4, "sim-1"),
                 nc(15919, 1, "sim-2"),
                 nc(19453, 1, "sim-1"),
                 nc(55324, 4, "sim-0"),
             ]),
-            Action::PortalFetchAssignment { succeeds: true },
-            Action::WorkerFetchAssignment {
-                worker: 2,
-                succeeds: true,
-            },
-            Action::PortalFetchAssignment { succeeds: true },
-            Action::WorkerFetchAssignment {
-                worker: 0,
-                succeeds: true,
-            },
-            Action::PortalFetchAssignment { succeeds: true },
-            Action::PortalFetchAssignment { succeeds: true },
             Action::AddChunks(vec![
                 nc(24932, 1, "sim-1"),
                 nc(4983, 4, "sim-2"),
@@ -1522,100 +1107,16 @@ fn churn_oscillation_does_not_strand_a_visible_chunk() {
                 nc(10358, 4, "sim-2"),
             ]),
             Action::AddChunks(vec![nc(41761, 1, "sim-1"), nc(62847, 1, "sim-0")]),
-            Action::PortalFetchAssignment { succeeds: true },
-            Action::WorkerFetchAssignment {
-                worker: 6,
-                succeeds: true,
-            },
-            Action::WorkerFetchAssignment {
-                worker: 10,
-                succeeds: true,
-            },
-            Action::SetDatasetSchema {
-                dataset: "s3://sim-2".to_string(),
-                schema: SCHEMA_POOL[1].clone(),
-            },
             Action::AddChunks(vec![
                 nc(19166, 12, "sim-2"),
                 nc(45182, 4, "sim-0"),
                 nc(58881, 4, "sim-2"),
             ]),
-            Action::SetMinReplication(2),
-            Action::AdvanceClock(1),
-            Action::AdvanceClock(5),
-            Action::WorkerFetchAssignment {
-                worker: 10,
-                succeeds: true,
-            },
-            Action::WorkerFetchAssignment {
-                worker: 8,
-                succeeds: true,
-            },
-            Action::WorkerFetchAssignment {
-                worker: 2,
-                succeeds: true,
-            },
-            Action::WorkerFetchAssignment {
-                worker: 4,
-                succeeds: true,
-            },
-            Action::AdvanceClock(5),
-            Action::WorkerFetchAssignment {
-                worker: 4,
-                succeeds: false,
-            },
-            Action::WorkerFetchAssignment {
-                worker: 7,
-                succeeds: true,
-            },
-            Action::PortalFetchAssignment { succeeds: true },
-            Action::WorkerFetchAssignment {
-                worker: 4,
-                succeeds: true,
-            },
-            Action::WorkerFetchAssignment {
-                worker: 8,
-                succeeds: true,
-            },
-            Action::PortalFetchAssignment { succeeds: true },
-            Action::CheckConverged(ConvergenceCheck::FloorLocallyFeasible),
-            Action::SetMinReplication(1),
-            Action::RegisterCorrection {
-                old_dataset: "s3://sim-0".to_string(),
-                old_chunk_id: mint_key(3259),
-                replacement: NewChunk {
-                    key: mint_key(41430),
-                    size: CHUNK_SIZE,
-                    weight: 4,
-                    dataset: "s3://sim-0".to_string(),
-                    blocks: 3259000..=3259999,
-                },
-            },
-            Action::SetDatasetSchema {
-                dataset: "s3://sim-0".to_string(),
-                schema: SCHEMA_POOL[1].clone(),
-            },
-            Action::PortalFetchAssignment { succeeds: true },
-            Action::PortalFetchAssignment { succeeds: true },
             Action::AddChunks(vec![
                 nc(41641, 12, "sim-0"),
                 nc(7923, 1, "sim-2"),
                 nc(1489, 1, "sim-1"),
             ]),
-            Action::PortalFetchAssignment { succeeds: true },
-            Action::PortalFetchAssignment { succeeds: true },
-            Action::WorkerFetchAssignment {
-                worker: 2,
-                succeeds: true,
-            },
-            Action::WorkerFetchAssignment {
-                worker: 4,
-                succeeds: true,
-            },
-            Action::WorkerFetchAssignment {
-                worker: 2,
-                succeeds: true,
-            },
             Action::AddChunks(vec![
                 nc(35153, 12, "sim-0"),
                 nc(27409, 1, "sim-0"),
@@ -1623,103 +1124,31 @@ fn churn_oscillation_does_not_strand_a_visible_chunk() {
                 nc(34539, 4, "sim-2"),
             ]),
             Action::AddChunks(vec![nc(16114, 1, "sim-1"), nc(28923, 1, "sim-0")]),
-            Action::PortalFetchAssignment { succeeds: true },
-            Action::WorkerFetchAssignment {
-                worker: 10,
-                succeeds: true,
-            },
-            Action::WorkerFetchAssignment {
-                worker: 8,
-                succeeds: true,
-            },
-            Action::PortalFetchAssignment { succeeds: true },
             Action::AddChunks(vec![
                 nc(30943, 12, "sim-2"),
                 nc(29621, 12, "sim-0"),
                 nc(634, 4, "sim-2"),
                 nc(12547, 12, "sim-2"),
             ]),
-            Action::PortalFetchAssignment { succeeds: true },
-            Action::AddChunks(vec![nc(58249, 12, "sim-2")]),
-            Action::WorkerFetchAssignment {
-                worker: 5,
-                succeeds: true,
-            },
             Action::AddChunks(vec![
                 nc(16683, 4, "sim-0"),
                 nc(8503, 12, "sim-0"),
                 nc(211, 1, "sim-2"),
             ]),
-            Action::SetMinReplication(2),
-            Action::PortalFetchAssignment { succeeds: true },
-            Action::PortalFetchAssignment { succeeds: true },
-            Action::WorkerFetchAssignment {
-                worker: 9,
-                succeeds: true,
-            },
             Action::CheckConverged(ConvergenceCheck::FloorLocallyFeasible),
             Action::SetMinReplication(1),
             Action::SetMinReplication(2),
-            Action::AdvanceClock(4),
-            Action::PortalFetchAssignment { succeeds: true },
-            Action::WorkerFetchAssignment {
-                worker: 4,
-                succeeds: true,
-            },
-            Action::PortalFetchAssignment { succeeds: true },
-            Action::WorkerFetchAssignment {
-                worker: 9,
-                succeeds: true,
-            },
-            Action::WorkerFetchAssignment {
-                worker: 6,
-                succeeds: true,
-            },
-            Action::CheckConverged(ConvergenceCheck::FloorLocallyFeasible),
-            Action::SetMinReplication(1),
-            Action::WorkerFetchAssignment {
-                worker: 8,
-                succeeds: true,
-            },
-            Action::RegisterCorrection {
-                old_dataset: "s3://sim-2".to_string(),
-                old_chunk_id: mint_key(19166),
-                replacement: NewChunk {
-                    key: mint_key(40976),
-                    size: CHUNK_SIZE,
-                    weight: 12,
-                    dataset: "s3://sim-2-foreign".to_string(),
-                    blocks: 19166000..=19166999,
-                },
-            },
-            Action::AddChunks(vec![
-                nc(4167, 12, "sim-0"),
-                nc(64942, 1, "sim-2"),
-                nc(9166, 12, "sim-1"),
-            ]),
-            Action::PortalFetchAssignment { succeeds: true },
-            Action::AddChunks(vec![
-                nc(5233, 1, "sim-0"),
-                nc(21277, 4, "sim-0"),
-                nc(65415, 12, "sim-2"),
-            ]),
-            Action::WorkerFetchAssignment {
-                worker: 4,
-                succeeds: true,
-            },
-            Action::CheckConverged(ConvergenceCheck::FloorLocallyFeasible),
         ],
     );
     sut.assert_all_routed_chunks_have_a_listed_holder();
 }
-
-/// Captured from the seed-pinned churn walk
-/// (`SIM_CASE_SEED=5466d59c65053f317384e3625ef7f04d8bd56a11df8ac940363981c37fd3ca1b`), now a
-/// concrete replay. The fleet is over-subscribed (`min_replication = 2`, ~30 chunks on 5
-/// workers): a visible chunk is dropped from the ideal, its scrub diff can't confirm under the
-/// full-quorum shortage, and its stale copies expire — globally uncovered while still routed.
-/// The replay pins that this recorded-shortage strand is accepted (no oracle fires) rather than
-/// misreported as a defect.
+/// Accepted shortage strand, minimised from the churn walk (`SIM_CASE_SEED=5466d59c…fd3ca1b`;
+/// delta-debugged 123 → 24 actions against "still passes AND still fails when the shortage
+/// stand-down is made fatal" — so the strand provably forms). Over-subscribing five workers at
+/// floor 2 records a shortage; a routed chunk drops from the ideal, its scrub diff can't confirm
+/// under the full-quorum shortage, and its stale copies expire — globally uncovered while still
+/// routed. The replay pins that this is *accepted* (the strand oracles stand down while
+/// `is_infeasible`) rather than misreported as a defect.
 #[test]
 fn shortage_routing_strand_is_not_a_defect() {
     let config = SimConfig {
@@ -1728,8 +1157,8 @@ fn shortage_routing_strand_is_not_a_defect() {
         gc_ticks: 15,
         ..base_config()
     };
-    let nc = |seed: u64, weight: u16, ds: &str| {
-        new_chunk((mint_key(seed), CHUNK_SIZE, weight, format!("s3://{ds}")))
+    let nc = |key: u64, weight: u16, dataset: &str| {
+        new_chunk((mint_key(key), CHUNK_SIZE, weight, format!("s3://{dataset}")))
     };
     replay(
         &config,
@@ -1740,41 +1169,13 @@ fn shortage_routing_strand_is_not_a_defect() {
                 nc(38875, 4, "sim-1"),
                 nc(62319, 4, "sim-2"),
             ]),
-            Action::AdvanceClock(6),
-            Action::WorkerFetchAssignment {
-                worker: 4,
-                succeeds: false,
-            },
             Action::AddChunks(vec![
                 nc(21192, 12, "sim-2"),
                 nc(25952, 1, "sim-2"),
                 nc(28610, 4, "sim-0"),
                 nc(26251, 1, "sim-0"),
             ]),
-            Action::WorkerLeft(3),
-            Action::WorkerFetchAssignment {
-                worker: 1,
-                succeeds: true,
-            },
             Action::AddChunks(vec![nc(42907, 4, "sim-0"), nc(51017, 12, "sim-1")]),
-            Action::WorkerFetchAssignment {
-                worker: 1,
-                succeeds: true,
-            },
-            Action::WorkerFetchAssignment {
-                worker: 0,
-                succeeds: false,
-            },
-            Action::PortalFetchAssignment { succeeds: true },
-            Action::AdvanceClock(5),
-            Action::WorkerFetchAssignment {
-                worker: 2,
-                succeeds: true,
-            },
-            Action::PortalFetchAssignment { succeeds: true },
-            Action::CheckConverged(ConvergenceCheck::FloorLocallyFeasible),
-            Action::AdvanceClock(5),
-            Action::AdvanceClock(1),
             Action::AddChunks(vec![
                 nc(14626, 4, "sim-1"),
                 nc(37034, 4, "sim-0"),
@@ -1786,49 +1187,7 @@ fn shortage_routing_strand_is_not_a_defect() {
                 nc(27779, 12, "sim-2"),
                 nc(63926, 1, "sim-2"),
             ]),
-            Action::WorkerFetchAssignment {
-                worker: 4,
-                succeeds: true,
-            },
-            Action::WorkerFetchAssignment {
-                worker: 1,
-                succeeds: false,
-            },
-            Action::WorkerFetchAssignment {
-                worker: 1,
-                succeeds: true,
-            },
-            Action::WorkerFetchAssignment {
-                worker: 2,
-                succeeds: true,
-            },
-            Action::WorkerFetchAssignment {
-                worker: 1,
-                succeeds: true,
-            },
-            Action::PortalFetchAssignment { succeeds: true },
-            Action::WorkerFetchAssignment {
-                worker: 0,
-                succeeds: true,
-            },
-            Action::AdvanceClock(5),
-            Action::PortalFetchAssignment { succeeds: false },
-            Action::PortalFetchAssignment { succeeds: true },
-            Action::SetDatasetSchema {
-                dataset: "s3://sim-0".to_string(),
-                schema: SCHEMA_POOL[1].clone(),
-            },
-            Action::WorkerFetchAssignment {
-                worker: 2,
-                succeeds: true,
-            },
-            Action::WorkerJoined(3),
-            Action::AdvanceClock(4),
             Action::AddChunks(vec![nc(38090, 12, "sim-1")]),
-            Action::WorkerFetchAssignment {
-                worker: 3,
-                succeeds: false,
-            },
             Action::AddChunks(vec![
                 nc(57374, 12, "sim-2"),
                 nc(50793, 12, "sim-0"),
@@ -1836,61 +1195,9 @@ fn shortage_routing_strand_is_not_a_defect() {
                 nc(25869, 12, "sim-2"),
                 nc(13721, 4, "sim-1"),
             ]),
-            Action::PortalFetchAssignment { succeeds: true },
-            Action::WorkerFetchAssignment {
-                worker: 4,
-                succeeds: true,
-            },
-            Action::WorkerFetchAssignment {
-                worker: 1,
-                succeeds: true,
-            },
-            Action::WorkerFetchAssignment {
-                worker: 0,
-                succeeds: true,
-            },
-            Action::WorkerFetchAssignment {
-                worker: 4,
-                succeeds: true,
-            },
-            Action::PortalFetchAssignment { succeeds: true },
-            Action::PortalFetchAssignment { succeeds: true },
-            Action::WorkerFetchAssignment {
-                worker: 3,
-                succeeds: true,
-            },
-            Action::WorkerFetchAssignment {
-                worker: 0,
-                succeeds: true,
-            },
-            Action::WorkerFetchAssignment {
-                worker: 4,
-                succeeds: true,
-            },
-            Action::WorkerFetchAssignment {
-                worker: 1,
-                succeeds: false,
-            },
-            Action::SetDatasetSchema {
-                dataset: "s3://sim-0".to_string(),
-                schema: SCHEMA_POOL[1].clone(),
-            },
-            Action::WorkerFetchAssignment {
-                worker: 2,
-                succeeds: true,
-            },
-            Action::PortalFetchAssignment { succeeds: true },
-            Action::PortalFetchAssignment { succeeds: false },
-            Action::PortalFetchAssignment { succeeds: true },
-            Action::PortalFetchAssignment { succeeds: true },
             Action::CheckConverged(ConvergenceCheck::FloorLocallyFeasible),
             Action::SetMinReplication(1),
-            Action::WorkerFetchAssignment {
-                worker: 0,
-                succeeds: true,
-            },
             Action::AddChunks(vec![nc(42596, 1, "sim-2"), nc(28350, 12, "sim-1")]),
-            Action::PortalFetchAssignment { succeeds: true },
             Action::WorkerFetchAssignment {
                 worker: 3,
                 succeeds: true,
@@ -1907,8 +1214,6 @@ fn shortage_routing_strand_is_not_a_defect() {
             ]),
             Action::WorkerJoined(8),
             Action::AddChunks(vec![nc(51672, 12, "sim-2")]),
-            Action::AdvanceClock(5),
-            Action::PortalFetchAssignment { succeeds: true },
             Action::AddChunks(vec![nc(41991, 4, "sim-2")]),
             Action::RegisterCorrection {
                 old_dataset: "s3://sim-2".to_string(),
@@ -1921,10 +1226,6 @@ fn shortage_routing_strand_is_not_a_defect() {
                     blocks: 42596000..=42596999,
                 },
             },
-            Action::WorkerFetchAssignment {
-                worker: 8,
-                succeeds: false,
-            },
             Action::AddChunks(vec![
                 nc(25766, 4, "sim-1"),
                 nc(31201, 1, "sim-2"),
@@ -1932,46 +1233,12 @@ fn shortage_routing_strand_is_not_a_defect() {
                 nc(12142, 1, "sim-2"),
                 nc(2654, 1, "sim-1"),
             ]),
-            Action::PortalFetchAssignment { succeeds: true },
-            Action::WorkerFetchAssignment {
-                worker: 4,
-                succeeds: true,
-            },
-            Action::WorkerFetchAssignment {
-                worker: 4,
-                succeeds: false,
-            },
-            Action::PortalFetchAssignment { succeeds: true },
-            Action::SetDatasetSchema {
-                dataset: "s3://sim-1".to_string(),
-                schema: SCHEMA_POOL[1].clone(),
-            },
             Action::WorkerLeft(8),
-            Action::WorkerFetchAssignment {
-                worker: 2,
-                succeeds: true,
-            },
-            Action::WorkerFetchAssignment {
-                worker: 2,
-                succeeds: true,
-            },
             Action::AddChunks(vec![
                 nc(38211, 12, "sim-1"),
                 nc(5257, 4, "sim-1"),
                 nc(47539, 4, "sim-1"),
             ]),
-            Action::SetDatasetSchema {
-                dataset: "s3://sim-0".to_string(),
-                schema: SCHEMA_POOL[1].clone(),
-            },
-            Action::WorkerFetchAssignment {
-                worker: 0,
-                succeeds: false,
-            },
-            Action::SetDatasetSchema {
-                dataset: "s3://sim-2".to_string(),
-                schema: SCHEMA_POOL[1].clone(),
-            },
             Action::WorkerFetchAssignment {
                 worker: 1,
                 succeeds: true,
@@ -1985,112 +1252,6 @@ fn shortage_routing_strand_is_not_a_defect() {
                 succeeds: true,
             },
             Action::AddChunks(vec![nc(65039, 12, "sim-1"), nc(10177, 12, "sim-0")]),
-            Action::AdvanceClock(5),
-            Action::PortalFetchAssignment { succeeds: true },
-            Action::PortalFetchAssignment { succeeds: false },
-            Action::CheckConverged(ConvergenceCheck::FloorLocallyFeasible),
-            Action::PortalFetchAssignment { succeeds: true },
-            Action::PortalFetchAssignment { succeeds: true },
-            Action::PortalFetchAssignment { succeeds: true },
-            Action::WorkerFetchAssignment {
-                worker: 0,
-                succeeds: false,
-            },
-            Action::PortalFetchAssignment { succeeds: true },
-            Action::WorkerJoined(7),
-            Action::RegisterCorrection {
-                old_dataset: "s3://sim-1".to_string(),
-                old_chunk_id: mint_key(40566),
-                replacement: NewChunk {
-                    key: mint_key(3064),
-                    size: CHUNK_SIZE,
-                    weight: 12,
-                    dataset: "s3://sim-1-foreign".to_string(),
-                    blocks: 40566000..=40566999,
-                },
-            },
-            Action::AddChunks(vec![
-                nc(12713, 4, "sim-2"),
-                nc(14865, 12, "sim-1"),
-                nc(27854, 1, "sim-2"),
-                nc(32698, 1, "sim-0"),
-                nc(41747, 1, "sim-1"),
-            ]),
-            Action::WorkerFetchAssignment {
-                worker: 3,
-                succeeds: true,
-            },
-            Action::AdvanceClock(5),
-            Action::SetMinReplication(2),
-            Action::WorkerFetchAssignment {
-                worker: 4,
-                succeeds: true,
-            },
-            Action::PortalFetchAssignment { succeeds: true },
-            Action::AdvanceClock(1),
-            Action::WorkerFetchAssignment {
-                worker: 1,
-                succeeds: false,
-            },
-            Action::WorkerFetchAssignment {
-                worker: 1,
-                succeeds: true,
-            },
-            Action::WorkerFetchAssignment {
-                worker: 2,
-                succeeds: true,
-            },
-            Action::WorkerFetchAssignment {
-                worker: 7,
-                succeeds: true,
-            },
-            Action::PortalFetchAssignment { succeeds: false },
-            Action::CheckConverged(ConvergenceCheck::FloorLocallyFeasible),
-            Action::WorkerJoined(5),
-            Action::SetMinReplication(1),
-            Action::AddChunks(vec![nc(26093, 1, "sim-0"), nc(64166, 1, "sim-2")]),
-            Action::WorkerFetchAssignment {
-                worker: 4,
-                succeeds: true,
-            },
-            Action::AddChunks(vec![
-                nc(56181, 1, "sim-0"),
-                nc(41242, 12, "sim-1"),
-                nc(24093, 4, "sim-2"),
-                nc(19875, 4, "sim-1"),
-            ]),
-            Action::WorkerFetchAssignment {
-                worker: 3,
-                succeeds: true,
-            },
-            Action::CheckConverged(ConvergenceCheck::FloorLocallyFeasible),
-            Action::CheckConverged(ConvergenceCheck::FloorLocallyFeasible),
-            Action::WorkerFetchAssignment {
-                worker: 4,
-                succeeds: true,
-            },
-            Action::RegisterCorrection {
-                old_dataset: "s3://sim-2".to_string(),
-                old_chunk_id: mint_key(31201),
-                replacement: NewChunk {
-                    key: mint_key(41173),
-                    size: CHUNK_SIZE,
-                    weight: 12,
-                    dataset: "s3://sim-2".to_string(),
-                    blocks: 31201000..=31201999,
-                },
-            },
-            Action::SetMinReplication(2),
-            Action::WorkerFetchAssignment {
-                worker: 1,
-                succeeds: true,
-            },
-            Action::PortalFetchAssignment { succeeds: true },
-            Action::WorkerFetchAssignment {
-                worker: 1,
-                succeeds: true,
-            },
-            Action::WorkerJoined(6),
         ],
     );
 }
