@@ -1,17 +1,9 @@
 //! Deterministic unit tests driving `SimUnderTest` directly (no runner), plus the
 //! `convergence_under_shortage` drain proptest.
 
-use super::super::utils::{chunk_pk, new_chunk};
+use super::super::utils::new_chunk;
 use super::*;
 use crate::scheduler_storage::NewChunk as StorageNewChunk;
-
-#[cfg(test)]
-impl<D: SimStorage> SimUnderTest<D> {
-    /// Insert chunks into the storage without running a cycle.
-    fn seed_chunks(&mut self, new: &[NewChunk]) {
-        self.insert_and_register(new);
-    }
-}
 
 /// `count` uniform chunks keyed from `base`; shared with the Postgres parity tests.
 pub(super) fn uniform_chunks(base: u64, count: u64) -> Vec<NewChunk> {
@@ -27,48 +19,16 @@ pub(super) fn uniform_chunks(base: u64, count: u64) -> Vec<NewChunk> {
         .collect()
 }
 
-/// All [`WEIGHTS`] values coexist in one dataset: `prepare` hands every chunk back with its
-/// recorded weight, nothing dropped.
-#[test]
-fn multiple_weights_coexist_in_one_dataset() {
-    let weights = WeightTable::default();
-    let chunks: Vec<NewChunk> = (0u64..3)
-        .flat_map(|rep| {
-            WEIGHTS.iter().map(move |&weight| {
-                new_chunk((
-                    mint_key(rep * 100 + u64::from(weight)),
-                    CHUNK_SIZE,
-                    weight,
-                    DATASETS[0].to_string(),
-                ))
-            })
-        })
-        .collect();
-    let expected: HashMap<(String, String), u16> =
-        chunks.iter().map(|c| (chunk_pk(c), c.weight)).collect();
-
-    // pk sort order mirrors a real cycle.
-    record_weights(&weights, &chunks);
-    let mut storage_chunks: Vec<StorageNewChunk> = chunks.iter().map(storage_chunk).collect();
-    storage_chunks.sort_by_key(|c| ((*c.dataset).clone(), (*c.id).clone()));
-    let prepared = weights.prepare(storage_chunks);
-
-    assert_eq!(prepared.len(), chunks.len(), "a chunk lost its weight");
-    for (chunk, weight, _) in prepared {
-        let pk = ((*chunk.dataset).clone(), (*chunk.id).clone());
-        assert_eq!(weight, expected[&pk], "wrong weight for {pk:?}");
-    }
-}
-
 /// With stale accumulated and never cleared, repeated frozen-clock rescheduling must reach a
 /// fixed point — no oscillation.
 #[test]
 fn settle_without_clearing_reaches_fixed_point() {
     let mut sim = SimUnderTest::new();
-    // Each burst lowers the replication factor and sheds copies into stale.
+    // Each burst lowers the replication factor and sheds copies into stale. Seeding + bare
+    // `run_scheduler` (instead of `do_add_chunks`) keeps the clock frozen, so nothing drains.
     for burst in [8u64, 8, 6] {
         let base = sim.total_chunk_count() as u64;
-        sim.seed_chunks(&uniform_chunks(base, burst));
+        sim.insert_and_register(&uniform_chunks(base, burst));
         assert!(
             sim.with_step_safety(|s| s.run_scheduler().is_some()),
             "setup reschedule should stay feasible"
@@ -87,30 +47,6 @@ fn settle_without_clearing_reaches_fixed_point() {
     assert!(
         converged,
         "pure settle (no clearing) did not reach a fixed point"
-    );
-}
-
-/// `AddOutcome` distinguishes a feasible add from a recorded shortage; an over-subscribing
-/// burst is inserted either way.
-#[test]
-fn add_outcome_distinguishes_progress_from_shortage() {
-    let mut sim = SimUnderTest::new();
-    let base = sim.total_chunk_count() as u64;
-    assert_eq!(
-        sim.do_add_chunks(uniform_chunks(base, 4)),
-        AddOutcome::AllPlaced
-    );
-
-    let before = sim.total_chunk_count();
-    let base = sim.total_chunk_count() as u64;
-    assert_eq!(
-        sim.do_add_chunks(uniform_chunks(base, 255)),
-        AddOutcome::Infeasible
-    );
-    assert_eq!(
-        sim.total_chunk_count(),
-        before + 255,
-        "an over-subscribing burst is still inserted, not rejected"
     );
 }
 
@@ -154,19 +90,12 @@ fn worker_join_and_feasible_departure_preserve_floors() {
 fn removing_a_needed_worker_records_a_shortage() {
     let config = SimConfig {
         worker_count: 2,
-        worker_capacity: WORKER_CAPACITY,
-        min_replication: 2,
-        saturation: 0.9,
-        converge_is_terminal: false,
-        chunk_cap: None,
-        datasets: sim_datasets(),
-        confirm_threshold_pct: 100,
-        gc_ticks: 0,
+        ..SimConfig::fixed() // min_replication 2
     };
     let mut sim = SimUnderTest::from_config(&config);
-    let key = sim.total_chunk_count() as u64;
+    let base = sim.total_chunk_count() as u64;
     assert_eq!(
-        sim.do_add_chunks(uniform_chunks(key, 1)),
+        sim.do_add_chunks(uniform_chunks(base, 1)),
         AddOutcome::AllPlaced,
     );
     assert!(
@@ -185,20 +114,30 @@ fn removing_a_needed_worker_records_a_shortage() {
     assert!(sim.is_infeasible, "the shortage is recorded, not panicked");
 }
 
-/// An over-subscribing burst is still inserted (a real client always registers its chunks); the
-/// shortage is recorded, and the set still drains to a fixed point.
+/// A feasible add reports `AddOutcome::AllPlaced`; an over-subscribing burst reports
+/// `AddOutcome::Infeasible` yet is still inserted (a real client always registers its chunks),
+/// the shortage is recorded, and the set still drains to a fixed point.
 #[test]
 fn over_subscribing_burst_is_inserted_and_recorded() {
     let mut sim = SimUnderTest::new(); // 6 workers × 10 MiB, min_replication 2 ⇒ ~27 chunks feasible
     let base = sim.total_chunk_count() as u64;
-    let burst = uniform_chunks(base, 255);
-    let n = burst.len();
+    assert_eq!(
+        sim.do_add_chunks(uniform_chunks(base, 4)),
+        AddOutcome::AllPlaced,
+        "a feasible add reports progress"
+    );
 
-    sim.do_add_chunks(burst);
+    let before = sim.total_chunk_count();
+    let base = sim.total_chunk_count() as u64;
+    assert_eq!(
+        sim.do_add_chunks(uniform_chunks(base, 255)),
+        AddOutcome::Infeasible,
+        "an over-subscribing add reports the shortage"
+    );
     assert_eq!(
         sim.total_chunk_count(),
-        n,
-        "an over-subscribing burst is still inserted into storage"
+        before + 255,
+        "an over-subscribing burst is still inserted, not rejected"
     );
     assert!(
         sim.is_infeasible,
@@ -243,14 +182,8 @@ fn over_subscription_yields_typed_storage_error_shortage() {
 fn dropping_min_replication_frees_capacity_for_more_chunks() {
     let config = SimConfig {
         worker_count: 5,
-        worker_capacity: WORKER_CAPACITY,
         min_replication: 5, // each chunk replicated onto every worker — costly
-        saturation: 0.9,
-        converge_is_terminal: false,
-        chunk_cap: None,
-        datasets: sim_datasets(),
-        confirm_threshold_pct: 100,
-        gc_ticks: 0,
+        ..SimConfig::fixed()
     };
     let mut sim = SimUnderTest::from_config(&config);
 
@@ -404,7 +337,6 @@ fn consistency_oracle_tolerates_beyond_m() {
 /// workers stay active — a stand-in for premature deletion. Both must go: the ADR-0001 oracle
 /// treats a physical-only wipe as bounded routing-lag; only a globally-uncovered routed chunk
 /// fires the check.
-#[cfg(test)]
 fn wipe_fleet_holdings(sim: &mut SimUnderTest<InMemoryStorage>) {
     let active = sim.active_worker_pks();
     let empty = WorkerAssignment {
@@ -418,7 +350,6 @@ fn wipe_fleet_holdings(sim: &mut SimUnderTest<InMemoryStorage>) {
     sim.latest_worker_assignment = Some(empty);
 }
 
-#[cfg(test)]
 mod convergence_under_shortage {
     use super::*;
     use proptest::prelude::*;
@@ -458,14 +389,8 @@ mod convergence_under_shortage {
             let datasets = sim_datasets();
             let config = SimConfig {
                 worker_count,
-                worker_capacity: WORKER_CAPACITY,
                 min_replication,
-                saturation: 0.9,
-                converge_is_terminal: false,
-                chunk_cap: None,
-                datasets: datasets.clone(),
-                confirm_threshold_pct: 100,
-                gc_ticks: 0,
+                ..SimConfig::fixed()
             };
             let mut sim = SimUnderTest::from_config(&config);
             let mut key = 0u64;

@@ -570,12 +570,6 @@ impl WeightStrategy for WeightTable {
     }
 }
 
-/// A chunk's storage primary key, `(dataset, key)`. Weight isn't encoded — it lives in the table.
-#[cfg(test)]
-pub(super) fn chunk_pk(chunk: &NewChunk) -> (String, String) {
-    (chunk.dataset.clone(), chunk.key.clone())
-}
-
 /// Build the storage insert input for a model chunk. Weight is *not* recorded here — call
 /// [`record_weights`] separately.
 pub(super) fn storage_chunk(chunk: &NewChunk) -> StorageNewChunk {

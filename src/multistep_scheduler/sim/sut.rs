@@ -26,7 +26,6 @@ use crate::scheduler_storage::{
     StorageError, Tick, WorkerAssignment, WorkerPk,
 };
 use crate::types::{DatasetSchema, Worker, WorkerStatus};
-use crate::weight::WeightStrategy;
 use proptest::statistics;
 use proptest_state_machine::iterative_runner::IterativeSutStateMachine;
 
