@@ -178,7 +178,6 @@ fn partition_reliable(workers: &[Worker]) -> (Vec<&Worker>, usize, Vec<WorkerInd
         .chain(unreliable_positions)
         .collect();
 
-    // `new_pos[old] = new` — where each caller position landed.
     let mut new_pos: Vec<WorkerIndex> = vec![0; workers.len()];
     for (new, &old) in order.iter().enumerate() {
         new_pos[old] = new as WorkerIndex;
@@ -549,8 +548,9 @@ struct Reconcile<'a> {
     workers: &'a [&'a Worker],
     rings: &'a Rings,
     worker_capacity: u64,
-    /// Bytes physically on each worker (footprint plus new downloads this cycle). Never
-    /// decreased: removal is asynchronous, so dropped bytes still occupy disk this cycle.
+    /// Bytes physically on each worker (footprint plus new downloads this cycle). Drops never
+    /// decrease it (removal is asynchronous, the bytes still occupy disk this cycle) — the only
+    /// subtractions are same-cycle eviction reclaims and rollback refunds of uncharged downloads.
     allocated: Vec<u64>,
     /// Published placement — the result.
     worker_chunks: Vec<Vec<ChunkIndex>>,
@@ -678,7 +678,8 @@ impl<'a> Reconcile<'a> {
             self.fill_to_cap(placement_order, min_replication);
         }
 
-        // Phase C — floor add-back (invariant 4).
+        // Phase C — floor add-back (Invariant 4, the removal safety window in
+        // `docs/mvcc-storage.md`: a pair dropped from routing keeps serving M ticks).
         for &chunk_index in placement_order {
             self.floor_add_back(chunk_index, min_replication);
         }
@@ -885,6 +886,9 @@ impl<'a> Reconcile<'a> {
                 if freed >= size {
                     break;
                 }
+                // The victim is held on `w`, so its bytes were charged in `Reconcile::new`;
+                // saturating is release-mode defense only.
+                debug_assert!(allocated[w] >= s, "evicting uncharged bytes");
                 allocated[w] = allocated[w].saturating_sub(s);
                 evicted.push((x, worker));
                 freed += s;
@@ -966,6 +970,12 @@ impl<'a> Reconcile<'a> {
         let holders = std::mem::take(&mut self.chunk_workers[chunk_index]);
         for w in holders {
             if !self.is_held(chunk_index, w) {
+                // Non-held placements were charged as fresh downloads by `place`; saturating is
+                // release-mode defense only.
+                debug_assert!(
+                    self.allocated[w as usize] >= size,
+                    "refunding uncharged bytes"
+                );
                 self.allocated[w as usize] = self.allocated[w as usize].saturating_sub(size);
             }
             self.worker_chunks[w as usize].retain(|&c| c != ci);
