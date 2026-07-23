@@ -302,13 +302,11 @@ fn converges_to_a_fixed_point_staying_above_floor() {
     );
 }
 
-// Part 1 (pipeline): a new chunk never evicts a routed copy to seat itself. Here every full worker's
-// spare (bonus) copies are all still routed (committed == routed == current), so the only reclaimable
-// space is routed — off-limits to a new chunk. The new chunk's atomic floor can't be met, so it
-// defers to zero (backpressure) rather than sacrificing a live chunk's routed read; donors keep every
-// copy. (The positive path — a new chunk reclaiming NON-routed space — is
-// `new_chunk_reclaims_a_nonrouted_drain`; a portal-visible chunk in this same layout would preempt, cf.
-// `a_portal_visible_chunk_that_lost_every_copy_keeps_what_fits`.)
+// Part 1 (pipeline): a new chunk never evicts a routed copy to seat itself. Every spare copy here
+// is still routed (committed == routed == current), so nothing is reclaimable by a new chunk: its
+// atomic floor fails and it defers to zero (backpressure); donors keep every copy. Counterparts:
+// `new_chunk_reclaims_a_nonrouted_drain` (positive path),
+// `a_portal_visible_chunk_that_lost_every_copy_keeps_what_fits` (a visible chunk preempts).
 #[test]
 fn new_chunk_defers_rather_than_evicting_routed_copies() {
     let w = generate_workers(4);
@@ -586,14 +584,12 @@ fn partition_reliable_translates_current_positions() {
     assert_eq!(translated, current);
 }
 
-/// The Part-1 differentiation, at the pipeline level. The SAME starved layout is scheduled twice,
-/// differing only in the starved chunk's portal visibility, with every full worker's spare copy still
-/// routed:
-///   - **portal-visible** (an existing degraded chunk portals already route to): routing is soft, so
-///     same-cycle preemption reclaims a still-routed above-floor copy and the chunk reaches its floor.
-///   - **not visible** (a new chunk nobody reads yet): the only reclaimable space is routed, so
-///     eviction is vetoed; the atomic floor can't be met and the chunk defers to zero (backpressure)
-///     rather than sacrificing a live chunk's routed read. It regains a copy once space frees.
+/// The Part-1 differentiation at the pipeline level: the SAME starved layout scheduled twice,
+/// differing only in the starved chunk's portal visibility, with every spare copy still routed.
+///   - **portal-visible**: routing is soft — preemption reclaims a still-routed above-floor copy
+///     and the chunk reaches its floor.
+///   - **not visible**: routed space is vetoed for a new chunk — it defers to zero (backpressure)
+///     until space frees.
 #[test]
 fn a_portal_visible_chunk_that_lost_every_copy_keeps_what_fits() {
     let w = generate_workers(4);
@@ -756,11 +752,10 @@ fn genuine_shortage_signals_backpressure_not_a_sub_floor_placement() {
     );
 }
 
-// ADR 0001: under contention several starved floors preempt above-floor copies, but no donor is ever
-// taken below `min_replication` — and the copies it keeps are PRESENT (were already on disk), not
-// freshly-targeted downloads. Three donors fill the fleet; two starved, portal-visible chunks must
-// seat their floors by reclaiming the donors' above-floor (drain) copies (routing is soft for a
-// visible chunk, so a still-routed above-floor copy may be reclaimed as a last resort).
+// ADR 0001: under contention several starved floors preempt above-floor copies, but no donor drops
+// below `min_replication` — and the copies it keeps are PRESENT (already on disk), not fresh
+// downloads. The starved chunks are portal-visible, so the donors' still-routed above-floor copies
+// are reclaimable.
 #[test]
 fn preemption_never_takes_a_donor_below_its_present_floor() {
     let w = generate_workers(4);
@@ -783,8 +778,7 @@ fn preemption_never_takes_a_donor_below_its_present_floor() {
             size: 1000,
             weight: 1,
             minimum_worker_version: None,
-            // The starved chunks are portal-visible so preemption of the donors' still-routed
-            // above-floor copies is permitted (a new chunk would defer instead).
+            // Only the starved n* chunks are portal-visible (a new chunk would defer instead).
             is_portal_visible: id.starts_with('n'),
         })
         .collect();
@@ -949,12 +943,9 @@ fn drive_reconcile(
 }
 
 // Durability-hard / routing-best-effort (ADR 0001 as revised): reclaim may take a donor's
-// above-committed-floor copy — even one the confirmed routing still addresses — but never its last
-// committed copy. B has one committed copy (w2) and one drain (w1), min_replication 1; its new ideal
-// is w0 (downloading). A starved, portal-visible C (an existing degraded chunk — the case where
-// routing is soft ordering, not a veto) reclaims the drain on w1, but B's committed w2 is off-limits,
-// so B stays served (durability floor kept). The transient stale route to w1 is bounded routing-lag,
-// not a strand — B keeps a covered holder.
+// above-committed-floor copy — even a still-routed one — but never its last committed copy. A
+// starved, portal-visible C reclaims B's still-routed drain on w1; B's committed w2 is off-limits,
+// so B keeps a covered holder (the stale route to w1 is bounded routing-lag, not a strand).
 #[test]
 fn reclaim_takes_a_drain_but_never_the_last_committed_copy() {
     let (holders, evicted) = drive_reconcile(
@@ -1000,11 +991,10 @@ fn reclaim_takes_a_drain_but_never_the_last_committed_copy() {
     );
 }
 
-// ADR 0001 (the guarantee behind the cumulative-eviction fix): several starved floors preempting the
-// SAME donor must never take it below its floor. Donor X (min_rep 1) has ideal on all 5 workers but
-// is only PRESENT on w2,w3,w4 (w0,w1 downloading); its floor lands on w0. Three starved chunks target
-// w2,w3,w4. Without subtracting same-cycle evictions from the kept-floor count, all three of X's
-// present copies get evicted and X is stranded to zero present copies. The fix keeps one.
+// ADR 0001 (cumulative-eviction fix): several starved floors preempting the SAME donor must never
+// take it below its floor. X is present only on w2,w3,w4 (its floor lands on w0, a fresh download);
+// three starved chunks target exactly those copies. Without subtracting same-cycle evictions from
+// the kept-floor count, all three go and X is stranded at zero present copies.
 #[test]
 fn cumulative_preemption_never_strands_the_same_donor() {
     let (holders, evicted) = drive_reconcile(
@@ -1076,9 +1066,8 @@ fn cumulative_preemption_never_strands_the_same_donor() {
 }
 
 // ADR 0001, example 1 (bonus): a chunk over-replicated by weight may be dropped toward — but never
-// below — its floor to seat a starved chunk. X wants 5 (weight) and holds 5; min_rep 2; a starved,
-// portal-visible S reclaims two of X's still-routed bonus copies (routing is soft for a visible
-// chunk). X must end at >= 2 present, S at its floor.
+// below — its floor to seat a starved chunk. A starved, portal-visible S reclaims two of X's
+// still-routed bonus copies; X must end at >= 2 present, S at its floor.
 #[test]
 fn reclaim_drops_bonus_copies_to_floor_a_starved_chunk_but_not_below_floor() {
     let (holders, _evicted) = drive_reconcile(
@@ -1291,8 +1280,7 @@ fn new_chunk_defers_from_a_routed_copy_but_visible_preempts() {
     };
 
     let (holders_new, evicted_new) = drive_reconcile(2, 1000, 1, &layout(false));
-    // Nothing force-evicted: the routed copy on w1 is not deleted (it may still drain normally over M,
-    // so the read stays served), and C stays short rather than robbing it.
+    // The routed copy on w1 survives (it may still drain normally over M); C stays short.
     assert!(
         evicted_new.is_empty(),
         "a new chunk must not evict a routed copy; got {evicted_new:?}"
@@ -1322,12 +1310,10 @@ fn new_chunk_defers_from_a_routed_copy_but_visible_preempts() {
     );
 }
 
-// Possession-confirmed durability: committed rows alone don't prove a copy was ever downloaded.
-// X is committed on w0 and w1, but only w0 is routed — w1 is a replacement the confirmation has
-// never covered, so for all the algorithm knows it was never fetched. Evicting the routed copy on
-// w0 would satisfy the committed-survivor count (w1 remains) while deleting the chunk's only
-// proven-physical copy. The possession rule vetoes exactly that: a routed copy may go only if a
-// surviving committed copy is itself routed. C must not seat, and X's routed copy stays.
+// Possession-confirmed durability: a committed row alone doesn't prove a copy was ever downloaded.
+// X is committed on w0,w1 but routed only on w0 — evicting w0 satisfies the committed-survivor
+// count while deleting the only proven-physical copy. The possession rule vetoes exactly that: a
+// routed copy may go only if a surviving committed copy is itself routed. C stays short.
 #[test]
 fn reclaim_never_takes_the_only_routed_copy_for_an_unfetched_survivor() {
     let (holders, evicted) = drive_reconcile(
@@ -1375,12 +1361,11 @@ fn reclaim_never_takes_the_only_routed_copy_for_an_unfetched_survivor() {
     );
 }
 
-// KNOWN LIMITATION, pinned: the possession rule is scoped to routed donors, and both backends feed
-// `routed` visibility-filtered — so a confirmed-but-not-yet-promoted donor arrives with routed = ∅
-// and its only fetched copy IS evictable in favor of an unfetched committed survivor (the committed
-// floor is satisfied on paper). Accepted for now: a non-visible chunk has no readers until
-// promotion, and the per-worker applied-report possession view (ADR 0001, possession follow-up)
-// closes the window. This test pins the permissive behavior so that follow-up flips it consciously.
+// KNOWN LIMITATION, pinned: both backends feed `routed` visibility-filtered, so a
+// confirmed-but-not-yet-promoted donor arrives with routed = ∅ and the possession rule is vacuous —
+// its only fetched copy IS evictable for an unfetched committed survivor. Accepted: no readers
+// before promotion; the applied-report possession view (ADR 0001, possession follow-up) closes the
+// window. Pinned so that follow-up flips the behavior consciously.
 #[test]
 fn reclaim_may_take_a_nonvisible_donors_fetched_copy_for_an_unfetched_survivor() {
     let (holders, evicted) = drive_reconcile(
@@ -1424,11 +1409,10 @@ fn reclaim_may_take_a_nonvisible_donors_fetched_copy_for_an_unfetched_survivor()
 }
 
 // Cumulative possession accounting: two starved floors preempting the SAME donor in one cycle must
-// not use each other's victim as the surviving routed copy. X is committed on w0,w1,w2 but routed
-// (possession-confirmed) only on w0,w1. C1 takes the routed copy on w0 — legal, w1 survives routed.
-// C2 then wants the routed copy on w1; its only routed "survivor" is w0, already evicted THIS cycle.
-// Without subtracting same-cycle evictions inside the possession rule, C2's eviction passes and X
-// loses both possession-confirmed copies, keeping only the unfetched w2 row. The subtraction vetoes.
+// not use each other's victim as the surviving routed copy. X is routed only on w0,w1; C1 legally
+// takes w0, then C2 wants w1 — its only routed "survivor" is w0, already evicted THIS cycle.
+// Without subtracting same-cycle evictions inside the possession rule, X keeps only the unfetched
+// w2 row.
 #[test]
 fn cumulative_preemption_never_takes_both_routed_copies_of_one_donor() {
     let (holders, evicted) = drive_reconcile(
@@ -1484,10 +1468,9 @@ fn cumulative_preemption_never_takes_both_routed_copies_of_one_donor() {
 }
 
 // Cumulative held accounting for the visible-donor rule: two starved floors must not each treat the
-// other's victim as the donor's surviving held copy. Visible Z (committed floor vacuous) has two
-// lingering held copies on w1,w2 while its replacement downloads on w0. C1 takes w1 — legal, w2
-// survives held. C2 then wants w2; without subtracting same-cycle evictions inside the visible-donor
-// rule, w1 still "survives" on paper and Z is stripped to zero held copies. The subtraction vetoes.
+// other's victim as the donor's surviving held copy. Visible Z (committed floor vacuous) holds only
+// w1,w2; C1 legally takes w1, then C2 wants w2 — without subtracting same-cycle evictions inside
+// the visible-donor rule, w1 still "survives" on paper and Z is stripped to zero held copies.
 #[test]
 fn cumulative_preemption_never_strips_a_visible_donors_held_copies() {
     let (holders, evicted) = drive_reconcile(
@@ -1571,11 +1554,10 @@ fn cumulative_preemption_never_strips_a_visible_donors_held_copies() {
     );
 }
 
-// A portal-visible donor keeps its last held copy even when its committed floor is vacuous.
-// X is visible with |committed| = 0 (its committed holders departed) and one lingering held copy
-// on w1 while its replacement downloads on w0. Under the bare `|committed| = 0 ⇒ floor 0` rule
-// that lingering copy is freely reclaimable — deleting it recreates the holderless-visible state
-// preemption exists to close. The visible-donor rule vetoes it; C stays short.
+// A portal-visible donor keeps its last held copy even when its committed floor is vacuous
+// (holders departed). Under the bare `|committed| = 0 ⇒ floor 0` rule X's lingering copy on w1
+// would be freely reclaimable — recreating the holderless-visible state preemption exists to close.
+// The visible-donor rule vetoes it; C stays short.
 #[test]
 fn reclaim_never_takes_a_visible_chunks_last_held_copy() {
     let (holders, evicted) = drive_reconcile(

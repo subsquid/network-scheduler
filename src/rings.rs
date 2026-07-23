@@ -93,8 +93,8 @@ impl Rings {
     /// with `hash == index`. A replica whose hash is `h` (in `0..n_workers`) therefore walks the
     /// ring starting at worker `h`, then `h+1`, … wrapping — so a test can steer each replica onto
     /// exact workers by choosing its per-tag hashes, instead of depending on the real hash geometry.
-    // Only the `mvcc-chunks` reconcile tests use this; `rings` compiles without that feature, so gate
-    // the helper to match its users or it reads as dead code in a default-feature build.
+    // Gated to its only users (the `mvcc-chunks` reconcile tests) so default-feature builds don't
+    // flag it as dead code.
     #[cfg(all(test, feature = "mvcc-chunks"))]
     pub(crate) fn test_identity(n_workers: usize) -> Self {
         let one_ring: Vec<(u64, WorkerIndex)> = (0..n_workers)

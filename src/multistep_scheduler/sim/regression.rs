@@ -499,8 +499,7 @@ fn pg_guided_overcommit_capture_pg() {
 /// Regression: worker GC must delete a worker's stale rows with it. Any stale row outliving its
 /// worker trips the in-memory integrity oracle, and on Postgres the
 /// `sched_stale_mappings_worker_id_fkey` FK aborts the update.
-#[test]
-fn worker_gc_orphans_post_departure_stale_rows() {
+fn worker_gc_orphans_post_departure_stale_rows_case() -> (SimConfig, Vec<Action>) {
     let config = SimConfig {
         worker_count: 4,
         min_replication: 4,
@@ -510,45 +509,32 @@ fn worker_gc_orphans_post_departure_stale_rows() {
         new_chunk((mint_key(key), CHUNK_SIZE, weight, "s3://sim-0".to_string()))
     };
 
-    replay(
-        &config,
-        vec![
-            // Floor 4 of 4 workers — the leaver is a holder.
-            Action::AddChunks(vec![nc(1, 1)]),
-            Action::WorkerLeft(0),
-            Action::SetMinReplication(1),
-            // Heavy adds reshuffle pairs off the departed worker; still registered, it passes
-            // the mint filter and collects stale rows.
-            Action::AddChunks(vec![nc(2, 12), nc(3, 12)]),
-            // This sync GCs the departed worker under its stale rows.
-            Action::WorkerJoined(4),
-        ],
-    );
+    let actions = vec![
+        // Floor 4 of 4 workers — the leaver is a holder.
+        Action::AddChunks(vec![nc(1, 1)]),
+        Action::WorkerLeft(0),
+        Action::SetMinReplication(1),
+        // Heavy adds reshuffle pairs off the departed worker; still registered, it passes
+        // the mint filter and collects stale rows.
+        Action::AddChunks(vec![nc(2, 12), nc(3, 12)]),
+        // This sync GCs the departed worker under its stale rows.
+        Action::WorkerJoined(4),
+    ];
+    (config, actions)
 }
 
-/// Postgres variant of [`worker_gc_orphans_post_departure_stale_rows`]: the worker delete must
-/// cascade into `sched_stale_mappings`, and the integrity oracle verifies no row survives it.
+#[test]
+fn worker_gc_orphans_post_departure_stale_rows() {
+    let (config, actions) = worker_gc_orphans_post_departure_stale_rows_case();
+    replay(&config, actions);
+}
+
+/// Postgres twin: the worker delete must cascade into `sched_stale_mappings`, and the integrity
+/// oracle verifies no row survives it.
 #[test]
 fn worker_gc_orphans_post_departure_stale_rows_pg() {
-    let config = SimConfig {
-        worker_count: 4,
-        min_replication: 4,
-        ..base_config()
-    };
-    let nc = |key: u64, weight: u16| {
-        new_chunk((mint_key(key), CHUNK_SIZE, weight, "s3://sim-0".to_string()))
-    };
-
-    replay_pg(
-        &config,
-        vec![
-            Action::AddChunks(vec![nc(1, 1)]),
-            Action::WorkerLeft(0),
-            Action::SetMinReplication(1),
-            Action::AddChunks(vec![nc(2, 12), nc(3, 12)]),
-            Action::WorkerJoined(4),
-        ],
-    );
+    let (config, actions) = worker_gc_orphans_post_departure_stale_rows_case();
+    replay_pg(&config, actions);
 }
 
 /// Regression: reshuffling around a departed worker must not overcommit a survivor — `ideal ∪

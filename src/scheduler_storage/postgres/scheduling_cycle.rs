@@ -208,7 +208,7 @@ pub(super) async fn fetch_active_chunks_with_placement(
         out.for_algo
             .push((pk, AlgoChunk::new(&chunk, row.is_portal_visible)));
         if row.entered_worker_assignment {
-            out.bundle_schema_ids.insert(chunk.schema_id); // SchemaId: Copy
+            out.bundle_schema_ids.insert(chunk.schema_id);
         }
         out.published.insert(pk, chunk);
         count += 1;
@@ -228,8 +228,8 @@ pub(super) async fn fetch_workers(tx: &mut Transaction<'_, Postgres>) -> Result<
     Ok(rows)
 }
 
-/// Apply all four post-write deltas and promote the new ideal as a single simple-query batch — one
-/// round-trip instead of eight. The statements run sequentially inside the cycle transaction (each
+/// Apply the post-write deltas and promote the new ideal as a single simple-query batch — one
+/// round-trip instead of one per statement. The statements run sequentially inside the cycle transaction (each
 /// sees the previous one's effects, exactly as when they were separate calls), and the swap is
 /// textually last so the diff/stale statements still read the live (pre-swap) ideal. The phases are
 /// mutually independent — disjoint rows, different target tables — so batching them changes nothing

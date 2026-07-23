@@ -49,21 +49,17 @@ pub type CurrentPlacement = FxHashMap<ChunkPk, Vec<WorkerPk>>;
 pub struct ScheduleOutput {
     pub mapping: IdealMapping,
     pub replication_by_weight: BTreeMap<u16, u16>,
-    /// `(chunk, worker)` pairs the reconcile deleted this cycle to free room for another chunk that
-    /// could not otherwise reach `min_replication` — evicting as many copies as it takes to fit the
-    /// starved one (chunk sizes vary, so this is not a one-for-one swap).
+    /// `(chunk, worker)` pairs the reconcile deleted this cycle to free room for a chunk that
+    /// could not otherwise reach `min_replication` (as many copies as it takes — chunk sizes vary).
     ///
-    /// Storage's default for a copy dropped from the ideal is deferred removal: turn it into a draining
-    /// `stale` mapping that serves reads for M ticks, then frees. These pairs must instead be deleted
-    /// outright. Storage picks drain-vs-delete purely from the ideal diff and cannot tell an
-    /// eviction-to-free-room from an ordinary reshuffle drop, so the algorithm names the evicted pairs
-    /// explicitly — otherwise the evicted copy would linger in `ideal ∪ stale` for M ticks *alongside*
-    /// the copy it made room for, overcommitting the worker. Empty for the placement-blind scheduler,
+    /// These must be deleted outright, not drained: storage turns any copy dropped from the ideal
+    /// into a `stale` mapping that serves reads for M ticks, and cannot tell an eviction from an
+    /// ordinary reshuffle drop by the ideal diff alone — an evicted copy left to drain would occupy
+    /// the worker alongside the copy it made room for. Empty for the placement-blind scheduler,
     /// which never evicts.
     ///
-    /// Only needed because storage re-derives the draining set itself; if the algorithm returned the
-    /// full placement (ideal plus retained drains), eviction would be implicit in a pair's absence and
-    /// this field would go away. See issue #110.
+    /// Would be unneeded if the algorithm returned the full placement (ideal plus retained drains),
+    /// making eviction implicit in a pair's absence — see issue #110.
     pub evicted: Vec<(ChunkPk, WorkerPk)>,
 }
 

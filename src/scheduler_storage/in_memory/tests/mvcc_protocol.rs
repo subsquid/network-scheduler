@@ -523,6 +523,7 @@ fn schema_bundle_covers_holderless_portal_visible_chunk() {
         "portal-visible chunk keeps its schema in the bundle",
     );
 }
+
 /// Order-insensitive view of `chunk_workers` for literal comparison. Panics on
 /// duplicate worker ids, which the set conversion would otherwise hide.
 fn as_sets(

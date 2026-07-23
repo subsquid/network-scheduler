@@ -917,12 +917,11 @@ impl SchedulerStorage for InMemoryStorage {
         // `BTreeMap` the snapshot is built as.
         let current_placement: CurrentPlacement = self.current_placement().into_iter().collect();
 
-        // Split-role inputs for eviction (see `SchedulingAlgorithm::schedule`): `committed` is the
-        // pre-cycle committed ideal (durability floor — hard), `confirmed_routing` is the confirmed
-        // routing (best-effort victim ordering). The routing is filtered to portal-visible chunks,
-        // mirroring the Postgres `fetch_confirmed_routing` predicate, so both backends see the same
-        // routed set. Departed holders are dropped downstream by the same position mapping as
-        // `current_placement`, so no active-worker filter is needed here.
+        // Split-role eviction inputs (roles documented on `SchedulingAlgorithm::schedule`). The
+        // routing is filtered to portal-visible chunks, mirroring the Postgres
+        // `fetch_confirmed_routing` predicate, so both backends see the same routed set. No
+        // active-worker filter: departed holders are dropped downstream by the same position
+        // mapping as `current_placement`.
         let committed: CurrentPlacement = self
             .sched_ideal_chunk_workers
             .iter()
@@ -1031,12 +1030,10 @@ impl SchedulerStorage for InMemoryStorage {
             }
         }
 
-        // Bundle covers every chunk that has entered a worker assignment and is not yet tombstoned —
-        // its whole routable lifetime, not just the chunks placed this cycle (ADR 0002). The portal can
-        // still route a chunk the latest assignment dropped (it was promoted off an earlier confirmed
-        // entry and drains for M ticks), so keying the bundle on current placement would drop the
-        // schema out from under a chunk still being read. `entered ∧ ¬tombstoned` holds for exactly the
-        // window a reader can be routed to the chunk.
+        // Bundle covers every chunk in its routable window — entered a worker assignment, not yet
+        // tombstoned — not just this cycle's placement (ADR 0002): the portal can still route a
+        // chunk the latest assignment dropped (promoted off an earlier confirmed entry, draining
+        // for M ticks), so keying on current placement would yank a schema still being read.
         let mut schema_ids: BTreeSet<SchemaId> = assignment.schema_ids();
         schema_ids.extend(
             self.sched_chunk_metadata

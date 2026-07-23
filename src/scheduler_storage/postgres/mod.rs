@@ -421,11 +421,11 @@ impl SchedulerStorage for PostgresStorage {
             )
             .await?;
 
-            // Bundle covers the assignment's chunks (ideal ∪ stale), plus every chunk still in its
-            // routable window (entered a worker assignment, not yet tombstoned) so one the latest
-            // assignment dropped but a confirmed earlier entry still routes to keeps its schema_id
-            // (ADR 0002). Only the content load hits the DB, and schema content is immutable per id,
-            // so the by-id read is safe under concurrent writers.
+            // Bundle covers the assignment's chunks (ideal ∪ stale) plus every chunk in its
+            // routable window — entered a worker assignment, not yet tombstoned — so a chunk the
+            // latest assignment dropped but an earlier confirmed entry still routes to keeps its
+            // schema (ADR 0002). Only the content load hits the DB, and schema content is
+            // immutable per id, so the by-id read is safe under concurrent writers.
             let mut schema_ids: BTreeSet<SchemaId> = wa.schema_ids();
             schema_ids.extend(bundle_schema_ids);
             let schema_ids: Vec<SchemaId> = schema_ids.into_iter().collect();

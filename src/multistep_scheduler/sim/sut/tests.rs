@@ -400,10 +400,10 @@ fn consistency_oracle_tolerates_beyond_m() {
     sim.assert_portal_consistency(); // no panic
 }
 
-/// Wipe every active worker's holdings *and* drop all coverage from the latest worker assignment,
-/// while the workers stay active — a stand-in for premature deletion. Both must go: the ADR-0001
-/// oracle treats a physical-only wipe (assignment still covers the chunk) as bounded routing-lag, so
-/// only a globally-uncovered routed chunk is genuinely unanswerable and fires the check.
+/// Wipe every active worker's holdings *and* the latest worker assignment's coverage, while the
+/// workers stay active — a stand-in for premature deletion. Both must go: the ADR-0001 oracle
+/// treats a physical-only wipe as bounded routing-lag; only a globally-uncovered routed chunk
+/// fires the check.
 #[cfg(test)]
 fn wipe_fleet_holdings(sim: &mut SimUnderTest<InMemoryStorage>) {
     let active = sim.active_worker_pks();

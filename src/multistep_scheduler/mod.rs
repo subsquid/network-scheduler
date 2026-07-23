@@ -14,7 +14,8 @@
 //! copies are added back if fewer than the floor survive, new chunks reach their floor atomically
 //! or are excluded, and bonus growth is suppressed while any floor is unmet.
 
-use std::collections::BTreeMap;
+use std::cmp::Reverse;
+use std::collections::{BTreeMap, HashSet};
 
 use itertools::Itertools;
 use libp2p_identity::PeerId;
@@ -54,21 +55,19 @@ pub struct ScheduledChunk<'a> {
 /// worker must be left out (they become a shortfall). Returns the full published placement
 /// (new copies plus current copies retained to hold the floor).
 ///
-/// `committed[i]` and `routed[i]` are the same **positions-into-`workers`** shape, splitting out the
-/// two roles the flattened `current` mixes together (see `docs/adr/0001-same-cycle-floor-preemption.md`):
-/// - `committed[i]` — the pre-cycle *committed ideal* holders: the durability floor `step_safety`
-///   retention measures against. Eviction treats this as the **hard** floor: a donor always keeps
-///   ≥ `min(min_replication, |committed|)` of its committed copies un-evicted.
-/// - `routed[i]` — the holders the *confirmed routing* still addresses. **Best-effort only**: it
-///   orders eviction victims (a still-routed copy is sacrificed last) but never blocks an eviction —
-///   confirmation lag is unbounded below a full quorum, so hard-protecting routing could pin disk
-///   indefinitely.
+/// `committed[i]` and `routed[i]` share the **positions-into-`workers`** shape and split out the two
+/// roles the flattened `current` mixes (see `docs/adr/0001-same-cycle-floor-preemption.md`):
+/// - `committed[i]` — pre-cycle *committed ideal* holders: the durability floor `step_safety`
+///   retention measures against. **Hard**: a donor always keeps
+///   ≥ `min(min_replication, |committed|)` committed copies un-evicted.
+/// - `routed[i]` — holders the *confirmed routing* still addresses. **Best-effort**: orders eviction
+///   victims (still-routed sacrificed last) but never blocks an eviction — confirmation lag is
+///   unbounded below a full quorum, so hard-protecting routing could pin disk indefinitely.
 ///
-/// Returns the published placement plus the `(chunk, holder)` pairs the reconcile force-dropped this
-/// cycle to floor a starved chunk. The evictions are **not** part of the assignment — a worker
-/// removes a copy simply because it is absent from its assignment; the list only tells storage not to
-/// re-mint those dropped copies as draining `stale` mappings (which would re-add them and overcommit
-/// the worker). See `docs/adr/0001-same-cycle-floor-preemption.md`.
+/// Returns the published placement plus the `(chunk, holder)` pairs force-dropped this cycle to
+/// floor a starved chunk. Evictions are **not** part of the assignment — a worker removes a copy
+/// simply because it is absent from its assignment; the list only tells storage not to re-mint the
+/// dropped copies as draining `stale` mappings (which would re-add them and overcommit the worker).
 pub fn schedule(
     chunks: &[ScheduledChunk<'_>],
     workers: &[Worker],
@@ -93,10 +92,9 @@ pub fn schedule(
         return schedule_to_workers(chunks, &workers, config, current, committed, routed, cache);
     }
 
-    // NOTE: untested. The sim and PBT run only with `ignore_reliability = true`, so everything
-    // below — the reliable-first partition, the per-view translation, and the reliable-prefix
-    // filtering of all three placement views — has no test coverage. It follows #53's single-view
-    // translation pattern extended to `committed`/`routed`, but nothing exercises it.
+    // NOTE: untested — the sim and PBT run only with `ignore_reliability = true`, so nothing below
+    // (partition, per-view translation, reliable-prefix filtering) has coverage. It extends #53's
+    // single-view translation pattern to `committed`/`routed`.
     //
     // The partition reorders the fleet, so every placement view is translated into the
     // partitioned position space (each held copy still points at the same worker).
@@ -158,8 +156,7 @@ pub fn schedule(
     // Partition evictions the same way, so no pair ever names a worker whose published list came
     // from the other pass (which might still hold that chunk). Reliable pass's pairs are all on
     // reliable workers; from `all` keep only pairs on unreliable workers.
-    let reliable_ids: std::collections::HashSet<PeerId> =
-        sorted[..reliable_count].iter().map(|w| w.id).collect();
+    let reliable_ids: HashSet<PeerId> = sorted[..reliable_count].iter().map(|w| w.id).collect();
     evicted.extend(
         all_evicted
             .into_iter()
@@ -536,9 +533,8 @@ impl FillToCap for Placement<'_> {
 // Stage 2 — reconciliation against the real footprint.
 // ===========================================================================
 
-/// Reconciliation pass state.
-/// The four per-chunk placement views the reconcile reads, all in input order. Grouped into a single
-/// [`Reconcile::new`] argument so they can't be swapped at the call site; see the like-named
+/// The four per-chunk placement views the reconcile reads, all in input order. Grouped into a
+/// single [`Reconcile::new`] argument so they can't be swapped at the call site; see the like-named
 /// [`Reconcile`] fields for each view's role.
 struct PlacementViews<'a> {
     ideal: &'a [Vec<WorkerIndex>],
@@ -547,6 +543,7 @@ struct PlacementViews<'a> {
     routed: &'a [Vec<WorkerIndex>],
 }
 
+/// Reconciliation pass state.
 struct Reconcile<'a> {
     chunks: &'a [ReplicatedChunk<'a>],
     workers: &'a [&'a Worker],
@@ -564,16 +561,15 @@ struct Reconcile<'a> {
     /// Current holders per chunk, in input order; draining copies included.
     held: &'a [Vec<WorkerIndex>],
     /// Pre-cycle committed-ideal holders per chunk — the durability floor eviction must not breach.
-    /// This is the exact set `step_safety` retention measures against, so counting *these* survivors
-    /// (not the drain-and-download-polluted `held`) is what keeps eviction from hard-deleting a copy
-    /// the donor's floor still needs.
+    /// The exact set `step_safety` retention measures against, unlike the drain-and-download-polluted
+    /// `held`.
     committed: &'a [Vec<WorkerIndex>],
     /// Pre-cycle confirmed-routing holders per chunk. Soft: only orders eviction victims so a
     /// still-routed copy is sacrificed last; never blocks an eviction (confirmation lag is unbounded
     /// below a full quorum).
     routed: &'a [Vec<WorkerIndex>],
-    /// Chunk indices each worker currently holds (inverse of `held`), built once. Lets Pass-2
-    /// eviction enumerate a worker's held-not-ideal copies without scanning every chunk.
+    /// Chunk indices each worker currently holds (inverse of `held`), built once so Pass-2 eviction
+    /// can enumerate a worker's held copies without scanning every chunk.
     held_by_worker: Vec<Vec<ChunkIndex>>,
     /// New chunks excluded this cycle because they couldn't reach the floor.
     excluded: Vec<bool>,
@@ -639,9 +635,9 @@ impl<'a> Reconcile<'a> {
         // would let two new chunks competing for the same room each grab a partial floor and
         // *both* roll back to zero, leaving placeable capacity unused.
         //
-        // Never-routed is what makes a chunk new here, not merely holding nothing: a chunk portals
-        // already route to arrives with no keepable copies once its last holder departs, and the
-        // all-or-nothing rule would take it from some copies to none.
+        // Not-portal-visible is what makes a chunk new here, not merely holding nothing: a chunk
+        // portals already route to can lose its last holder, and the all-or-nothing rule would then
+        // exclude it outright instead of re-flooring it best-effort.
         let (new_chunks, held_chunks): (Vec<usize>, Vec<usize>) = placement_order
             .iter()
             .copied()
@@ -763,44 +759,29 @@ impl<'a> Reconcile<'a> {
         self.place_by_eviction(chunk_index, tag, min_replication)
     }
 
-    /// Pass 2: walk the chunk's ring again in the same order, and at the first worker whose free room
-    /// plus its reclaimable bytes cover the chunk, evict just enough reclaimable copies to fit, then
-    /// place the chunk the same cycle (same-cycle swap — the worker deletes before it downloads, so
-    /// accept the momentary over-commit).
+    /// Pass 2: re-walk the chunk's ring in the same order; at the first worker whose free room plus
+    /// reclaimable bytes cover the chunk, evict just enough reclaimable copies to fit and place the
+    /// chunk the same cycle (the worker deletes before it downloads, so the momentary over-commit is
+    /// accepted). See `docs/adr/0001-same-cycle-floor-preemption.md`.
     ///
-    /// **Durability is the hard invariant; routing consistency is best-effort.** (Worker-confirmation
-    /// lag is unbounded below a full quorum — a stalled watermark pins the confirmed routing — so
-    /// hard-protecting routing would pin disk and freeze the scheduler's reaction to ingestion and
-    /// worker churn.)
-    ///
-    /// *Hard floor — committed copies.* A held copy of chunk `X` on `w` may be evicted iff
-    /// `w ∉ chunk_workers[X]` (X is not publishing `w` this cycle), `(X, w) ∉ evicted`, and X keeps
-    /// ≥ `min(min_replication, |committed[X]|)` of its **committed** copies without `w`. `committed[X]`
-    /// is the pre-cycle committed ideal — exactly what `step_safety` retention measures — so counting
-    /// survivors here is what stops eviction from hard-deleting a copy the donor's durability floor
-    /// still needs. `|committed[X]| = 0` ⇒ floor 0 ⇒ freely reclaimable (a holderless/removed chunk has
-    /// no floor to breach, preserving ADR-0001 room). Copies of X already evicted this cycle (on other
-    /// workers) are subtracted, so several floors preempting one donor can't collectively take it below
-    /// the floor. Everything above the committed floor — bonus copies and leftover drains — stays
-    /// reclaimable; weight/bonus replication is soft, floors are hard.
-    ///
-    /// *Hard — possession.* Committed rows don't prove possession (a committed replacement may never
-    /// have fetched), so evicting a **routed** copy — the algorithm's only possession proof — further
-    /// requires a surviving committed copy that is itself routed; and a **portal-visible** donor always
-    /// keeps ≥ 1 held copy, even at `|committed| = 0`, so preemption can never manufacture the
-    /// holderless-visible state it exists to close.
-    ///
-    /// *Soft — routing, differentiated by the starved chunk's visibility.* `routed[X]` orders victims:
-    /// copies the routing has already moved off (`w ∉ routed[X]`) are evicted before still-routed ones.
-    /// - **C portal-visible** (an existing degraded chunk — the ADR-0001 case): routing is pure
-    ///   ordering and never a veto. A still-routed donor copy above the durability floor may be evicted
-    ///   as a last resort; the transient read miss is the documented routing-lag cost
-    ///   (`portal_consistency_misses`), bounded because the chunk keeps a covered holder elsewhere.
-    /// - **C not portal-visible** (a new chunk nobody reads yet): routing is a *hard* veto on the
-    ///   donor — a candidate `(X, w)` with `w ∈ routed[X]` is rejected. A new chunk reclaims only
-    ///   non-routed space; if that isn't enough it defers via the atomic-floor exclusion
-    ///   (backpressure). Principle: don't sacrifice a live chunk's read availability to place a chunk
-    ///   nobody reads yet. The durability guard applies in both cases and is never relaxed.
+    /// **Durability is hard; routing consistency is best-effort** (worker-confirmation lag is
+    /// unbounded below a full quorum, so hard-protecting routing would pin disk indefinitely).
+    /// For a candidate copy of chunk `X` on worker `w`:
+    /// - *Committed floor (hard).* X must keep ≥ `min(min_replication, |committed[X]|)` committed
+    ///   copies without `w`, net of this cycle's other evictions of X (so several floors preempting
+    ///   one donor can't collectively breach it). `committed[X]` is exactly what `step_safety`
+    ///   retention measures, so this floor stops eviction from hard-deleting a copy the donor still
+    ///   needs; `|committed[X]| = 0` ⇒ no floor ⇒ freely reclaimable (preserves ADR-0001 room).
+    ///   Bonus copies and leftover drains above the floor stay reclaimable.
+    /// - *Possession (hard).* A committed row doesn't prove the copy was ever fetched, so evicting a
+    ///   **routed** copy — the only possession proof — additionally requires a surviving committed
+    ///   copy that is itself routed; and a portal-visible donor always keeps ≥ 1 held copy, so
+    ///   preemption can't recreate the holderless-visible state it exists to close.
+    /// - *Routing (soft).* `routed[X]` orders victims, not-routed copies first. A portal-visible
+    ///   starved chunk (the ADR-0001 case) may take a still-routed copy above the floor as a last
+    ///   resort — the transient miss is the documented `portal_consistency_misses` cost. For a
+    ///   not-yet-visible starved chunk `w ∈ routed[X]` is a hard veto: never trade a live chunk's
+    ///   reads for a chunk nobody reads yet; it defers via the atomic-floor exclusion instead.
     fn place_by_eviction(
         &mut self,
         chunk_index: usize,
@@ -811,12 +792,8 @@ impl<'a> Reconcile<'a> {
         let chunks = self.chunks;
         let chunk = &chunks[chunk_index];
         let size = chunk.size as u64;
-        // A new (not-yet-portal-visible) chunk C nobody reads yet must not evict a still-routed copy
-        // to seat itself: that would trade a live chunk's read availability for a chunk with no
-        // readers. A new C reclaims only non-routed space; if that isn't enough it defers via the
-        // atomic-floor exclusion (backpressure), intended. A portal-visible C (an existing degraded
-        // chunk — the ADR-0001 case) keeps the soft-routing behavior: a still-routed donor copy above
-        // the durability floor may be evicted as a last resort.
+        // Decides the routing rule (see doc): visible C treats routing as soft ordering,
+        // not-yet-visible C is hard-vetoed from still-routed copies.
         let c_visible = chunk.is_portal_visible;
         let workers = self.workers;
         let rings = self.rings;
@@ -853,16 +830,9 @@ impl<'a> Reconcile<'a> {
                     xi != chunk_index
                         && !chunk_workers[xi].contains(&worker)   // X not publishing w this cycle
                         && !evicted.contains(&(x, worker))        // not already evicted
-                        // A new chunk reclaims only non-routed space: never sacrifice a live chunk's
-                        // routed read for a chunk nobody reads yet. Visible C keeps soft routing.
+                        // Routing veto for a not-yet-visible starved chunk.
                         && (c_visible || !routed[xi].contains(&worker))
-                        // Durability-hard floor: X keeps ≥ min(min_replication, |committed[X]|) of its
-                        // committed copies after removing w. `committed[X]` is the pre-cycle committed
-                        // ideal (what step_safety retention measures), so this is the exact floor the
-                        // donor must not breach. Copies of X already evicted this cycle (on other
-                        // workers) are subtracted, so several floors preempting one donor can't
-                        // collectively take it below the floor. |committed[X]| = 0 ⇒ floor 0 ⇒ freely
-                        // reclaimable (holderless/removed chunk has no floor).
+                        // Committed floor, net of this cycle's other evictions of X.
                         && {
                             let floor = (min_replication as usize).min(committed[xi].len());
                             committed[xi]
@@ -871,31 +841,24 @@ impl<'a> Reconcile<'a> {
                                 .count()
                                 >= floor
                         }
-                        // Possession-confirmed durability: a committed row alone doesn't prove the
-                        // copy was ever downloaded — a committed-but-never-fetched replacement can
-                        // lag unboundedly, so counting it as the survivor would let eviction
-                        // hard-delete the donor's only physical copy. A *routed* copy is the one
-                        // possession proof the algorithm has (the confirmed routing only addresses
-                        // workers that confirmed holding), so deleting a routed copy additionally
-                        // requires a surviving committed copy that is itself routed.
+                        // Possession: evicting a routed copy requires a surviving committed copy
+                        // that is itself routed (a committed-but-never-fetched survivor proves
+                        // nothing).
                         //
                         // Scope: both backends feed `routed` visibility-filtered, so this rule is
-                        // vacuous for a not-yet-visible donor (`routed[xi]` empty) — its copies are
-                        // guarded by the committed floor only, and its sole fetched copy remains
-                        // evictable for an unfetched survivor until the per-worker applied-report
-                        // possession view lands (ADR 0001, possession follow-up). Bounded harm: a
-                        // non-visible chunk has no readers until promotion.
+                        // vacuous for a not-yet-visible donor (`routed[xi]` empty) — its sole
+                        // fetched copy stays evictable for an unfetched survivor until the
+                        // per-worker applied-report possession view lands (ADR 0001, possession
+                        // follow-up). Bounded harm: no readers until promotion.
                         && (!routed[xi].contains(&worker)
                             || committed[xi].iter().any(|&w2| {
                                 w2 != worker
                                     && !evicted.contains(&(x, w2))
                                     && routed[xi].contains(&w2)
                             }))
-                        // A portal-visible donor keeps ≥ 1 held copy. With |committed[X]| = 0
-                        // (all committed holders departed) the floor guard above is vacuous, but
-                        // taking a visible chunk's last lingering copy recreates the exact
-                        // holderless-visible state preemption exists to close. Non-visible chunks
-                        // (incl. being-removed, ideal = ∅) stay freely reclaimable.
+                        // A portal-visible donor keeps ≥ 1 held copy — covers |committed[X]| = 0,
+                        // where the floor guard is vacuous. Non-visible chunks (incl. being-removed,
+                        // ideal = ∅) stay freely reclaimable.
                         && (!chunks[xi].is_portal_visible
                             || held_all[xi]
                                 .iter()
@@ -906,10 +869,10 @@ impl<'a> Reconcile<'a> {
                     (still_routed, chunks[x as usize].size as u64, x)
                 })
                 .collect();
-            // Best-effort routing: evict not-routed copies first (primary key), largest-first within a
-            // routing class (tiebreak). A still-routed copy is sacrificed only when the not-routed ones
-            // don't free enough room for the starved floor.
-            candidates.sort_unstable_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)));
+            // Not-routed copies first, largest-first within a routing class: a still-routed copy is
+            // sacrificed only when the not-routed ones don't free enough room.
+            candidates
+                .sort_unstable_by_key(|&(still_routed, size, _)| (still_routed, Reverse(size)));
 
             // Cheap pre-sum: never evict on a worker that still can't fit the chunk — spill instead.
             let reclaimable: u64 = candidates.iter().map(|(_, s, _)| *s).sum();

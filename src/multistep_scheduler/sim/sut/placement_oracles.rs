@@ -33,15 +33,13 @@ use crate::scheduler_storage::{
 /// replication concern, not MVCC; below a 100% quorum, routing to stragglers is the documented X%
 /// tradeoff (`docs/mvcc-storage.md`, "Slow confirmation").
 ///
-/// **Durability-hard, routing best-effort (ADR 0001).** A within-M miss is *excused* while the chunk
-/// keeps a covered holder somewhere (`covered_anywhere` — durability intact): same-cycle floor
-/// preemption deliberately deletes an above-floor still-routed copy, and worker-confirmation lag is
-/// unbounded below a full quorum, so the routed workers can lag the durable placement. That is bounded
-/// routing-lag (the
-/// same envelope [`portal_consistency_misses`] counts), analogous to `published_coverage` and to the
-/// existing departed-worker exemption below — not a strand. The oracle fires only when the chunk is
-/// **globally uncovered** (no covered holder anywhere): then the query is genuinely unanswerable —
-/// real data loss, not lag.
+/// **Durability-hard, routing best-effort (ADR 0001).** A within-M miss is excused while the chunk
+/// keeps a covered holder somewhere (`covered_anywhere`): same-cycle floor preemption deliberately
+/// deletes an above-floor still-routed copy, and confirmation lag is unbounded below a full quorum,
+/// so routing can lag the durable placement. That is bounded routing-lag (the envelope
+/// [`portal_consistency_misses`] counts) — not a strand, like the departed-worker exemption. The
+/// oracle fires only when the chunk is **globally uncovered**: then the query is genuinely
+/// unanswerable — data loss, not lag.
 pub(super) fn portal_consistency(
     snapshot: &PortalAssignment,
     snapshot_age: Tick,
@@ -117,29 +115,26 @@ pub(super) fn portal_consistency_misses(
 /// chunk with an active routed worker, the published worker assignment (`ideal ∪ stale`) must list at
 /// least one active holder for that chunk **anywhere** — not necessarily among the routed workers.
 ///
-/// This is the true "unanswerable" property. Durability is the hard invariant; routing consistency is
-/// best-effort and bounded: same-cycle floor preemption deliberately deletes an above-floor,
-/// still-routed copy (worker-confirmation lag is unbounded below a full quorum, so eviction cannot
-/// hard-protect routing).
-/// A stale route to an evicted copy, while the chunk still has a covered holder elsewhere, is accepted
-/// routing-lag — the same envelope [`portal_consistency_misses`] counts, and consistent with ADR 0002.
-/// The oracle fires only when the chunk has **no** covered holder at all: then a query cannot be
-/// answered anywhere — genuine data loss, not lag.
+/// Durability is the hard invariant; routing consistency is best-effort: same-cycle floor preemption
+/// deliberately deletes an above-floor still-routed copy (confirmation lag is unbounded below a full
+/// quorum, so eviction cannot hard-protect routing). A stale route to an evicted copy while a covered
+/// holder remains elsewhere is bounded routing-lag (the envelope [`portal_consistency_misses`]
+/// counts; consistent with ADR 0002). The oracle fires only when the chunk has **no** covered holder
+/// at all — genuine data loss, not lag.
 ///
-/// Only active workers count (both routed and holder). A departed worker's stale rows are purged on
+/// Only active workers count (both routed and holder): a departed worker's stale rows are purged on
 /// departure, so a chunk routed only to departed workers is a documented availability event, not a
-/// coverage bug (a removed chunk is de-visibilitied from the portal, so it never reaches this check).
+/// coverage bug. The caller also stands this check down during a recorded shortage (`is_infeasible`):
+/// an over-subscribed fleet cannot hold every floor, so a visible chunk reaching zero copies there is
+/// unavoidable — the same category as the departed-worker exemption.
 ///
-/// The caller also stands this check down during a recorded shortage (`is_infeasible`): an
-/// over-subscribed fleet cannot hold every floor, so a visible chunk reaching zero copies there is
-/// unavoidable, not a defect — the same category as the departed-worker exemption.
-/// With `require_physical`, "covered" is additionally required to be *physical*: at least one active
-/// listed holder must really hold the chunk (`holds`). A listing row alone doesn't prove possession —
-/// a committed-but-never-fetched replacement can lag unboundedly. Callers use this mode for
-/// **classification only, at every quorum**: a paper-only state is legitimate in departure→rejoin
+/// With `require_physical`, "covered" additionally needs an active listed holder that really holds
+/// the chunk (`holds`) — a listing row alone doesn't prove possession, since a
+/// committed-but-never-fetched replacement can lag unboundedly. Callers use this mode for
+/// **classification only, at every quorum**: paper-only coverage is legitimate in departure→rejoin
 /// windows (a rejoined worker is listed while its disk is still empty), so it can never be fatal
-/// state-wise. Eviction-caused physical loss is made fatal by the edge-triggered
-/// `assert_physical_retention` in the SUT, not by this predicate.
+/// state-wise. Eviction-caused physical loss is made fatal by the SUT's edge-triggered
+/// `assert_physical_retention`, not by this predicate.
 pub(super) fn published_coverage(
     portal: &PortalAssignment,
     worker: Option<&WorkerAssignment>,
@@ -152,9 +147,8 @@ pub(super) fn published_coverage(
         if !routed.iter().any(|&w| is_active(w)) {
             continue;
         }
-        // Covered iff the worker assignment lists ANY active holder for this chunk, anywhere. The
-        // routed workers need not be among them — a still-routed copy eviction deleted is tolerated as
-        // long as some covered holder remains.
+        // Covered iff the assignment lists ANY active holder — the routed workers need not be
+        // among them.
         let listed_holders = worker.and_then(|assignment| assignment.chunk_workers.get(chunk));
         let covered_anywhere =
             listed_holders.is_some_and(|holders| holders.iter().any(|&w| is_active(w)));
@@ -166,26 +160,28 @@ pub(super) fn published_coverage(
                  is unanswerable",
             ));
         }
-        let covered_physically = listed_holders
-            .is_some_and(|holders| holders.iter().any(|&w| is_active(w) && holds(w, chunk)));
-        if require_physical && !covered_physically {
-            return Err(format!(
-                "published worker assignment covers chunk {chunk:?} on paper only: it lists active \
-                 holders, but none of them physically holds the chunk — legitimate transiently in a \
-                 departure→rejoin window, a defect when eviction caused it (which the \
-                 physical-retention edge check polices)",
-            ));
+        if require_physical {
+            let covered_physically = listed_holders
+                .is_some_and(|holders| holders.iter().any(|&w| is_active(w) && holds(w, chunk)));
+            if !covered_physically {
+                return Err(format!(
+                    "published worker assignment covers chunk {chunk:?} on paper only: it lists \
+                     active holders, but none of them physically holds the chunk — legitimate \
+                     transiently in a departure→rejoin window, a defect when eviction caused it \
+                     (which the physical-retention edge check polices)",
+                ));
+            }
         }
     }
     Ok(())
 }
 
 /// Fixed-point routing liveness: at a drained fixed point (ideal stable, stale empty, every routing
-/// diff replayed, no shortage) all deliberate routing lag has resolved, so the confirmed routing must
-/// agree with the worker assignment **pair-by-pair** — every active routed worker is listed as a
-/// holder of the chunk it is routed for. This restores the strict pre-preemption per-pair check
-/// exactly where it is sound, and is what makes "bounded routing-lag" a checked bound: a stale pair
-/// that survives quiescence is a stuck routing update (a diff never emitted or misapplied), not lag.
+/// diff replayed, no shortage) all deliberate routing lag has resolved, so the confirmed routing
+/// must agree with the worker assignment **pair-by-pair** — every active routed worker is listed as
+/// a holder of the chunk it is routed for. This is what makes "bounded routing-lag" a checked bound:
+/// a stale pair that survives quiescence is a stuck routing update (a diff never emitted or
+/// misapplied), not lag.
 pub(super) fn routing_matches_assignment_at_fixed_point(
     portal: &PortalAssignment,
     worker: Option<&WorkerAssignment>,
@@ -637,7 +633,8 @@ mod tests {
 
     #[test]
     fn portal_consistency_fires_when_accountable_worker_lacks_chunk() {
-        // No routed worker holds it and it is covered nowhere — a genuine miss.
+        // No routed worker holds it and it is covered nowhere — a genuine miss, still fatal under
+        // the relaxed (ADR 0001) oracle.
         let snapshot = portal(&[(0, &[1, 2])]);
         let verdict =
             portal_consistency(&snapshot, 0, 5, |_, _| false, |_| true, |_| true, |_| false);
@@ -667,16 +664,6 @@ mod tests {
         let verdict =
             portal_consistency(&snapshot, 0, 5, |_, _| false, |_| true, |_| true, |_| true);
         assert!(verdict.is_ok());
-    }
-
-    #[test]
-    fn portal_consistency_fires_on_globally_uncovered_chunk() {
-        // Covered nowhere and routed to an accountable active worker that lacks it — genuine loss,
-        // still fatal even under the relaxed oracle.
-        let snapshot = portal(&[(0, &[1, 2])]);
-        let verdict =
-            portal_consistency(&snapshot, 0, 5, |_, _| false, |_| true, |_| true, |_| false);
-        assert!(verdict.is_err());
     }
 
     #[test]

@@ -35,10 +35,9 @@
 //! - `SIM_WORKERS`, `SIM_CHUNKS`, `SIM_WORKER_CAPACITY`, `SIM_RANDOM_SIZES` — world-shape
 //!   overrides for debugging.
 
-// Every case runner returns `proptest`'s `TestError`, whose `Fail` variant carries the failing
-// `(SimConfig, Vec<Action>)` case — that payload IS the point of the type (it's what a replay reads).
-// Boxing it to shrink the `Err` would fight the state-machine runner's return type for no benefit in
-// this `#[cfg(test)]` module.
+// Case runners return `TestError`, whose `Fail` variant carries the failing
+// `(SimConfig, Vec<Action>)` — the payload a replay reads. Boxing it to shrink the `Err` would
+// fight the state-machine runner's return type for no benefit in a test-only module.
 #![allow(clippy::result_large_err)]
 
 use proptest::test_runner::{Config, RngAlgorithm, TestError, TestRng, TestRunner};
@@ -117,13 +116,13 @@ mod in_memory {
         replay_case(&churn(), "churn_simulation_case")
     }
 
-    /// Regression, seed-pinned: guards the churn precondition against generating an unpreventable
-    /// departure. Under `min_replication` oscillation (4→1→2) a chunk can collapse to a single
-    /// committed-ideal copy on a joined worker whose peers hold only draining stale copies; if that
-    /// worker departs before the raised floor re-replicates, the chunk's last durable copy leaves with
-    /// it — genuine global uncoverage. [`is_removal_recoverable`] admits a departure only when a
-    /// surviving committed-ideal holder remains, keeping the walk feasible. Pinned by seed rather than
-    /// a concrete-action `replay`, which does not reproduce the multi-cycle stale-expiry timing.
+    /// Regression, seed-pinned: guards the churn precondition against an unpreventable departure.
+    /// Under `min_replication` oscillation (4→1→2) a chunk can collapse to a single committed-ideal
+    /// copy whose peers hold only draining stale copies; if that worker departs before the raised
+    /// floor re-replicates, the last durable copy leaves with it — genuine global uncoverage.
+    /// [`is_removal_recoverable`] admits a departure only when a surviving committed-ideal holder
+    /// remains. Pinned by seed because a concrete-action `replay` does not reproduce the
+    /// multi-cycle stale-expiry timing.
     #[test]
     fn churn_oscillation_does_not_strand_a_visible_chunk()
     -> Result<(), TestError<(SimConfig, Vec<Action>)>> {
@@ -138,13 +137,12 @@ mod in_memory {
         )
     }
 
-    /// Regression, seed-pinned: a routing strand under a recorded shortage is not a defect. This case
-    /// over-subscribes the fleet (`min_replication` 2, ~30 chunks on 5 workers), so the scheduler sits
-    /// in a shortage: a portal-visible chunk is dropped from the ideal, its scrub diff can't confirm
-    /// under full quorum, and its stale copies expire — leaving it globally uncovered while the portal
-    /// still routes it. Both strand oracles (`published_coverage`, within-M `portal_consistency`) stand
-    /// down while `is_infeasible`, since an over-subscribed fleet cannot hold every floor. Pinned by
-    /// seed because the strand only forms after a multi-cycle shortage streak.
+    /// Regression, seed-pinned: a routing strand under a recorded shortage is not a defect. The case
+    /// over-subscribes the fleet (`min_replication` 2, ~30 chunks on 5 workers): a portal-visible
+    /// chunk is dropped from the ideal, its scrub diff can't confirm under full quorum, and its
+    /// stale copies expire — globally uncovered while still routed. Both strand oracles
+    /// (`published_coverage`, within-M `portal_consistency`) stand down while `is_infeasible`.
+    /// Pinned by seed because the strand only forms after a multi-cycle shortage streak.
     #[test]
     fn shortage_routing_strand_is_not_a_defect() -> Result<(), TestError<(SimConfig, Vec<Action>)>>
     {
