@@ -136,8 +136,6 @@ pub(super) async fn promote_orphaned_drains(
         WITH orphaned AS (
             SELECT i.chunk_pk
             FROM sched_ideal_chunk_workers i
-            -- Only chunks touched by THIS sync's departures can have just become orphaned; the
-            -- && prefilter halves the statement at the 1M-chunk scale (measured: 165ms -> 87ms).
             WHERE i.worker_ids && $1
               AND cardinality(i.worker_ids) > 0
               AND NOT EXISTS (
