@@ -367,19 +367,28 @@ pub(super) async fn apply_deltas_and_swap(
 ///   6. Make the new ideal live: swap the staged twin in, leaving the old table empty and ready
 ///      to stage the next cycle.
 const SQL_DELTAS_AND_SWAP: &str = r#"
+-- Only chunks whose holder set changed can mint stale, and both tables store holders in
+-- canonical sorted order (set equality = array equality), so the whole-array prefilter is
+-- exact — same idiom as the diff insert below. MATERIALIZED pins the filter before the
+-- unnest: without it the planner unnests every chunk's array and filters the pairs after.
+WITH changed AS MATERIALIZED (
+    SELECT c.chunk_pk, c.worker_ids, COALESCE(f.worker_ids, '{}'::int[]) AS future_worker_ids
+    FROM sched_ideal_chunk_workers c
+    LEFT JOIN sched_future_ideal_chunk_workers f ON f.chunk_pk = c.chunk_pk
+    WHERE c.worker_ids IS DISTINCT FROM f.worker_ids
+)
 INSERT INTO sched_stale_mappings (chunk_pk, worker_id, superseded_at_worker_assignment_id)
-SELECT c.chunk_pk, u.worker_id, $WA
-FROM sched_ideal_chunk_workers c
-LEFT JOIN sched_future_ideal_chunk_workers f ON f.chunk_pk = c.chunk_pk
-CROSS JOIN LATERAL UNNEST(c.worker_ids) AS u(worker_id)
-WHERE u.worker_id <> ALL (COALESCE(f.worker_ids, '{}'::int[]))
+SELECT ch.chunk_pk, u.worker_id, $WA
+FROM changed ch
+CROSS JOIN LATERAL UNNEST(ch.worker_ids) AS u(worker_id)
+WHERE u.worker_id <> ALL (ch.future_worker_ids)
   AND EXISTS (
       SELECT 1 FROM sched_workers sw
       WHERE sw.id = u.worker_id AND sw.inactive_since IS NULL
   )
   AND NOT EXISTS (
       SELECT 1 FROM sched_chunk_metadata m
-      WHERE m.chunk_pk = c.chunk_pk
+      WHERE m.chunk_pk = ch.chunk_pk
         AND m.dropped_at_portal_assignment_id IS NOT NULL
   )
 ON CONFLICT (chunk_pk, worker_id) DO NOTHING;
