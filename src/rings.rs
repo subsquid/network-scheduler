@@ -89,12 +89,10 @@ impl Rings {
         &self.entries[start..start + self.n_workers]
     }
 
-    /// Test-only ring with a fixed, predictable geometry: every ring lists workers in index order
-    /// with `hash == index`. A replica whose hash is `h` (in `0..n_workers`) therefore walks the
-    /// ring starting at worker `h`, then `h+1`, … wrapping — so a test can steer each replica onto
-    /// exact workers by choosing its per-tag hashes, instead of depending on the real hash geometry.
-    // Gated to its only users (the `mvcc-chunks` reconcile tests) so default-feature builds don't
-    // flag it as dead code.
+    /// Test-only identity ring: `hash == index` in worker order, so a replica with hash `h` walks
+    /// `h, h+1, …` wrapping. Lets tests steer replicas onto exact workers via per-tag hashes rather
+    /// than the real hash geometry.
+    // Gated to its `mvcc-chunks` reconcile-test users so default builds don't flag it dead.
     #[cfg(all(test, feature = "mvcc-chunks"))]
     pub(crate) fn test_identity(n_workers: usize) -> Self {
         let one_ring: Vec<(u64, WorkerIndex)> = (0..n_workers)

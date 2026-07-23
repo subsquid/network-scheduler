@@ -1,20 +1,27 @@
-//! Checks over a storage [`Snapshot`] that flag placements the scheduler should never produce.
-//! Three things are checked:
-//!   - no worker stores more bytes than its capacity;
-//!   - each chunk gets enough copies. A chunk's target copy count is the *floor* (`min_replication`).
-//!     A new chunk is made visible only once it has the whole floor — never partially — and an
-//!     existing chunk doesn't abruptly lose copies it already holds. The floor is a goal, not a
-//!     guarantee: under saturation a chunk may rest below it — an accepted tradeoff, not a bug;
-//!   - a portal only routes a query to a worker that actually holds the chunk: while a routed
-//!     chunk still has any active, accountable worker, at least one routed worker must really hold
-//!     it (within the drain window M). This — not the floor — is what keeps a chunk answerable.
+//! Checks over a storage [`Snapshot`] that flag placements the scheduler must never produce. Each
+//! check only *detects*: it returns the first problem as a ready-to-panic message (plus the
+//! offending chunk when the failure dump needs it) and never panics itself — the SUT reports.
+//!
+//! Three families are checked:
+//!   - **Capacity** — no worker stores more bytes than its capacity.
+//!   - **Floor** — each chunk should reach `min_replication` copies. A new chunk turns visible only
+//!     with its whole floor (never partial); an existing chunk never abruptly loses copies it holds.
+//!     The floor is a goal, not a guarantee: under saturation a chunk may rest below it — a tradeoff,
+//!     not a bug.
+//!   - **Routing coverage** — a portal only routes a query to a worker that can answer it. This, not
+//!     the floor, is what keeps a chunk answerable. See the coverage model below.
+//!
+//! # Coverage model (ADR 0001): durability is hard, routing is best-effort
+//! Same-cycle floor preemption may delete an above-floor copy that routing still points at, and
+//! confirmation lag is unbounded below a full quorum — so routing can trail the durable placement.
+//! A chunk that keeps a covered holder *somewhere* is **covered**; a stale route to it is bounded
+//! routing-lag, not a failure ([`portal_consistency_misses`] counts these). A chunk with no covered
+//! holder at all is **globally uncovered** — an unanswerable query, the only fatal case. Two states
+//! are exempt entirely: routing only to departed workers (their stale rows are purged on departure —
+//! an availability event) and a recorded shortage (an over-subscribed fleet can't hold every floor).
 //!
 //! Chunk-correction checks live separately, in
 //! [`correction_oracle`](crate::scheduler_storage::test_harness::correction_oracle).
-//!
-//! Each check only detects: it returns the first problem it finds as a ready-to-panic message
-//! (plus the offending chunk when the failure dump needs it) and never panics itself — the SUT
-//! does the reporting.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
@@ -23,23 +30,15 @@ use crate::scheduler_storage::{
     ChunkPk, PortalAssignment, SchemaBundle, Tick, WorkerAssignment, WorkerPk,
 };
 
-/// Every chunk the portal routes must be held by at least one of its routed workers — by what the
-/// worker actually downloaded (`holds`), not the published assignment (that superset is
-/// `published_coverage`'s job). Otherwise a query lands on a worker without the data and fails. Only
-/// checked while `snapshot_age < m_ticks`; beyond M a worker may have legitimately deleted it.
+/// Routing coverage by physical possession: within the M window, a routed chunk must be physically
+/// held (`holds` — not the published listing, which is [`published_coverage`]'s job) by one of its
+/// routed workers, or a query lands on a worker without the data. Beyond M the check stands down (a
+/// worker may have legitimately deleted it).
 ///
-/// A violation needs a routed worker that is still active and caught up to the snapshot's watermark
-/// while none of the routed workers holds the chunk. Routing only to departed workers is a
-/// replication concern, not MVCC; below a 100% quorum, routing to stragglers is the documented X%
-/// tradeoff (`docs/mvcc-storage.md`, "Slow confirmation").
-///
-/// **Durability-hard, routing best-effort (ADR 0001).** A within-M miss is excused while the chunk
-/// keeps a covered holder somewhere (`covered_anywhere`): same-cycle floor preemption deliberately
-/// deletes an above-floor still-routed copy, and confirmation lag is unbounded below a full quorum,
-/// so routing can lag the durable placement. That is bounded routing-lag (the envelope
-/// [`portal_consistency_misses`] counts) — not a strand, like the departed-worker exemption. The
-/// oracle fires only when the chunk is **globally uncovered**: then the query is genuinely
-/// unanswerable — data loss, not lag.
+/// Fires only when the chunk is globally uncovered *and* a routed worker is still active and caught
+/// up to the snapshot's watermark; otherwise it is excused bounded routing-lag (`covered_anywhere`)
+/// or the X% straggler tradeoff (see the module coverage model; `docs/mvcc-storage.md`, "Slow
+/// confirmation").
 pub(super) fn portal_consistency(
     snapshot: &PortalAssignment,
     snapshot_age: Tick,
@@ -111,30 +110,21 @@ pub(super) fn portal_consistency_misses(
         .count()
 }
 
-/// Strand invariant (ADR 0001, revised): a routed chunk must not be **globally uncovered**. For each
-/// chunk with an active routed worker, the published worker assignment (`ideal ∪ stale`) must list at
-/// least one active holder for that chunk **anywhere** — not necessarily among the routed workers.
+/// Routing coverage by the published assignment (ADR 0001, revised): for every chunk with an active
+/// routed worker, the worker assignment (`ideal ∪ stale`) must list an active holder **anywhere** —
+/// not necessarily a routed one. Fires only when the chunk is globally uncovered; covered-elsewhere
+/// is bounded routing-lag (module coverage model; consistent with ADR 0002). Only active workers
+/// count on both sides, and the caller stands the check down during a recorded shortage
+/// (`is_infeasible`).
 ///
-/// Durability is the hard invariant; routing consistency is best-effort: same-cycle floor preemption
-/// deliberately deletes an above-floor still-routed copy (confirmation lag is unbounded below a full
-/// quorum, so eviction cannot hard-protect routing). A stale route to an evicted copy while a covered
-/// holder remains elsewhere is bounded routing-lag (the envelope [`portal_consistency_misses`]
-/// counts; consistent with ADR 0002). The oracle fires only when the chunk has **no** covered holder
-/// at all — genuine data loss, not lag.
-///
-/// Only active workers count (both routed and holder): a departed worker's stale rows are purged on
-/// departure, so a chunk routed only to departed workers is a documented availability event, not a
-/// coverage bug. The caller also stands this check down during a recorded shortage (`is_infeasible`):
-/// an over-subscribed fleet cannot hold every floor, so a visible chunk reaching zero copies there is
-/// unavoidable — the same category as the departed-worker exemption.
-///
-/// With `require_physical`, "covered" additionally needs an active listed holder that really holds
-/// the chunk (`holds`) — a listing row alone doesn't prove possession, since a
-/// committed-but-never-fetched replacement can lag unboundedly. Callers use this mode for
-/// **classification only, at every quorum**: paper-only coverage is legitimate in departure→rejoin
-/// windows (a rejoined worker is listed while its disk is still empty), so it can never be fatal
-/// state-wise. Eviction-caused physical loss is made fatal by the SUT's edge-triggered
-/// `assert_physical_retention`, not by this predicate.
+/// The default check counts a chunk as covered when it is *listed* — an assignment row names an
+/// active holder. A listing is only intent, though: that worker may not have downloaded the bytes
+/// yet. `require_physical` tightens "covered" to a listed active holder that *actually* holds the
+/// chunk (`holds`); a chunk that is listed but held by nobody — covered on paper only — then fails.
+/// Paper-only coverage is legitimate and transient (a rejoined worker is re-listed while its disk is
+/// still empty; a committed-but-never-fetched replacement can lag unboundedly), so this mode is
+/// **classification-only, at every quorum** — never fatal here. Eviction-caused physical loss is
+/// made fatal by the SUT's edge-triggered `assert_physical_retention`.
 pub(super) fn published_coverage(
     portal: &PortalAssignment,
     worker: Option<&WorkerAssignment>,

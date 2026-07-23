@@ -108,21 +108,19 @@ pub(super) async fn delete_stale_mappings(
     Ok(())
 }
 
-/// Give a drain back its committed-holder status when every worker it was handing off to has
-/// departed.
+/// Turn a draining copy back into a committed holder when every worker it was handing off to has left.
 ///
-/// Why: confirmation is a quorum of *active* workers. When a recipient departs, the quorum
-/// stops waiting for it, so the handoff assignment can count as "confirmed" even though the
-/// recipient never downloaded anything (a vacuous confirmation — Invariant 2,
-/// docs/mvcc-storage.md). The drain's expiry clock trusts that confirmation and would delete
-/// the fleet's last real copy. Promoting the drain holder back to committed takes it off the
-/// expiry clock and puts it under the retention floor.
+/// Why: "confirmed" means a quorum of *active* workers acknowledged the handoff. Once the recipients
+/// leave, the quorum stops waiting for them, so the handoff counts as confirmed even though no one
+/// ever downloaded the copy (vacuous confirmation — Invariant 2, docs/mvcc-storage.md). The drain's
+/// expiry clock trusts that and would delete the fleet's last real copy; promoting it back to
+/// committed takes it off that clock and under the retention floor.
 ///
-/// Aftermath needs no special handling: excess copies become ordinary drains in later cycles,
-/// and the departed workers' ideal rows fall out with the next cycle's diff.
+/// No follow-up needed: leftover copies become ordinary drains next cycle, and the departed workers'
+/// ideal rows drop out with the next diff.
 ///
-/// Must run after [`mark_departed`] (this sync's departures are visible) and
-/// [`delete_stale_mappings`] (every remaining stale row belongs to an active worker).
+/// Run after [`mark_departed`] (departures now visible) and [`delete_stale_mappings`] (every leftover
+/// stale row belongs to an active worker).
 pub(super) async fn promote_orphaned_drains(
     tx: &mut Transaction<'_, Postgres>,
     departed: &[WorkerPk],
