@@ -542,6 +542,76 @@ struct PlacementViews<'a> {
     routed: &'a [Vec<WorkerIndex>],
 }
 
+/// An eviction candidate on the probed worker (see [`Reconcile::place_by_eviction`]).
+struct Victim {
+    /// Soft ordering key: the confirmed routing still addresses this copy — sacrificed last.
+    still_routed: bool,
+    size: u64,
+    chunk: ChunkIndex,
+}
+
+/// The immutable views the donor-eviction rules consult, snapshot per probed worker. The rules and
+/// their rationale are documented on [`Reconcile::place_by_eviction`]; [`Self::evictable`] is their
+/// one-home implementation.
+struct DonorGuards<'a> {
+    chunks: &'a [ReplicatedChunk<'a>],
+    /// Holders published so far this cycle (`Reconcile::chunk_workers`).
+    published: &'a [Vec<WorkerIndex>],
+    committed: &'a [Vec<WorkerIndex>],
+    routed: &'a [Vec<WorkerIndex>],
+    held: &'a [Vec<WorkerIndex>],
+    evicted: &'a [(ChunkIndex, WorkerIndex)],
+    min_replication: ReplicationFactor,
+}
+
+impl DonorGuards<'_> {
+    /// May the copy of donor chunk `x` on `worker` be reclaimed to floor the seated chunk?
+    fn evictable(
+        &self,
+        x: ChunkIndex,
+        worker: WorkerIndex,
+        seated: usize,
+        seated_visible: bool,
+    ) -> bool {
+        let xi = x as usize;
+        // Never the seated chunk itself, a copy it publishes this cycle, or one already evicted.
+        if xi == seated
+            || self.published[xi].contains(&worker)
+            || self.evicted.contains(&(x, worker))
+        {
+            return false;
+        }
+        // Routing veto: a not-yet-visible seated chunk never takes a still-routed copy.
+        if !seated_visible && self.routed[xi].contains(&worker) {
+            return false;
+        }
+        let survives = |w2: WorkerIndex| w2 != worker && !self.evicted.contains(&(x, w2));
+        // Committed floor, net of this cycle's other evictions of X.
+        let floor = (self.min_replication as usize).min(self.committed[xi].len());
+        if self.committed[xi]
+            .iter()
+            .filter(|&&w2| survives(w2))
+            .count()
+            < floor
+        {
+            return false;
+        }
+        // Possession: deleting a routed copy needs a surviving committed copy that is itself routed.
+        if self.routed[xi].contains(&worker)
+            && !self.committed[xi]
+                .iter()
+                .any(|&w2| survives(w2) && self.routed[xi].contains(&w2))
+        {
+            return false;
+        }
+        // A portal-visible donor keeps ≥ 1 held copy.
+        if self.chunks[xi].is_portal_visible && !self.held[xi].iter().any(|&w2| survives(w2)) {
+            return false;
+        }
+        true
+    }
+}
+
 /// Reconciliation pass state.
 struct Reconcile<'a> {
     chunks: &'a [ReplicatedChunk<'a>],
@@ -711,7 +781,7 @@ impl<'a> Reconcile<'a> {
         let workers = self.workers;
         let rings = self.rings;
         let worker_capacity = self.worker_capacity;
-        let held = &self.held[chunk_index];
+        let chunk_held = &self.held[chunk_index];
         let evicted = &self.evicted;
         let allocated = &mut self.allocated;
         let worker_chunks = &mut self.worker_chunks;
@@ -729,7 +799,7 @@ impl<'a> Reconcile<'a> {
                 return false;
             }
             // Held copies are already charged in `allocated`; keeping one costs 0.
-            let cost = if held.contains(&worker) {
+            let cost = if chunk_held.contains(&worker) {
                 0
             } else {
                 chunk.size as u64
@@ -777,7 +847,11 @@ impl<'a> Reconcile<'a> {
     /// - *Possession (hard).* A committed row doesn't prove the copy was ever fetched, so evicting a
     ///   **routed** copy — the only possession proof — additionally requires a surviving committed
     ///   copy that is itself routed; and a portal-visible donor always keeps ≥ 1 held copy, so
-    ///   preemption can't recreate the holderless-visible state it exists to close.
+    ///   preemption can't recreate the holderless-visible state it exists to close. Scope: both
+    ///   backends feed `routed` visibility-filtered, so the routed-survivor rule is vacuous for a
+    ///   not-yet-visible donor — its sole fetched copy stays evictable for an unfetched survivor
+    ///   until the per-worker applied-report possession view lands (ADR 0001, possession follow-up).
+    ///   Bounded harm: no readers until promotion.
     /// - *Routing (soft).* `routed[X]` orders victims, not-routed copies first. A portal-visible
     ///   starved chunk (the ADR-0001 case) may take a still-routed copy above the floor as a last
     ///   resort — the transient miss is the documented `portal_consistency_misses` cost. For a
@@ -820,69 +894,40 @@ impl<'a> Reconcile<'a> {
                 return false;
             }
 
-            // Each candidate: whether the confirmed routing still addresses this copy (soft ordering
-            // key) and its byte size. `still_routed = false` ⇒ evict first.
-            let mut candidates: Vec<(bool, u64, ChunkIndex)> = held_by_worker[w]
+            let guards = DonorGuards {
+                chunks,
+                published: chunk_workers,
+                committed,
+                routed,
+                held: held_all,
+                evicted,
+                min_replication,
+            };
+            let mut candidates: Vec<Victim> = held_by_worker[w]
                 .iter()
                 .copied()
-                .filter(|&x| {
-                    let xi = x as usize;
-                    // w already ∈ held[X] (candidates come from held_by_worker[w]).
-                    xi != chunk_index
-                        && !chunk_workers[xi].contains(&worker)   // X not publishing w this cycle
-                        && !evicted.contains(&(x, worker))        // not already evicted
-                        // Routing veto for a not-yet-visible starved chunk.
-                        && (c_visible || !routed[xi].contains(&worker))
-                        // Committed floor, net of this cycle's other evictions of X.
-                        && {
-                            let floor = (min_replication as usize).min(committed[xi].len());
-                            committed[xi]
-                                .iter()
-                                .filter(|&&w2| w2 != worker && !evicted.contains(&(x, w2)))
-                                .count()
-                                >= floor
-                        }
-                        // Possession: evicting a routed copy requires a surviving committed copy
-                        // that is itself routed (a committed-but-never-fetched survivor proves
-                        // nothing).
-                        //
-                        // Scope: both backends feed `routed` visibility-filtered, so this rule is
-                        // vacuous for a not-yet-visible donor (`routed[xi]` empty) — its sole
-                        // fetched copy stays evictable for an unfetched survivor until the
-                        // per-worker applied-report possession view lands (ADR 0001, possession
-                        // follow-up). Bounded harm: no readers until promotion.
-                        && (!routed[xi].contains(&worker)
-                            || committed[xi].iter().any(|&w2| {
-                                w2 != worker
-                                    && !evicted.contains(&(x, w2))
-                                    && routed[xi].contains(&w2)
-                            }))
-                        // A portal-visible donor keeps ≥ 1 held copy — covers |committed[X]| = 0,
-                        // where the floor guard is vacuous. Non-visible chunks (incl. being-removed,
-                        // ideal = ∅) stay freely reclaimable.
-                        && (!chunks[xi].is_portal_visible
-                            || held_all[xi]
-                                .iter()
-                                .any(|&w2| w2 != worker && !evicted.contains(&(x, w2))))
-                })
-                .map(|x| {
-                    let still_routed = routed[x as usize].contains(&worker);
-                    (still_routed, chunks[x as usize].size as u64, x)
+                .filter(|&x| guards.evictable(x, worker, chunk_index, c_visible))
+                .map(|x| Victim {
+                    still_routed: routed[x as usize].contains(&worker),
+                    size: chunks[x as usize].size as u64,
+                    chunk: x,
                 })
                 .collect();
             // Not-routed copies first, largest-first within a routing class: a still-routed copy is
             // sacrificed only when the not-routed ones don't free enough room.
-            candidates
-                .sort_unstable_by_key(|&(still_routed, size, _)| (still_routed, Reverse(size)));
+            candidates.sort_unstable_by_key(|v| (v.still_routed, Reverse(v.size)));
 
             // Cheap pre-sum: never evict on a worker that still can't fit the chunk — spill instead.
-            let reclaimable: u64 = candidates.iter().map(|(_, s, _)| *s).sum();
+            let reclaimable: u64 = candidates.iter().map(|v| v.size).sum();
             if free + reclaimable < size {
                 return false;
             }
 
             let mut freed = free;
-            for (_, s, x) in candidates {
+            for Victim {
+                size: s, chunk: x, ..
+            } in candidates
+            {
                 if freed >= size {
                     break;
                 }
@@ -941,26 +986,16 @@ impl<'a> Reconcile<'a> {
         }
     }
 
-    /// Held workers in floor-retention preference order, deduped: ideal positions first, then
-    /// the rest. Held copies not needed for the floor are released, letting drains finish.
+    /// Held workers in floor-retention preference order: ideal positions first, then the rest.
+    /// Held copies not needed for the floor are released, letting drains finish.
     fn add_back_candidates(&self, chunk_index: usize) -> Vec<WorkerIndex> {
         let ideal = &self.ideal[chunk_index];
         let held = &self.held[chunk_index];
-        let mut out: Vec<WorkerIndex> = Vec::new();
-        let push = |out: &mut Vec<WorkerIndex>, w: WorkerIndex| {
-            if !out.contains(&w) {
-                out.push(w);
-            }
-        };
-        for &w in held {
-            if ideal.contains(&w) {
-                push(&mut out, w);
-            }
-        }
-        for &w in held {
-            push(&mut out, w);
-        }
-        out
+        held.iter()
+            .filter(|w| ideal.contains(w))
+            .chain(held.iter().filter(|w| !ideal.contains(w)))
+            .copied()
+            .collect()
     }
 
     /// Undo every placement of `chunk_index` this cycle, refunding only new-download bytes.
