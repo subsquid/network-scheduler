@@ -35,6 +35,11 @@ Add **same-cycle floor preemption** to the reconcile. When placing a mandatory f
 that sit **above some other chunk's `min_replication` floor**, then place the floor copy. It is a
 same-cycle swap: the donor worker deletes before it downloads (momentary over-commit accepted).
 
+> **Worker protocol requirement:** a worker applies an assignment's *deletions before its
+> downloads*. This is what makes the swap disk-safe at 100% fill — the "momentary over-commit" is
+> book-keeping only, never physical. A worker that downloaded first would hit disk-full exactly when
+> preemption fires, never complete the apply, and deadlock the swap.
+
 ### Durability is the hard invariant; routing consistency is best-effort
 
 The maintainer's constraint: **worker-assignment confirmation lag is unbounded.** The portal's own
@@ -154,7 +159,9 @@ whether a still-routed donor copy is a soft-ordered victim (visible) or a hard v
   still `NotEnoughCapacity` backpressure, unchanged.
 - A residual **holderless** (0-copy) window remains only when the fill is genuinely un-reclaimable —
   a fleet full of **sole-serving** drains (mid-reshuffle, replacements still downloading). Availability
-  there cannot be restored this cycle. Its *consistency* consequence — a visible chunk momentarily
+  there cannot be restored this cycle. While holderless, the chunk keeps first claim on recovery:
+  floors place copy-round-outer (tag-outer), so its *first* copy contends in round 0 — ahead of every
+  chunk's second copy and all new chunks — and it lands the moment any byte becomes reclaimable. Its *consistency* consequence — a visible chunk momentarily
   absent from the schema bundle — is closed by [ADR 0002](0002-schema-bundle-covers-visible-chunks.md)
   (the bundle covers visible chunks, so the chunk stays resolvable: degraded, but consistent). A true
   *shortage* commits nothing, so the bundle stays frozen with the chunk — no breach there.
@@ -219,12 +226,24 @@ The flagship regressions additionally probe the mechanism end-to-end
 departed worker, which the strand oracle deliberately exempts — without the probe, deleting the
 preemption path entirely would leave every replay green.
 
+**Quorum and the possession signal.** The production quorum target is ~80% (and may be relaxed
+further under fleet-wide lag); the 100%-quorum configs exist to *prove the algorithm* under bounded
+confirmation, not as an operational target. At 100% "routed" implies "fetched", so the
+routed-survivor rule is exact there; below 100% the watermark can advance on other workers'
+confirmations, so routing is only a heuristic possession signal — still strictly safer than none.
+The quorum-independent possession proof is the **per-worker applied report** (a worker reports each
+assignment id it has fully applied — the same signal `confirm_worker_assignment` already records for
+the watermark). Follow-up, required before production: derive a per-pair `possessed` view from those
+reports (`chunk ∈ slice(worker, last_applied(worker))`, unknown ⇒ not possessed) and use it in the
+eviction guard in place of the routing proxy, in both backends.
+
 ## Precondition: the departure residual is kept out of the walk, not hidden
 
 A separate residual the sweep surfaces is **not** a scheduler bug and must not be masked by an oracle:
 a chunk's **last held copy departs** (`WorkerLeft`) while the fleet is saturated, so the fresh
-re-download that would restore it is starved by competing load over the next cycles — genuine loss no
-scheduler can mask. Relaxing an oracle to accept it would hide real data loss. Instead the churn model's
+re-download that would restore it is starved by competing load over the next cycles — unbounded
+unavailability no scheduler can prevent (the bytes stay recoverable from dataset storage; what's lost
+is the fleet's serving copy). Relaxing an oracle to accept it would hide that window. Instead the churn model's
 `WorkerLeft` precondition (`is_removal_recoverable`) is tightened: on top of the from-scratch floor-fit
 check, a departure is rejected when it would take a portal-visible chunk's **last physically-held
 copy** (no surviving `holds_chunk`). A held copy is durable (kept for free each cycle); a chunk reduced
