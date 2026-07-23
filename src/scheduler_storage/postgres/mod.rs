@@ -30,7 +30,7 @@ use sqlx::Connection;
 use sqlx::postgres::PgConnection;
 
 use crate::metrics::{PhaseTimer, Timer};
-use crate::scheduler_storage::algorithm::{CurrentPlacement, ScheduleOutput, SchedulingAlgorithm};
+use crate::scheduler_storage::algorithm::{ScheduleOutput, SchedulingAlgorithm};
 use crate::scheduler_storage::{
     AssignmentId, ChunkPk, DatasetPk, NewChunk, PortalAssignment, SchedulerStorage, SchemaBundle,
     SchemaId, StorageError, Tick, WorkerAssignment,
@@ -357,21 +357,17 @@ impl SchedulerStorage for PostgresStorage {
 
             // One streamed round-trip decoding the algorithm's inputs and the published chunk
             // columns together, so the post-commit assignment build needn't re-read them.
+            // `confirmed_routing` (the eviction victim-ordering hint) rides in the same scan,
+            // filtered to portal-visible chunks in the SQL, matching the in-memory backend's
+            // routed set.
             let phase::ActiveChunks {
                 for_algo: chunks_for_algo,
                 current_placement,
                 committed_placement,
+                confirmed_routing,
                 published: published_chunks,
                 bundle_schema_ids,
             } = phase::fetch_active_chunks_with_placement(&mut tx).await?;
-
-            // Confirmed routing for the eviction victim-ordering hint (best-effort). Read in the same
-            // tx as the placement so both see a consistent snapshot; filtered to portal-visible chunks
-            // server-side, matching the in-memory backend's routed set.
-            let confirmed_routing: CurrentPlacement = visibility::fetch_confirmed_routing(&mut tx)
-                .await?
-                .into_iter()
-                .collect();
 
             let worker_rows = phase::fetch_workers(&mut tx).await?;
             let phase::DecodedWorkers {

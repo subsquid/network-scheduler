@@ -3,6 +3,7 @@
 
 mod correction_tests;
 mod drain_tests;
+mod feed_order_tests;
 mod inspect;
 mod registration_tests;
 mod schema;

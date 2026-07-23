@@ -36,22 +36,50 @@ pub(super) struct WorkerRow {
     pub(super) inactive_since: Option<i64>,
 }
 
-/// An active chunk paired with its current holders (ideal ∪ stale), fetched in one round-trip so the
-/// cycle needn't query the placement separately. `worker_ids` is `None` for a chunk with no current
-/// placement, distinguishing "unplaced" from a placed-but-empty set.
+/// An active chunk paired with its current holders (ideal ∪ stale), its committed ideal, and its
+/// confirmed routing, fetched in one round-trip so the cycle needn't query any placement
+/// separately. Carries `dataset_id`, not the dataset name: the name is resolved through the
+/// (tiny) dataset list fetched once per cycle, keeping 6M+ text values off the wire.
+/// `worker_ids` is `None` for a chunk with no current placement, distinguishing "unplaced" from a
+/// placed-but-empty set.
 #[derive(sqlx::FromRow)]
 pub(super) struct ActiveChunkRow {
-    #[sqlx(flatten)]
-    pub(super) chunk: ChunkRow,
+    pub(super) chunk_pk: ChunkPk,
+    pub(super) dataset_id: i16,
+    pub(super) chunk_id: String,
+    pub(super) size: i32,
+    /// The chunk's schema pin (stamped at insert, never NULL).
+    pub(super) schema_id: SchemaId,
+    pub(super) tables_present: Option<bit_vec::BitVec>,
+    pub(super) first_block: i64,
+    /// last_block - first_block; add to `first_block` to recover the inclusive end.
+    pub(super) last_block_delta: i32,
     pub(super) worker_ids: Option<Vec<WorkerPk>>,
     /// The committed ideal holders alone (pre-merge, no stale), for the eviction durability floor.
     /// `None` when the chunk has no committed ideal row yet (pending/holderless).
     pub(super) ideal_worker_ids: Option<Vec<WorkerPk>>,
+    /// Confirmed routing (portal-visible chunks only; the SQL nulls it for the rest), for the
+    /// eviction victim ordering.
+    pub(super) routed_worker_ids: Option<Vec<WorkerPk>>,
     pub(super) is_portal_visible: bool,
     /// Has ever entered a worker assignment (`applied_at_worker_assignment_id IS NOT NULL`). With the
     /// query's `dropped_from_worker_assignment_at IS NULL` filter, this marks the chunks whose schema
     /// the bundle must carry — the whole routable window.
     pub(super) entered_worker_assignment: bool,
+}
+
+pub(super) fn chunk_from_active_row(
+    row: ActiveChunkRow,
+    dataset: Arc<String>,
+) -> WorkerAssignmentChunk {
+    WorkerAssignmentChunk {
+        dataset,
+        id: Arc::new(row.chunk_id),
+        size: row.size as u32,
+        blocks: block_range_from_columns(row.first_block, row.last_block_delta),
+        schema_id: row.schema_id,
+        tables_present: row.tables_present,
+    }
 }
 
 /// Ticks are non-negative logical timestamps, so they always fit in `i64`.
