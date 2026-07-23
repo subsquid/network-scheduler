@@ -130,6 +130,62 @@ pub(super) struct ActiveChunks {
     pub(super) bundle_schema_ids: BTreeSet<SchemaId>,
 }
 
+impl ActiveChunks {
+    fn with_capacity(capacity: usize) -> Self {
+        let placement = || CurrentPlacement::with_capacity_and_hasher(capacity, Default::default());
+        Self {
+            for_algo: Vec::with_capacity(capacity),
+            current_placement: placement(),
+            committed_placement: placement(),
+            confirmed_routing: placement(),
+            published: FxHashMap::with_capacity_and_hasher(capacity, Default::default()),
+            bundle_schema_ids: BTreeSet::new(),
+        }
+    }
+
+    /// Record a chunk's committed ideal and derive its current placement (ideal ∪ stale, sorted
+    /// and deduped) — the client-side equivalent of the SQL merge this read used to do.
+    fn record_placement(
+        &mut self,
+        pk: ChunkPk,
+        ideal: Option<Vec<WorkerPk>>,
+        stale: Option<Vec<WorkerPk>>,
+    ) {
+        match (ideal, stale) {
+            (Some(ideal), None) => {
+                self.current_placement.insert(pk, ideal.clone());
+                self.committed_placement.insert(pk, ideal);
+            }
+            (Some(ideal), Some(stale)) => {
+                self.current_placement
+                    .insert(pk, union_holders(&ideal, stale));
+                self.committed_placement.insert(pk, ideal);
+            }
+            (None, Some(stale)) => {
+                self.current_placement.insert(pk, union_holders(&[], stale));
+            }
+            (None, None) => {}
+        }
+    }
+
+    /// Sort `for_algo` into the exact order `ORDER BY d.name, c.first_block` would produce —
+    /// stage-1 packing is order-sensitive, so the feed order is observable behaviour — as an
+    /// integer-key sort.
+    fn restore_feed_order(&mut self, datasets: &DatasetDirectory) {
+        self.for_algo.sort_by_cached_key(|(_, chunk)| {
+            (datasets.rank(&chunk.dataset), *chunk.blocks.start())
+        });
+    }
+}
+
+fn union_holders(ideal: &[WorkerPk], extra: Vec<WorkerPk>) -> Vec<WorkerPk> {
+    let mut merged = ideal.to_vec();
+    merged.extend(extra);
+    merged.sort_unstable();
+    merged.dedup();
+    merged
+}
+
 /// Reads every active chunk — registered, and neither `rejected` nor removed (tombstoned) — spanning
 /// the lifecycle from **pending** (registered but not yet placed) through **marked-for-removal**.
 /// Pending chunks are included so the algorithm can place them; they carry no `current_placement` entry.
@@ -139,35 +195,43 @@ pub(super) async fn fetch_active_chunks_with_placement(
     capacity_hint: usize,
 ) -> Result<ActiveChunks> {
     let mut timer = PhaseTimer::new("run_scheduling_cycle:fetch_active_chunks_with_placement");
+    let datasets = fetch_dataset_directory(tx).await?;
+    let mut stale_holders = fetch_stale_holders(tx).await?;
 
-    // The dataset list in the server's collation order; the sort below uses its ranks, so the
-    // big query neither joins `datasets` (no per-row name text on the wire) nor sorts. `id`
-    // tiebreaks names a non-C collation may compare equal.
-    let dataset_rows: Vec<(i16, String)> =
-        sqlx::query_as("SELECT id, name FROM datasets ORDER BY name, id")
-            .fetch_all(&mut **tx)
-            .await
-            .context("run_scheduling_cycle: fetch datasets")?;
-    let mut name_by_id: FxHashMap<i16, Arc<String>> = FxHashMap::default();
-    let mut rank_of: FxHashMap<Arc<String>, u32> = FxHashMap::default();
-    for (rank, (id, name)) in dataset_rows.into_iter().enumerate() {
-        let name = Arc::new(name);
-        name_by_id.insert(id, name.clone());
-        rank_of.insert(name, rank as u32);
+    let mut stream = sqlx::query_as::<_, ActiveChunkRow>(ACTIVE_CHUNKS_SQL).fetch(&mut **tx);
+    let mut out = ActiveChunks::with_capacity(capacity_hint);
+    let mut count = 0u64;
+    while let Some(mut row) = stream
+        .try_next()
+        .await
+        .context("run_scheduling_cycle: fetch active chunks with placement")?
+    {
+        let pk = row.chunk_pk;
+        let is_portal_visible = row.is_portal_visible;
+        out.record_placement(pk, row.ideal_worker_ids.take(), stale_holders.remove(&pk));
+        if let Some(routed) = row.routed_worker_ids.take() {
+            out.confirmed_routing.insert(pk, routed);
+        }
+        if row.entered_worker_assignment {
+            out.bundle_schema_ids.insert(row.schema_id);
+        }
+        let dataset = datasets.name(row.dataset_id);
+        let chunk = chunk_from_active_row(row, dataset);
+        out.for_algo
+            .push((pk, AlgoChunk::new(&chunk, is_portal_visible)));
+        out.published.insert(pk, chunk);
+        count += 1;
     }
+    out.restore_feed_order(&datasets);
+    timer.stmt(count);
+    Ok(out)
+}
 
-    // Stale is a sliver of the chunk set, so the current placement (ideal ∪ stale) is derived
-    // client-side: the big query ships one holder array per chunk (the ideal), not two
-    // near-identical ones, and only chunks with a stale row pay the merge.
-    let stale_rows: Vec<(ChunkPk, Vec<WorkerPk>)> = sqlx::query_as(
-        "SELECT chunk_pk, array_agg(worker_id) FROM sched_stale_mappings GROUP BY chunk_pk",
-    )
-    .fetch_all(&mut **tx)
-    .await
-    .context("run_scheduling_cycle: fetch stale holders")?;
-    let mut stale_extra: FxHashMap<ChunkPk, Vec<WorkerPk>> = stale_rows.into_iter().collect();
-
-    let sql = r#"
+/// One row per active chunk with its committed ideal and (portal-visible only) confirmed routing.
+/// No `datasets` join and no ORDER BY: names and the feed order come from the (tiny)
+/// [`DatasetDirectory`] instead, keeping per-row name text off the wire and replacing a full-result
+/// text sort with [`ActiveChunks::restore_feed_order`].
+const ACTIVE_CHUNKS_SQL: &str = r#"
         SELECT c.chunk_pk, c.dataset_id, c.chunk_id, c.size,
                c.schema_id, c.tables_present,
                c.first_block, c.last_block_delta,
@@ -185,68 +249,59 @@ pub(super) async fn fetch_active_chunks_with_placement(
         WHERE s.dropped_from_worker_assignment_at IS NULL
           AND NOT s.rejected
         "#;
-    let mut stream = sqlx::query_as::<_, ActiveChunkRow>(sql).fetch(&mut **tx);
 
-    let with_capacity =
-        || CurrentPlacement::with_capacity_and_hasher(capacity_hint, Default::default());
-    let mut out = ActiveChunks {
-        for_algo: Vec::with_capacity(capacity_hint),
-        current_placement: with_capacity(),
-        committed_placement: with_capacity(),
-        confirmed_routing: with_capacity(),
-        published: FxHashMap::with_capacity_and_hasher(capacity_hint, Default::default()),
-        bundle_schema_ids: BTreeSet::new(),
-    };
-    let mut count = 0u64;
-    while let Some(mut row) = stream
-        .try_next()
-        .await
-        .context("run_scheduling_cycle: fetch active chunks with placement")?
-    {
-        let dataset = name_by_id
-            .get(&row.dataset_id)
+/// The dataset list, resolving a chunk row's `dataset_id` to its shared name and to its feed-order
+/// rank. Fetched in the server's collation order so the ranks reproduce `ORDER BY name`; `id`
+/// tiebreaks names a non-C collation may compare equal.
+struct DatasetDirectory {
+    name_by_id: FxHashMap<i16, Arc<String>>,
+    rank_by_name: FxHashMap<Arc<String>, u32>,
+}
+
+impl DatasetDirectory {
+    fn name(&self, dataset_id: i16) -> Arc<String> {
+        self.name_by_id
+            .get(&dataset_id)
             .expect("chunks.dataset_id references a dataset row read in the same snapshot")
-            .clone();
-        let pk = row.chunk_pk;
-        let is_portal_visible = row.is_portal_visible;
-        match (row.ideal_worker_ids.take(), stale_extra.remove(&pk)) {
-            (Some(ideal), None) => {
-                out.current_placement.insert(pk, ideal.clone());
-                out.committed_placement.insert(pk, ideal);
-            }
-            (Some(ideal), Some(extra)) => {
-                let mut merged = ideal.clone();
-                merged.extend(extra);
-                merged.sort_unstable();
-                merged.dedup();
-                out.current_placement.insert(pk, merged);
-                out.committed_placement.insert(pk, ideal);
-            }
-            (None, Some(mut extra)) => {
-                extra.sort_unstable();
-                extra.dedup();
-                out.current_placement.insert(pk, extra);
-            }
-            (None, None) => {}
-        }
-        if let Some(routed) = row.routed_worker_ids.take() {
-            out.confirmed_routing.insert(pk, routed);
-        }
-        if row.entered_worker_assignment {
-            out.bundle_schema_ids.insert(row.schema_id);
-        }
-        let chunk = chunk_from_active_row(row, dataset);
-        out.for_algo
-            .push((pk, AlgoChunk::new(&chunk, is_portal_visible)));
-        out.published.insert(pk, chunk);
-        count += 1;
+            .clone()
     }
-    // The exact order `ORDER BY d.name, c.first_block` would produce — stage-1 packing is
-    // order-sensitive, so the feed order is observable behaviour — as an integer-key sort.
-    out.for_algo
-        .sort_by_cached_key(|(_, chunk)| (rank_of[&*chunk.dataset], *chunk.blocks.start()));
-    timer.stmt(count);
-    Ok(out)
+
+    fn rank(&self, name: &Arc<String>) -> u32 {
+        self.rank_by_name[&**name]
+    }
+}
+
+async fn fetch_dataset_directory(tx: &mut Transaction<'_, Postgres>) -> Result<DatasetDirectory> {
+    let rows: Vec<(i16, String)> =
+        sqlx::query_as("SELECT id, name FROM datasets ORDER BY name, id")
+            .fetch_all(&mut **tx)
+            .await
+            .context("run_scheduling_cycle: fetch datasets")?;
+    let mut directory = DatasetDirectory {
+        name_by_id: FxHashMap::default(),
+        rank_by_name: FxHashMap::default(),
+    };
+    for (rank, (id, name)) in rows.into_iter().enumerate() {
+        let name = Arc::new(name);
+        directory.name_by_id.insert(id, name.clone());
+        directory.rank_by_name.insert(name, rank as u32);
+    }
+    Ok(directory)
+}
+
+/// Stale holders per chunk. Stale is a sliver of the chunk set, so it rides as its own small
+/// aggregate and [`ActiveChunks::record_placement`] merges it client-side — the big query ships
+/// one holder array per chunk, not two near-identical ones.
+async fn fetch_stale_holders(
+    tx: &mut Transaction<'_, Postgres>,
+) -> Result<FxHashMap<ChunkPk, Vec<WorkerPk>>> {
+    let rows: Vec<(ChunkPk, Vec<WorkerPk>)> = sqlx::query_as(
+        "SELECT chunk_pk, array_agg(worker_id) FROM sched_stale_mappings GROUP BY chunk_pk",
+    )
+    .fetch_all(&mut **tx)
+    .await
+    .context("run_scheduling_cycle: fetch stale holders")?;
+    Ok(rows.into_iter().collect())
 }
 
 pub(super) async fn fetch_workers(tx: &mut Transaction<'_, Postgres>) -> Result<Vec<WorkerRow>> {
