@@ -1359,3 +1359,61 @@ fn vacuous_confirmation_must_not_expire_the_last_drain_pg() {
     let (config, actions) = vacuous_confirmation_must_not_expire_the_last_drain_case();
     replay_pg(&config, actions);
 }
+
+/// Captured from a `pg::churn_simulation` failure
+/// (`SIM_CASE_SEED=b70de3a3f1f6ca99c5801b76e6237bbb12b70db7f7fa57fc441a5abc8b454e17`): Stage 1's
+/// greedy from-empty packing is sensitive to the order chunks are fed, and the two backends feed
+/// different orders. Twelve equal-size chunks at `min_replication = 3` on four workers need 36 of
+/// 40 slots — feasible, but with no slack for a greedy misstep. Postgres feeds
+/// `(dataset, first_block)` order (`fetch_active_chunks_with_placement`'s `ORDER BY`); in that
+/// order the ring walk fills two workers completely while a sim-2 chunk still needs its third
+/// copy, which only those full workers could take, so `ensure_minimum` errors
+/// `NotEnoughCapacity` and the cycle records a shortage. The in-memory backend and the
+/// `is_ideal_feasible` cross-check feed the same chunks in `ChunkPk` order, which packs fine —
+/// so the oracle proves a placement exists and the replay panics (the in-memory twin of this
+/// capture converges).
+///
+/// The inputs are deterministic, so the false shortage repeats every cycle: nothing commits and
+/// the fleet freezes on a placeable chunk set until the chunk set itself changes.
+///
+/// `#[ignore]`d because the gap is unfixed and the oracle is correct: parked red as a TODO — make
+/// Stage 1 place feasible floors regardless of feed order (or feed both backends one canonical
+/// order), don't weaken the assertion.
+#[ignore = "open stage-1 gap: greedy from-empty packing fails on a feasible set in pg chunk order"]
+#[test]
+fn churn_pg_chunk_order_false_shortage_unfixed() {
+    let config = SimConfig {
+        worker_count: 3,
+        min_replication: 3,
+        saturation: 0.95,
+        ..base_config()
+    };
+    let nc = |key: u64, weight: u16, dataset: &str| {
+        new_chunk((mint_key(key), CHUNK_SIZE, weight, dataset.to_string()))
+    };
+
+    replay_pg(
+        &config,
+        vec![
+            Action::AddChunks(vec![nc(35300, 4, "s3://sim-2"), nc(57014, 4, "s3://sim-0")]),
+            Action::AddChunks(vec![
+                nc(39090, 1, "s3://sim-1"),
+                nc(50771, 12, "s3://sim-1"),
+            ]),
+            Action::AddChunks(vec![
+                nc(24942, 4, "s3://sim-2"),
+                nc(28061, 1, "s3://sim-2"),
+                nc(30370, 12, "s3://sim-0"),
+            ]),
+            Action::WorkerJoined(4),
+            Action::AddChunks(vec![
+                nc(52384, 12, "s3://sim-1"),
+                nc(56638, 1, "s3://sim-1"),
+                nc(56837, 4, "s3://sim-1"),
+                nc(59000, 12, "s3://sim-1"),
+                nc(57437, 1, "s3://sim-0"),
+            ]),
+            Action::CheckConverged(ConvergenceCheck::FloorLocallyFeasible),
+        ],
+    );
+}
