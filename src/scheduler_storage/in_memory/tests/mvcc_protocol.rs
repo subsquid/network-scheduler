@@ -466,6 +466,64 @@ fn schema_bundle_retains_removing_chunk_until_tombstone() {
     );
 }
 
+/// ADR 0002: a portal-visible chunk that loses its last holder (departure) keeps its schema in the
+/// frozen bundle, even though it falls out of ideal ∪ stale — so portals can still resolve it.
+#[test]
+fn schema_bundle_covers_holderless_portal_visible_chunk() {
+    let Setup {
+        mut storage,
+        worker_ids,
+        chunk_pks,
+    } = setup(1, 1);
+    let chunk_pk = &chunk_pks[0];
+    let w1 = worker_ids[0];
+
+    // Place, confirm, promote to the portal -> portal_visible, one holder (w1).
+    let (wa, _) = storage
+        .run_scheduling_cycle(
+            &StaticSchedulingAlgorithm {
+                mapping: ideal_mapping([(chunk_pk, vec![w1])]),
+            },
+            &(),
+            CYCLE_INTERVAL,
+            GRACE_PERIOD,
+        )
+        .expect("scheduling succeeds");
+    let schema_id = wa.chunks.get(chunk_pk).unwrap().schema_id;
+    storage
+        .confirm_worker_assignment(wa.id, CYCLE_INTERVAL)
+        .unwrap();
+    storage
+        .run_visibility_cycle(CYCLE_INTERVAL + DELTA)
+        .unwrap();
+
+    // Depart the sole holder: its copy vanishes (not drained), no stale row survives.
+    storage
+        .update_worker_set(&[], 2 * CYCLE_INTERVAL, 1000)
+        .unwrap();
+
+    // Next cycle places nothing (no active workers) -> chunk is holderless (ideal={}, stale={}),
+    // still portal_visible. The frozen bundle must still carry its schema.
+    let (wa2, bundle) = storage
+        .run_scheduling_cycle(
+            &StaticSchedulingAlgorithm {
+                mapping: ideal_mapping([]),
+            },
+            &(),
+            3 * CYCLE_INTERVAL,
+            GRACE_PERIOD,
+        )
+        .expect("scheduling succeeds");
+    assert!(
+        !wa2.chunks.contains_key(chunk_pk),
+        "chunk is holderless: out of ideal ∪ stale",
+    );
+    assert!(
+        bundle.contains(schema_id),
+        "portal-visible chunk keeps its schema in the bundle",
+    );
+}
+
 /// Order-insensitive view of `chunk_workers` for literal comparison. Panics on
 /// duplicate worker ids, which the set conversion would otherwise hide.
 fn as_sets(

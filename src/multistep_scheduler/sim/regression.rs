@@ -4,7 +4,8 @@
 
 use super::sut::{Action, ConvergenceCheck, NewChunk, SimConfig, SimUnderTest};
 use super::utils::{
-    CHUNK_SIZE, WORKER_CAPACITY, blocks_for_key, mint_key, new_chunk, sim_datasets,
+    CHUNK_SIZE, NEVER_GC_TICKS, SCHEMA_POOL, WORKER_CAPACITY, blocks_for_key, mint_key, new_chunk,
+    sim_datasets,
 };
 use crate::scheduler_storage::in_memory::InMemoryStorage;
 use proptest_state_machine::iterative_runner::IterativeSutStateMachine;
@@ -51,6 +52,7 @@ fn base_config() -> SimConfig {
         chunk_cap: None,
         datasets: sim_datasets(),
         confirm_threshold_pct: 100,
+        gc_ticks: 0,
     }
 }
 
@@ -312,14 +314,10 @@ fn correction_chain_replacement_inherits_superseded_range() {
 ///    until that draining finishes. The joining worker adds too little space to catch up before the
 ///    holder leaves.
 ///
-/// FIXME: this behaviour should be fixed. When a chunk has fewer than the required number of copies,
-/// placing a copy for it should take priority over keeping a draining copy of a chunk that still has
-/// enough — the short chunk should reclaim that space instead of waiting out the grace period, so it
-/// never has to drop to zero. The scheduler already avoids making new extra copies while any chunk is
-/// short, but that is not enough on its own: a copy already draining keeps its space for the whole
-/// grace period.
-#[test]
-fn churn_raise_min_replication_underreplicates_new_chunk() {
+/// A short chunk reclaims that space in the same cycle: when a floor copy can't fit against a full
+/// footprint, the Stage-2 reconcile evicts a still-adequate chunk's draining copy to make room
+/// (ring-following floor-preemption), so the short chunk never drops to zero.
+fn churn_raise_min_replication_underreplicates_new_chunk_case() -> (SimConfig, Vec<Action>) {
     let config = SimConfig {
         worker_count: 8,
         worker_capacity: WORKER_CAPACITY,
@@ -329,79 +327,91 @@ fn churn_raise_min_replication_underreplicates_new_chunk() {
         chunk_cap: None,
         datasets: sim_datasets(),
         confirm_threshold_pct: 96,
+        gc_ticks: 0,
     };
 
     let nc = |key: u64, weight: u16, dataset: &str| {
         new_chunk((mint_key(key), CHUNK_SIZE, weight, dataset.to_string()))
     };
 
-    replay(
-        &config,
-        vec![
-            Action::AddChunks(vec![
-                nc(16954961818610243957, 1, "s3://sim-0"),
-                nc(17192678508929664996, 4, "s3://sim-0"),
-                nc(10410597896074326657, 12, "s3://sim-1"),
-            ]),
-            Action::AddChunks(vec![nc(10745604078485693560, 1, "s3://sim-0")]),
-            Action::AddChunks(vec![
-                nc(14225974142692056874, 4, "s3://sim-0"),
-                nc(16716503399904949224, 1, "s3://sim-0"),
-            ]),
-            Action::AddChunks(vec![
-                nc(15964094345927118657, 4, "s3://sim-2"),
-                nc(10907444126988596830, 1, "s3://sim-1"),
-                nc(10088558488371624923, 1, "s3://sim-0"),
-                nc(11025351918916638976, 4, "s3://sim-0"),
-            ]),
-            Action::WorkerJoined(6),
-            Action::AddChunks(vec![nc(4768630435428853058, 12, "s3://sim-0")]),
-            Action::AddChunks(vec![nc(2989571896298241678, 12, "s3://sim-0")]),
-            Action::WorkerJoined(10),
-            Action::AddChunks(vec![
-                nc(2653943195343285012, 1, "s3://sim-1"),
-                nc(3919469687435077483, 1, "s3://sim-2"),
-                nc(2128585714501728433, 12, "s3://sim-0"),
-                nc(16195951278785098129, 4, "s3://sim-2"),
-                nc(13923989993107868323, 1, "s3://sim-1"),
-            ]),
-            Action::AddChunks(vec![
-                nc(7383991124465855767, 4, "s3://sim-0"),
-                nc(13124044741015883640, 4, "s3://sim-0"),
-                nc(14381497883753118542, 1, "s3://sim-0"),
-                nc(8603037258648407345, 12, "s3://sim-0"),
-            ]),
-            Action::AddChunks(vec![
-                nc(1852091475659358006, 1, "s3://sim-1"),
-                nc(4768812022606210322, 1, "s3://sim-1"),
-                nc(13154924922703163528, 4, "s3://sim-0"),
-            ]),
-            Action::AddChunks(vec![nc(3032749468128534043, 1, "s3://sim-0")]),
-            Action::AddChunks(vec![
-                nc(15772499366711579397, 12, "s3://sim-0"),
-                nc(15015764490999709691, 12, "s3://sim-2"),
-                nc(15896881262948160117, 12, "s3://sim-2"),
-                nc(2983592671753481994, 12, "s3://sim-2"),
-            ]),
-            Action::AddChunks(vec![
-                nc(14222294236544597556, 4, "s3://sim-0"),
-                nc(6495960531106175075, 4, "s3://sim-2"),
-                nc(3326128349095418881, 1, "s3://sim-0"),
-            ]),
-            Action::AddChunks(vec![
-                nc(2915024374768891974, 12, "s3://sim-1"),
-                nc(2484565404766071878, 12, "s3://sim-2"),
-                nc(7152088397016466779, 4, "s3://sim-0"),
-                nc(4790796835249161539, 12, "s3://sim-0"),
-                nc(17661028380861810705, 1, "s3://sim-2"),
-            ]),
-            Action::SetMinReplication(1),
-            Action::CheckConverged(ConvergenceCheck::FloorLocallyFeasible),
-            Action::SetMinReplication(2),
-            Action::WorkerJoined(9),
-            Action::WorkerLeft(2),
-        ],
-    );
+    let actions = vec![
+        Action::AddChunks(vec![
+            nc(16954961818610243957, 1, "s3://sim-0"),
+            nc(17192678508929664996, 4, "s3://sim-0"),
+            nc(10410597896074326657, 12, "s3://sim-1"),
+        ]),
+        Action::AddChunks(vec![nc(10745604078485693560, 1, "s3://sim-0")]),
+        Action::AddChunks(vec![
+            nc(14225974142692056874, 4, "s3://sim-0"),
+            nc(16716503399904949224, 1, "s3://sim-0"),
+        ]),
+        Action::AddChunks(vec![
+            nc(15964094345927118657, 4, "s3://sim-2"),
+            nc(10907444126988596830, 1, "s3://sim-1"),
+            nc(10088558488371624923, 1, "s3://sim-0"),
+            nc(11025351918916638976, 4, "s3://sim-0"),
+        ]),
+        Action::WorkerJoined(6),
+        Action::AddChunks(vec![nc(4768630435428853058, 12, "s3://sim-0")]),
+        Action::AddChunks(vec![nc(2989571896298241678, 12, "s3://sim-0")]),
+        Action::WorkerJoined(10),
+        Action::AddChunks(vec![
+            nc(2653943195343285012, 1, "s3://sim-1"),
+            nc(3919469687435077483, 1, "s3://sim-2"),
+            nc(2128585714501728433, 12, "s3://sim-0"),
+            nc(16195951278785098129, 4, "s3://sim-2"),
+            nc(13923989993107868323, 1, "s3://sim-1"),
+        ]),
+        Action::AddChunks(vec![
+            nc(7383991124465855767, 4, "s3://sim-0"),
+            nc(13124044741015883640, 4, "s3://sim-0"),
+            nc(14381497883753118542, 1, "s3://sim-0"),
+            nc(8603037258648407345, 12, "s3://sim-0"),
+        ]),
+        Action::AddChunks(vec![
+            nc(1852091475659358006, 1, "s3://sim-1"),
+            nc(4768812022606210322, 1, "s3://sim-1"),
+            nc(13154924922703163528, 4, "s3://sim-0"),
+        ]),
+        Action::AddChunks(vec![nc(3032749468128534043, 1, "s3://sim-0")]),
+        Action::AddChunks(vec![
+            nc(15772499366711579397, 12, "s3://sim-0"),
+            nc(15015764490999709691, 12, "s3://sim-2"),
+            nc(15896881262948160117, 12, "s3://sim-2"),
+            nc(2983592671753481994, 12, "s3://sim-2"),
+        ]),
+        Action::AddChunks(vec![
+            nc(14222294236544597556, 4, "s3://sim-0"),
+            nc(6495960531106175075, 4, "s3://sim-2"),
+            nc(3326128349095418881, 1, "s3://sim-0"),
+        ]),
+        Action::AddChunks(vec![
+            nc(2915024374768891974, 12, "s3://sim-1"),
+            nc(2484565404766071878, 12, "s3://sim-2"),
+            nc(7152088397016466779, 4, "s3://sim-0"),
+            nc(4790796835249161539, 12, "s3://sim-0"),
+            nc(17661028380861810705, 1, "s3://sim-2"),
+        ]),
+        Action::SetMinReplication(1),
+        Action::CheckConverged(ConvergenceCheck::FloorLocallyFeasible),
+        Action::SetMinReplication(2),
+        Action::WorkerJoined(9),
+        Action::WorkerLeft(2),
+    ];
+    (config, actions)
+}
+
+#[test]
+fn churn_raise_min_replication_underreplicates_new_chunk() {
+    let (config, actions) = churn_raise_min_replication_underreplicates_new_chunk_case();
+    replay(&config, actions);
+}
+
+/// Postgres twin, for backend parity on the floor-preemption fix.
+#[test]
+fn churn_raise_min_replication_underreplicates_new_chunk_pg() {
+    let (config, actions) = churn_raise_min_replication_underreplicates_new_chunk_case();
+    replay_pg(&config, actions);
 }
 
 /// Regression: a tombstoned chunk's stale mappings must be dropped, else they keep counting in
@@ -423,6 +433,7 @@ fn pg_guided_overcommit_capture_pg() {
         chunk_cap: None,
         datasets: sim_datasets(),
         confirm_threshold_pct: 100,
+        gc_ticks: 0,
     };
     let nc = |key: u64, weight: u16, dataset: &str| NewChunk {
         key: mint_key(key),
@@ -483,4 +494,926 @@ fn pg_guided_overcommit_capture_pg() {
         sim = SimUnderTest::apply(sim, &config, action);
         SimUnderTest::check_invariants(&sim, &config);
     }
+}
+
+/// Regression: worker GC must delete a worker's stale rows with it. Any stale row outliving its
+/// worker trips the in-memory integrity oracle, and on Postgres the
+/// `sched_stale_mappings_worker_id_fkey` FK aborts the update.
+fn worker_gc_orphans_post_departure_stale_rows_case() -> (SimConfig, Vec<Action>) {
+    let config = SimConfig {
+        worker_count: 4,
+        min_replication: 4,
+        ..base_config()
+    };
+    let nc = |key: u64, weight: u16| {
+        new_chunk((mint_key(key), CHUNK_SIZE, weight, "s3://sim-0".to_string()))
+    };
+
+    let actions = vec![
+        // Floor 4 of 4 workers — the leaver is a holder.
+        Action::AddChunks(vec![nc(1, 1)]),
+        Action::WorkerLeft(0),
+        Action::SetMinReplication(1),
+        // Heavy adds reshuffle pairs off the departed worker; still registered, it passes
+        // the mint filter and collects stale rows.
+        Action::AddChunks(vec![nc(2, 12), nc(3, 12)]),
+        // This sync GCs the departed worker under its stale rows.
+        Action::WorkerJoined(4),
+    ];
+    (config, actions)
+}
+
+#[test]
+fn worker_gc_orphans_post_departure_stale_rows() {
+    let (config, actions) = worker_gc_orphans_post_departure_stale_rows_case();
+    replay(&config, actions);
+}
+
+/// Postgres twin: the worker delete must cascade into `sched_stale_mappings`, and the integrity
+/// oracle verifies no row survives it.
+#[test]
+fn worker_gc_orphans_post_departure_stale_rows_pg() {
+    let (config, actions) = worker_gc_orphans_post_departure_stale_rows_case();
+    replay_pg(&config, actions);
+}
+
+/// Regression: reshuffling around a departed worker must not overcommit a survivor — `ideal ∪
+/// stale` once reached 11 MiB on a 10 MiB worker, from held copies being charged to the wrong
+/// workers after the fleet reorder. Also reproduces on
+/// Postgres (`pg_draining_after_churn_reaches_a_fixed_point`). Shrunk from
+/// `SIM_CASE_SEED=7b66a64870d2e68ab587e5643db307655cba96d1fdc558e77425dd6a5e7ff9a1`.
+///
+/// The overcommit was the worker-reorder position bug, now fixed at the source (#53):
+/// `partition_reliable` translates every placement view into the reordered position space, so each
+/// held copy still charges the worker that actually holds it.
+#[test]
+fn departure_reshuffle_overcommits_a_survivor() {
+    let config = SimConfig {
+        worker_count: 6,
+        min_replication: 3,
+        saturation: 0.94,
+        confirm_threshold_pct: 86,
+        gc_ticks: 15,
+        ..base_config()
+    };
+    let nc = |key: u64, weight: u16, dataset: &str| {
+        new_chunk((mint_key(key), CHUNK_SIZE, weight, dataset.to_string()))
+    };
+
+    replay(
+        &config,
+        vec![
+            Action::AddChunks(vec![
+                nc(18283, 1, "s3://sim-2"),
+                nc(32929, 12, "s3://sim-1"),
+                nc(23095, 4, "s3://sim-2"),
+                nc(58340, 12, "s3://sim-0"),
+            ]),
+            Action::AddChunks(vec![nc(50533, 1, "s3://sim-0")]),
+            Action::AddChunks(vec![
+                nc(1042, 1, "s3://sim-1"),
+                nc(11774, 12, "s3://sim-1"),
+                nc(29750, 12, "s3://sim-0"),
+                nc(32802, 4, "s3://sim-0"),
+                nc(12729, 12, "s3://sim-1"),
+            ]),
+            Action::WorkerLeft(4),
+            Action::AddChunks(vec![nc(36932, 1, "s3://sim-0")]),
+        ],
+    );
+}
+
+/// Regression: a departed worker's lingering row must not stall the drain probe. GC waits for a
+/// membership sync and the drain triggers none, so the row survives the whole probe; while
+/// departed workers were still scheduled onto, the ideal oscillated around it and the probe
+/// exhausted its 200-cycle budget. Shrunk by the churn walk.
+///
+/// Parked for the same reason as [`departure_reshuffle_overcommits_a_survivor`]: the oscillation
+/// was the reorder bug, fixed in a separate PR and masked here by the departed-worker filter.
+#[ignore = "multistep-scheduler-fix-required"]
+#[test]
+fn departed_worker_prevents_quiescence() {
+    let config = SimConfig {
+        worker_count: 6,
+        min_replication: 2,
+        saturation: 0.73,
+        confirm_threshold_pct: 88,
+        gc_ticks: 5,
+        ..base_config()
+    };
+    let nc = |key: u64, weight: u16, dataset: &str| {
+        new_chunk((mint_key(key), CHUNK_SIZE, weight, dataset.to_string()))
+    };
+
+    replay(
+        &config,
+        vec![
+            Action::AddChunks(vec![
+                nc(36144, 4, "s3://sim-1"),
+                nc(3220, 4, "s3://sim-1"),
+                nc(28452, 1, "s3://sim-2"),
+            ]),
+            Action::SetMinReplication(3),
+            Action::WorkerJoined(8),
+            Action::AddChunks(vec![
+                nc(56552, 1, "s3://sim-2"),
+                nc(58127, 4, "s3://sim-0"),
+                nc(65478, 12, "s3://sim-0"),
+                nc(62366, 4, "s3://sim-0"),
+            ]),
+            Action::WorkerJoined(7),
+            Action::SetMinReplication(1),
+            Action::WorkerLeft(7),
+            Action::CheckConverged(ConvergenceCheck::FloorLocallyFeasible),
+        ],
+    );
+}
+
+/// Regression: the stale mint must not create a row for a worker that is gone. Worker GC deletes
+/// the worker's row (taking its stale rows along), but its pairs are still in the ideal; when a
+/// later cycle drops such a pair, the in-memory mint records it as a stale mapping without
+/// checking that the worker is still registered — so the new row points at a deleted worker and
+/// can never drain. In-memory only: the Postgres mint filters these out with
+/// `EXISTS (SELECT 1 FROM sched_workers …)`. Shrunk by the churn walk.
+#[test]
+fn stale_minted_for_a_gc_deleted_worker() {
+    let config = SimConfig {
+        min_replication: 2,
+        saturation: 0.7,
+        gc_ticks: 5,
+        ..base_config()
+    };
+
+    replay(
+        &config,
+        vec![
+            Action::AddChunks(vec![new_chunk((
+                mint_key(13105),
+                CHUNK_SIZE,
+                1,
+                "s3://sim-0".to_string(),
+            ))]),
+            Action::WorkerLeft(0),
+            // Draining advances the clock past the retention; the departed worker keeps its
+            // ideal pairs (nothing filters it) until the join's sync GC-deletes the row.
+            Action::CheckConverged(ConvergenceCheck::FloorLocallyFeasible),
+            Action::WorkerJoined(8),
+            // The reshuffle drops the deleted worker's pair from the ideal — and the mint
+            // creates a stale row for a worker that no longer exists.
+            Action::SetMinReplication(1),
+        ],
+    );
+}
+
+/// Regression: routing that names a departed worker is tolerated until the assignment that dropped
+/// it confirms. Nothing retracts routing at departure by design — the scheduler drops the worker
+/// from the ideal and the routing follows on confirmation — so a worker that departs and rejoins
+/// empty is unaccountable for the routing meanwhile. Guards the oracles against tightening onto
+/// that window. Needs no worker GC (`gc_ticks: NEVER_GC_TICKS`). Shrunk by the churn walk.
+#[test]
+fn portal_routes_to_a_rejoined_worker_with_empty_disk() {
+    let config = SimConfig {
+        worker_count: 8,
+        min_replication: 3,
+        saturation: 0.82,
+        gc_ticks: NEVER_GC_TICKS,
+        ..base_config()
+    };
+    let nc = |key: u64, weight: u16, dataset: &str| {
+        new_chunk((mint_key(key), CHUNK_SIZE, weight, dataset.to_string()))
+    };
+
+    replay(
+        &config,
+        vec![
+            Action::AddChunks(vec![nc(7835, 12, "s3://sim-0"), nc(50770, 4, "s3://sim-0")]),
+            Action::AddChunks(vec![
+                nc(54949, 12, "s3://sim-0"),
+                nc(27489, 12, "s3://sim-2"),
+                nc(49688, 4, "s3://sim-2"),
+                nc(7112, 1, "s3://sim-0"),
+            ]),
+            Action::AddChunks(vec![
+                nc(24126, 4, "s3://sim-2"),
+                nc(41662, 4, "s3://sim-0"),
+                nc(2559, 12, "s3://sim-2"),
+                nc(4623, 4, "s3://sim-0"),
+            ]),
+            Action::AddChunks(vec![
+                nc(20657, 12, "s3://sim-2"),
+                nc(12105, 4, "s3://sim-0"),
+                nc(34911, 4, "s3://sim-0"),
+                nc(20366, 12, "s3://sim-1"),
+                nc(4873, 4, "s3://sim-2"),
+            ]),
+            Action::AddChunks(vec![
+                nc(24310, 12, "s3://sim-0"),
+                nc(12952, 1, "s3://sim-0"),
+                nc(38253, 12, "s3://sim-1"),
+            ]),
+            Action::SetMinReplication(1),
+            Action::CheckConverged(ConvergenceCheck::FloorLocallyFeasible),
+            Action::WorkerLeft(4),
+            Action::WorkerJoined(4),
+        ],
+    );
+}
+
+/// Regression: diffs queued before a departure still name the worker and replay into the routing
+/// as confirmation advances — routing converges through the diff stream, not through a departure
+/// hook. So the published assignment legitimately stops covering what the routing claims until the
+/// post-departure assignment confirms. Guards `published_coverage`'s departure scoping against
+/// tightening onto that window. Shrunk by the churn walk.
+#[test]
+fn diff_replay_carries_a_departed_workers_routing() {
+    let config = SimConfig {
+        worker_count: 6,
+        min_replication: 4,
+        saturation: 0.83,
+        gc_ticks: 5,
+        ..base_config()
+    };
+    let nc = |key: u64, weight: u16, dataset: &str| {
+        new_chunk((mint_key(key), CHUNK_SIZE, weight, dataset.to_string()))
+    };
+
+    replay(
+        &config,
+        vec![
+            Action::AddChunks(vec![
+                nc(45634, 12, "s3://sim-0"),
+                nc(55285, 12, "s3://sim-2"),
+            ]),
+            Action::AddChunks(vec![
+                nc(14498, 12, "s3://sim-1"),
+                nc(62007, 12, "s3://sim-2"),
+                nc(30482, 1, "s3://sim-2"),
+                nc(53011, 4, "s3://sim-2"),
+                nc(47973, 12, "s3://sim-1"),
+            ]),
+            Action::WorkerLeft(5),
+            Action::AddChunks(vec![
+                nc(64995, 12, "s3://sim-1"),
+                nc(62008, 1, "s3://sim-0"),
+                nc(5958, 12, "s3://sim-2"),
+                nc(22807, 4, "s3://sim-0"),
+            ]),
+            Action::CheckConverged(ConvergenceCheck::FloorLocallyFeasible),
+            Action::SetMinReplication(3),
+            Action::WorkerJoined(5),
+        ],
+    );
+}
+
+/// Regression: a portal polling right after a departure is handed routing that still names the
+/// departed worker — freshly fetched, so no staleness tolerance applies — and a rejoin makes those
+/// routings resolve to an empty worker. Expected: portals act on published assignments, and the
+/// routing only sheds the worker once the assignment that dropped it confirms — republication
+/// alone is not the boundary, despite this test's name. Shrunk by the churn walk.
+#[test]
+fn portal_fetches_pre_departure_routing_before_republication() {
+    let config = SimConfig {
+        worker_count: 7,
+        min_replication: 3,
+        saturation: 0.75,
+        ..base_config()
+    };
+    let nc = |key: u64, weight: u16, dataset: &str| {
+        new_chunk((mint_key(key), CHUNK_SIZE, weight, dataset.to_string()))
+    };
+
+    replay(
+        &config,
+        vec![
+            Action::AddChunks(vec![
+                nc(26891, 12, "s3://sim-1"),
+                nc(41709, 12, "s3://sim-2"),
+                nc(4634, 1, "s3://sim-2"),
+                nc(51215, 1, "s3://sim-0"),
+            ]),
+            Action::AddChunks(vec![
+                nc(48172, 12, "s3://sim-0"),
+                nc(32642, 12, "s3://sim-2"),
+                nc(26162, 12, "s3://sim-0"),
+                nc(29040, 1, "s3://sim-2"),
+                nc(31984, 12, "s3://sim-1"),
+            ]),
+            Action::AddChunks(vec![
+                nc(37817, 12, "s3://sim-0"),
+                nc(60836, 1, "s3://sim-2"),
+            ]),
+            Action::AddChunks(vec![
+                nc(42276, 4, "s3://sim-2"),
+                nc(31621, 4, "s3://sim-2"),
+                nc(21452, 4, "s3://sim-1"),
+                nc(37254, 4, "s3://sim-0"),
+            ]),
+            Action::SetMinReplication(1),
+            Action::CheckConverged(ConvergenceCheck::FloorLocallyFeasible),
+            Action::WorkerLeft(2),
+            Action::PortalFetchAssignment { succeeds: true },
+            Action::WorkerJoined(2),
+        ],
+    );
+}
+
+/// Regression: a departure can leave a portal-visible chunk with no holders at all. A departed
+/// worker's copies vanish rather than drain, so when it held the last copy the chunk would drop out
+/// of `ideal ∪ stale` — and the published worker assignment, built from that union, would no longer
+/// name it. The schema bundle is derived from that assignment, so the still-visible chunk's schema
+/// would be missing from it and no client could resolve the chunk's file set.
+///
+/// The fix: with the surviving fleet momentarily full of draining copies, the Stage-2 reconcile
+/// evicts one of those drains to re-floor the holderless chunk the same cycle. It stays in the
+/// worker assignment and the bundle, and the schema-bundle oracle passes.
+///
+/// This state was reached on roughly half of full sim runs. Replay with
+/// `SIM_CASE_SEED=348400ec6469d83ffc977f3d665b3b409cd539204649e174bf81b593be5e7bc5`
+/// or `SIM_CASE_SEED=8d1b004d7735fecc177bf21a4f134a8c8a1c50455714a0d9cf0f0f9cee324da6` against
+/// `in_memory::churn_simulation_case`.
+fn departure_leaves_a_visible_chunk_holderless_case() -> (SimConfig, Vec<Action>) {
+    let config = SimConfig {
+        worker_count: 4,
+        min_replication: 3,
+        saturation: 0.96,
+        confirm_threshold_pct: 72,
+        gc_ticks: 15,
+        ..base_config()
+    };
+    let nc = |key: u64, weight: u16, dataset: &str| {
+        new_chunk((mint_key(key), CHUNK_SIZE, weight, dataset.to_string()))
+    };
+
+    let actions = vec![
+        Action::AddChunks(vec![
+            nc(11160, 1, "s3://sim-1"),
+            nc(8656, 1, "s3://sim-2"),
+            nc(39851, 12, "s3://sim-0"),
+        ]),
+        // A second schema for sim-1: chunks added after this carry a schema id the bundle must
+        // still carry when the portal names them.
+        Action::SetDatasetSchema {
+            dataset: "s3://sim-1".to_string(),
+            schema: SCHEMA_POOL[1].clone(),
+        },
+        Action::AddChunks(vec![nc(32862, 12, "s3://sim-1"), nc(5382, 1, "s3://sim-0")]),
+        Action::WorkerJoined(7),
+        Action::AddChunks(vec![nc(59633, 4, "s3://sim-1")]),
+        Action::AddChunks(vec![
+            nc(59055, 4, "s3://sim-1"),
+            nc(27815, 12, "s3://sim-0"),
+            nc(15889, 12, "s3://sim-0"),
+        ]),
+        Action::SetMinReplication(1),
+        Action::CheckConverged(ConvergenceCheck::FloorLocallyFeasible),
+        Action::AddChunks(vec![
+            nc(39552, 12, "s3://sim-2"),
+            nc(19658, 12, "s3://sim-2"),
+            nc(40207, 1, "s3://sim-0"),
+        ]),
+        Action::AddChunks(vec![
+            nc(38657, 12, "s3://sim-0"),
+            nc(45711, 12, "s3://sim-2"),
+            nc(24142, 1, "s3://sim-1"),
+            nc(41432, 4, "s3://sim-1"),
+        ]),
+        // The departure takes the last copy of an already-visible chunk with it.
+        Action::WorkerLeft(7),
+        Action::AddChunks(vec![nc(65416, 1, "s3://sim-0")]),
+    ];
+    (config, actions)
+}
+
+#[test]
+fn departure_leaves_a_visible_chunk_holderless() {
+    let (config, actions) = departure_leaves_a_visible_chunk_holderless_case();
+    let sut = replay(&config, actions);
+    // ADR 0001 sentinel: the departure-emptied chunk is routed only at the departed worker, which
+    // the strand oracles deliberately exempt — so without this probe, deleting the preemption
+    // mechanism would leave this replay green. The probe demands what preemption guarantees: after
+    // the committed cycle, every routed chunk has an active listed holder again.
+    sut.assert_all_routed_chunks_have_a_listed_holder();
+}
+
+/// Postgres twin: exercises the eviction delete on the real backend (populated
+/// `sched_stale_mappings` DELETE), keeping the two storages at parity on the fix.
+#[test]
+fn departure_leaves_a_visible_chunk_holderless_pg() {
+    let (config, actions) = departure_leaves_a_visible_chunk_holderless_case();
+    let sut = replay_pg(&config, actions);
+    sut.assert_all_routed_chunks_have_a_listed_holder();
+}
+
+/// Captured by the in-memory `churn_simulation`
+/// (`SIM_CASE_SEED=e675aea88480f91a54c61dfbc688fbc30d1bac09e4df5a5753c3eb47ba8bb540`). After a floor
+/// drop (4→3) and three worker joins, floor-preemption eviction removes the copies covering a
+/// weight-1 chunk's (`ChunkPk(1)`) confirmed routing while confirmation lags, so the portal
+/// momentarily routes to workers that hold nothing.
+///
+/// Resolved by the durability-hard / routing-best-effort design: eviction keeps the chunk's committed
+/// durability floor (so it stays covered by holders elsewhere), and `published_coverage` no longer
+/// fires on a stale route to an evicted copy while the chunk is covered somewhere — that is bounded
+/// routing-lag, not a strand. The chunk here is covered elsewhere, so the capture now passes.
+#[test]
+fn churn_holderless_chunk_strands_portal_routing() {
+    let config = SimConfig {
+        worker_count: 4,
+        min_replication: 4,
+        saturation: 0.8,
+        gc_ticks: 15,
+        ..base_config()
+    };
+    let nc = |key: u64, weight: u16, dataset: &str| {
+        new_chunk((mint_key(key), CHUNK_SIZE, weight, dataset.to_string()))
+    };
+
+    replay(
+        &config,
+        vec![
+            Action::AddChunks(vec![
+                nc(62123, 1, "s3://sim-1"),
+                nc(21247, 4, "s3://sim-0"),
+                nc(31989, 4, "s3://sim-0"),
+                nc(6557, 1, "s3://sim-1"),
+            ]),
+            Action::AddChunks(vec![
+                nc(24514, 12, "s3://sim-2"),
+                nc(43084, 1, "s3://sim-0"),
+            ]),
+            Action::AddChunks(vec![nc(45588, 1, "s3://sim-0")]),
+            Action::AddChunks(vec![
+                nc(41443, 12, "s3://sim-0"),
+                nc(52150, 12, "s3://sim-1"),
+                nc(50962, 12, "s3://sim-1"),
+            ]),
+            Action::CheckConverged(ConvergenceCheck::FloorLocallyFeasible),
+            Action::WorkerJoined(4),
+            Action::WorkerJoined(5),
+            Action::WorkerJoined(7),
+            Action::SetMinReplication(3),
+            Action::AddChunks(vec![
+                nc(17316, 4, "s3://sim-0"),
+                nc(4991, 12, "s3://sim-0"),
+                nc(8828, 4, "s3://sim-0"),
+                nc(2498, 4, "s3://sim-0"),
+                nc(21382, 12, "s3://sim-1"),
+            ]),
+        ],
+    );
+}
+
+/// The schema bundle must resolve every chunk the portal can route. A chunk enters the ideal, a later
+/// assignment drops it, then it promotes to portal-visible off its earlier confirmed entry — so the
+/// portal routes it after the current assignment no longer holds it; a `SetDatasetSchema` made that
+/// chunk's schema unique, so dropping it from the ideal would drop the only copy of that schema, and a
+/// sustained shortage freezes the bundle so it never self-heals. The bundle covers a chunk's schema for
+/// its whole routable lifetime (`entered_worker_assignment ∧ ¬tombstoned`, ADR 0002), so the schema
+/// stays resolvable. Delta-debugged from the failing walk (proptest over-shrank it).
+fn shortage_schema_bundle_misses_in_flight_chunk_case() -> (SimConfig, Vec<Action>) {
+    let config = SimConfig {
+        worker_count: 8,
+        min_replication: 3,
+        saturation: 0.96,
+        confirm_threshold_pct: 92,
+        gc_ticks: NEVER_GC_TICKS,
+        ..base_config()
+    };
+    let nc = |key: u64, weight: u16, dataset: &str| {
+        new_chunk((mint_key(key), CHUNK_SIZE, weight, format!("s3://{dataset}")))
+    };
+    // One `AddChunks` batch per line (rustfmt would explode each onto its own line); the case is a
+    // frozen delta-debugged fixture, so hand-packing costs no future churn.
+    #[rustfmt::skip]
+    let actions = vec![
+        Action::AddChunks(vec![nc(62822, 4, "sim-1"), nc(8667, 1, "sim-1"), nc(50543, 12, "sim-2")]),
+        Action::AddChunks(vec![nc(6631, 1, "sim-2"), nc(5017, 4, "sim-0"), nc(57041, 1, "sim-0"), nc(5596, 12, "sim-2")]),
+        Action::WorkerJoined(9),
+        Action::WorkerJoined(11),
+        Action::AddChunks(vec![nc(50796, 1, "sim-2"), nc(34259, 12, "sim-2"), nc(1758, 1, "sim-2"), nc(37011, 1, "sim-2"), nc(64296, 12, "sim-0")]),
+        Action::AddChunks(vec![nc(56401, 12, "sim-1"), nc(46547, 12, "sim-2"), nc(38358, 1, "sim-0"), nc(25072, 12, "sim-2"), nc(24018, 4, "sim-1")]),
+        Action::AddChunks(vec![nc(15917, 4, "sim-2"), nc(43358, 1, "sim-1"), nc(58239, 1, "sim-0"), nc(17204, 1, "sim-2"), nc(220, 12, "sim-0")]),
+        Action::WorkerJoined(10),
+        Action::AddChunks(vec![nc(12800, 4, "sim-2"), nc(30433, 4, "sim-1"), nc(16078, 4, "sim-2"), nc(29109, 12, "sim-2"), nc(60512, 4, "sim-2")]),
+        Action::AddChunks(vec![nc(31243, 1, "sim-2"), nc(31398, 12, "sim-0"), nc(24095, 12, "sim-1"), nc(61110, 12, "sim-1")]),
+        Action::AddChunks(vec![nc(62076, 4, "sim-0"), nc(48527, 12, "sim-2")]),
+        Action::AddChunks(vec![nc(59142, 12, "sim-2"), nc(17311, 1, "sim-1"), nc(40615, 1, "sim-2"), nc(3569, 1, "sim-0"), nc(47652, 4, "sim-1")]),
+        Action::SetMinReplication(2),
+        Action::AddChunks(vec![nc(7424, 1, "sim-0")]),
+        Action::AddChunks(vec![nc(55665, 12, "sim-2"), nc(5210, 12, "sim-2")]),
+        Action::AddChunks(vec![nc(1122, 12, "sim-2"), nc(37710, 4, "sim-2"), nc(41327, 12, "sim-0")]),
+        Action::AddChunks(vec![nc(65227, 12, "sim-2"), nc(20805, 1, "sim-2"), nc(65148, 1, "sim-2"), nc(27132, 4, "sim-2")]),
+        Action::AddChunks(vec![nc(19312, 1, "sim-2"), nc(6606, 4, "sim-2"), nc(3645, 1, "sim-2"), nc(31802, 12, "sim-0")]),
+        Action::SetDatasetSchema { dataset: "s3://sim-1".into(), schema: SCHEMA_POOL[1].clone() },
+        Action::CheckConverged(ConvergenceCheck::FloorLocallyFeasible),
+        Action::SetMinReplication(1),
+        Action::AddChunks(vec![nc(52877, 4, "sim-0"), nc(22506, 4, "sim-2"), nc(7926, 12, "sim-1"), nc(32987, 12, "sim-0"), nc(44551, 1, "sim-1")]),
+        Action::WorkerLeft(4),
+        Action::AdvanceClock(4),
+        Action::SetMinReplication(2),
+        Action::CheckConverged(ConvergenceCheck::FloorLocallyFeasible),
+    ];
+    (config, actions)
+}
+
+#[test]
+fn shortage_schema_bundle_misses_in_flight_chunk() {
+    let (config, actions) = shortage_schema_bundle_misses_in_flight_chunk_case();
+    replay(&config, actions);
+}
+
+/// Postgres twin: the same case on the real backend, keeping the bundle fix at parity across storages.
+#[test]
+fn shortage_schema_bundle_misses_in_flight_chunk_pg() {
+    let (config, actions) = shortage_schema_bundle_misses_in_flight_chunk_case();
+    replay_pg(&config, actions);
+}
+
+/// A departed-then-rejoined worker (`WorkerLeft`/`WorkerJoined` on the same index, same pk) covers the
+/// chunks it is re-placed for. Its departure records a `placed_until` bound so
+/// [`routing_has_caught_up_with_departure`](super::sut::SimUnderTest::routing_has_caught_up_with_departure)
+/// can excuse stale routing to a departed worker; that bound must clear on rejoin, or the coverage
+/// oracle keeps treating the now-active holder as an unscrubbed departed route and flags a false strand.
+#[test]
+fn rejoined_worker_covers_its_chunks() {
+    let config = SimConfig {
+        worker_count: 7,
+        min_replication: 2,
+        saturation: 0.85,
+        confirm_threshold_pct: 93,
+        gc_ticks: 15,
+        ..base_config()
+    };
+    let nc = |key: u64, weight: u16, dataset: &str| {
+        new_chunk((mint_key(key), CHUNK_SIZE, weight, format!("s3://{dataset}")))
+    };
+    // One action per line; rustfmt would explode each batch, and this frozen fixture never changes.
+    #[rustfmt::skip]
+    replay(&config, vec![
+        Action::AddChunks(vec![nc(51262, 12, "sim-1"), nc(19230, 12, "sim-0"), nc(40079, 12, "sim-0"), nc(35074, 12, "sim-1"), nc(36465, 12, "sim-2")]),
+        Action::SetMinReplication(1),
+        Action::AddChunks(vec![nc(48988, 12, "sim-1"), nc(11031, 12, "sim-1"), nc(23450, 1, "sim-1"), nc(48788, 1, "sim-1")]),
+        Action::WorkerFetchAssignment { worker: 1, succeeds: true },
+        Action::AddChunks(vec![nc(46781, 4, "sim-1"), nc(22076, 4, "sim-1")]),
+        Action::WorkerLeft(2),
+        Action::WorkerJoined(2),
+        Action::AddChunks(vec![nc(9497, 4, "sim-0"), nc(1876, 1, "sim-1"), nc(47202, 12, "sim-2")]),
+        Action::AddChunks(vec![nc(63259, 12, "sim-1"), nc(33532, 12, "sim-1")]),
+        Action::AddChunks(vec![nc(6850, 4, "sim-0")]),
+        Action::WorkerFetchAssignment { worker: 3, succeeds: true },
+        Action::WorkerFetchAssignment { worker: 4, succeeds: true },
+        Action::AddChunks(vec![nc(21701, 4, "sim-0"), nc(23690, 12, "sim-0")]),
+        Action::WorkerFetchAssignment { worker: 0, succeeds: true },
+        Action::WorkerFetchAssignment { worker: 6, succeeds: true },
+        Action::WorkerFetchAssignment { worker: 5, succeeds: true },
+        Action::WorkerFetchAssignment { worker: 2, succeeds: true },
+        Action::AddChunks(vec![nc(42038, 12, "sim-0"), nc(38427, 12, "sim-1"), nc(45246, 1, "sim-2"), nc(2114, 4, "sim-2")]),
+    ]);
+}
+/// Floor-oscillation knife edge, minimised from the churn walk that surfaced the departure-loss
+/// precondition (`SIM_CASE_SEED=d090ccc1…85ef21b`; delta-debugged 226 → 12 actions against "a
+/// routed chunk reaches exactly one active committed copy, peers only draining, while the floor
+/// demands ≥ 2"). Saturate seven workers at floor 4, converge, drop the floor to 1 — every chunk
+/// sheds to one committed copy plus drains — then raise it to 2: chunks now sit **under-floor
+/// with only draining peers**. A departure taking that last committed copy would be
+/// unrecoverable loss, which is exactly what the churn generator's `is_removal_recoverable`
+/// refuses to produce; this replay pins the recovery half — the scheduler re-floors every routed
+/// chunk without loss.
+#[test]
+fn churn_oscillation_does_not_strand_a_visible_chunk() {
+    let config = SimConfig {
+        worker_count: 7,
+        min_replication: 4,
+        saturation: 0.84,
+        gc_ticks: 15,
+        ..base_config()
+    };
+    let nc = |key: u64, weight: u16, dataset: &str| {
+        new_chunk((mint_key(key), CHUNK_SIZE, weight, format!("s3://{dataset}")))
+    };
+    let sut = replay(
+        &config,
+        vec![
+            Action::AddChunks(vec![
+                nc(3452, 4, "sim-1"),
+                nc(15919, 1, "sim-2"),
+                nc(19453, 1, "sim-1"),
+                nc(55324, 4, "sim-0"),
+            ]),
+            Action::AddChunks(vec![
+                nc(24932, 1, "sim-1"),
+                nc(4983, 4, "sim-2"),
+                nc(31512, 12, "sim-2"),
+                nc(38786, 4, "sim-1"),
+                nc(10358, 4, "sim-2"),
+            ]),
+            Action::AddChunks(vec![nc(41761, 1, "sim-1"), nc(62847, 1, "sim-0")]),
+            Action::AddChunks(vec![
+                nc(19166, 12, "sim-2"),
+                nc(45182, 4, "sim-0"),
+                nc(58881, 4, "sim-2"),
+            ]),
+            Action::AddChunks(vec![
+                nc(41641, 12, "sim-0"),
+                nc(7923, 1, "sim-2"),
+                nc(1489, 1, "sim-1"),
+            ]),
+            Action::AddChunks(vec![
+                nc(35153, 12, "sim-0"),
+                nc(27409, 1, "sim-0"),
+                nc(42453, 1, "sim-2"),
+                nc(34539, 4, "sim-2"),
+            ]),
+            Action::AddChunks(vec![nc(16114, 1, "sim-1"), nc(28923, 1, "sim-0")]),
+            Action::AddChunks(vec![
+                nc(30943, 12, "sim-2"),
+                nc(29621, 12, "sim-0"),
+                nc(634, 4, "sim-2"),
+                nc(12547, 12, "sim-2"),
+            ]),
+            Action::AddChunks(vec![
+                nc(16683, 4, "sim-0"),
+                nc(8503, 12, "sim-0"),
+                nc(211, 1, "sim-2"),
+            ]),
+            Action::CheckConverged(ConvergenceCheck::FloorLocallyFeasible),
+            Action::SetMinReplication(1),
+            Action::SetMinReplication(2),
+        ],
+    );
+    sut.assert_all_routed_chunks_have_a_listed_holder();
+}
+/// Accepted shortage strand, minimised from the churn walk (`SIM_CASE_SEED=5466d59c…fd3ca1b`;
+/// delta-debugged 123 → 24 actions against "still passes AND still fails when the shortage
+/// stand-down is made fatal" — so the strand provably forms). Over-subscribing five workers at
+/// floor 2 records a shortage; a routed chunk drops from the ideal, its scrub diff can't confirm
+/// under the full-quorum shortage, and its stale copies expire — globally uncovered while still
+/// routed. The replay pins that this is *accepted* (the strand oracles stand down while
+/// `is_infeasible`) rather than misreported as a defect.
+#[test]
+fn shortage_routing_strand_is_not_a_defect() {
+    let config = SimConfig {
+        min_replication: 2,
+        saturation: 0.83,
+        gc_ticks: 15,
+        ..base_config()
+    };
+    let nc = |key: u64, weight: u16, dataset: &str| {
+        new_chunk((mint_key(key), CHUNK_SIZE, weight, format!("s3://{dataset}")))
+    };
+    replay(
+        &config,
+        vec![
+            Action::AddChunks(vec![
+                nc(40566, 4, "sim-1"),
+                nc(13820, 4, "sim-0"),
+                nc(38875, 4, "sim-1"),
+                nc(62319, 4, "sim-2"),
+            ]),
+            Action::AddChunks(vec![
+                nc(21192, 12, "sim-2"),
+                nc(25952, 1, "sim-2"),
+                nc(28610, 4, "sim-0"),
+                nc(26251, 1, "sim-0"),
+            ]),
+            Action::AddChunks(vec![nc(42907, 4, "sim-0"), nc(51017, 12, "sim-1")]),
+            Action::AddChunks(vec![
+                nc(14626, 4, "sim-1"),
+                nc(37034, 4, "sim-0"),
+                nc(4974, 4, "sim-1"),
+            ]),
+            Action::AddChunks(vec![
+                nc(12348, 1, "sim-2"),
+                nc(17006, 4, "sim-2"),
+                nc(27779, 12, "sim-2"),
+                nc(63926, 1, "sim-2"),
+            ]),
+            Action::AddChunks(vec![nc(38090, 12, "sim-1")]),
+            Action::AddChunks(vec![
+                nc(57374, 12, "sim-2"),
+                nc(50793, 12, "sim-0"),
+                nc(7556, 12, "sim-0"),
+                nc(25869, 12, "sim-2"),
+                nc(13721, 4, "sim-1"),
+            ]),
+            Action::CheckConverged(ConvergenceCheck::FloorLocallyFeasible),
+            Action::SetMinReplication(1),
+            Action::AddChunks(vec![nc(42596, 1, "sim-2"), nc(28350, 12, "sim-1")]),
+            Action::WorkerFetchAssignment {
+                worker: 3,
+                succeeds: true,
+            },
+            Action::WorkerFetchAssignment {
+                worker: 4,
+                succeeds: true,
+            },
+            Action::AddChunks(vec![
+                nc(51258, 4, "sim-0"),
+                nc(14473, 12, "sim-0"),
+                nc(61909, 1, "sim-0"),
+                nc(8138, 12, "sim-0"),
+            ]),
+            Action::WorkerJoined(8),
+            Action::AddChunks(vec![nc(51672, 12, "sim-2")]),
+            Action::AddChunks(vec![nc(41991, 4, "sim-2")]),
+            Action::RegisterCorrection {
+                old_dataset: "s3://sim-2".to_string(),
+                old_chunk_id: mint_key(42596),
+                replacement: NewChunk {
+                    key: mint_key(55065),
+                    size: CHUNK_SIZE,
+                    weight: 12,
+                    dataset: "s3://sim-2".to_string(),
+                    blocks: 42596000..=42596999,
+                },
+            },
+            Action::AddChunks(vec![
+                nc(25766, 4, "sim-1"),
+                nc(31201, 1, "sim-2"),
+                nc(10807, 1, "sim-0"),
+                nc(12142, 1, "sim-2"),
+                nc(2654, 1, "sim-1"),
+            ]),
+            Action::WorkerLeft(8),
+            Action::AddChunks(vec![
+                nc(38211, 12, "sim-1"),
+                nc(5257, 4, "sim-1"),
+                nc(47539, 4, "sim-1"),
+            ]),
+            Action::WorkerFetchAssignment {
+                worker: 1,
+                succeeds: true,
+            },
+            Action::WorkerFetchAssignment {
+                worker: 0,
+                succeeds: true,
+            },
+            Action::WorkerFetchAssignment {
+                worker: 2,
+                succeeds: true,
+            },
+            Action::AddChunks(vec![nc(65039, 12, "sim-1"), nc(10177, 12, "sim-0")]),
+        ],
+    );
+}
+
+/// Captured by the in-memory `churn_simulation` (`SIM_CASE_SEED=21d9bddcd17fdb94cd8ed990d2163ca32fa970ad2480f65c2d3fd3247e36e17c`, shrunk to 19
+/// actions). A reshuffle hands one chunk (`ChunkPk(31)` in-memory) from W10 — its only fetched
+/// holder — to the just-joined W8, minting W10's drain row; W8 departs before fetching anything,
+/// and `SetMinReplication(2)` opens a shortage streak. During the streak the confirmation
+/// watermark passes the reshuffle without W8 (a departed worker leaves the quorum denominator —
+/// a *vacuous* confirmation), the chunk is promoted routed only at the absent W8, and the M-tick
+/// expiry deletes the drain row: the only record that W10 holds the fleet's sole fetched copy.
+/// W8 then rejoins empty, the next feasible cycle publishes without W10, and W10's fetch deletes
+/// that copy — `assert_physical_retention` fires. The fix re-promotes: when the departure leaves
+/// the chunk with every committed-ideal holder departed, its active stale holders (W10) return
+/// to the committed ideal, protected by the ordinary retention floor.
+fn vacuous_confirmation_must_not_expire_the_last_drain_case() -> (SimConfig, Vec<Action>) {
+    let config = SimConfig {
+        worker_count: 8,
+        min_replication: 4,
+        saturation: 0.72,
+        gc_ticks: 15,
+        ..base_config()
+    };
+    let nc = |key: u64, weight: u16, dataset: &str| {
+        new_chunk((mint_key(key), CHUNK_SIZE, weight, dataset.to_string()))
+    };
+    let actions = vec![
+        Action::AddChunks(vec![nc(23300, 1, "s3://sim-1"), nc(37376, 4, "s3://sim-0")]),
+        Action::AddChunks(vec![
+            nc(6240, 12, "s3://sim-2"),
+            nc(18125, 4, "s3://sim-2"),
+            nc(20397, 4, "s3://sim-1"),
+            nc(16404, 12, "s3://sim-2"),
+        ]),
+        Action::AddChunks(vec![
+            nc(46355, 1, "s3://sim-2"),
+            nc(31766, 4, "s3://sim-0"),
+            nc(65379, 4, "s3://sim-2"),
+            nc(39489, 1, "s3://sim-0"),
+        ]),
+        Action::AddChunks(vec![
+            nc(1563, 1, "s3://sim-1"),
+            nc(43984, 4, "s3://sim-1"),
+            nc(16344, 12, "s3://sim-2"),
+            nc(36142, 1, "s3://sim-2"),
+            nc(15851, 4, "s3://sim-2"),
+        ]),
+        Action::WorkerJoined(10),
+        Action::AddChunks(vec![
+            nc(64399, 1, "s3://sim-2"),
+            nc(42583, 1, "s3://sim-1"),
+            nc(3816, 1, "s3://sim-1"),
+            nc(23951, 1, "s3://sim-1"),
+            nc(31852, 1, "s3://sim-1"),
+        ]),
+        Action::AddChunks(vec![
+            nc(65156, 4, "s3://sim-2"),
+            nc(13194, 12, "s3://sim-0"),
+            nc(62901, 4, "s3://sim-1"),
+            nc(49684, 12, "s3://sim-0"),
+            nc(60849, 12, "s3://sim-1"),
+        ]),
+        Action::SetMinReplication(1),
+        Action::AddChunks(vec![
+            nc(77, 12, "s3://sim-2"),
+            nc(36179, 12, "s3://sim-2"),
+            nc(28930, 12, "s3://sim-0"),
+        ]),
+        Action::AddChunks(vec![
+            nc(23261, 4, "s3://sim-0"),
+            nc(16087, 4, "s3://sim-1"),
+            nc(48532, 4, "s3://sim-0"),
+            nc(17745, 12, "s3://sim-0"),
+        ]),
+        // W8 joins and the reshuffle hands the chunk to it (drain minted for W10)...
+        Action::WorkerJoined(8),
+        Action::SetMinReplication(1),
+        Action::AddChunks(vec![nc(16568, 1, "s3://sim-0")]),
+        // ...then departs without ever fetching, voiding the handoff.
+        Action::WorkerLeft(8),
+        // Shortage streak: nothing commits, but clock-driven expiry keeps running.
+        Action::SetMinReplication(2),
+        Action::CheckConverged(ConvergenceCheck::FloorLocallyFeasible),
+        Action::WorkerJoined(8),
+        Action::SetMinReplication(1),
+        // W10 (the only fetched holder) applies the post-shortage assignment.
+        Action::WorkerFetchAssignment {
+            worker: 10,
+            succeeds: true,
+        },
+    ];
+    (config, actions)
+}
+
+#[test]
+fn vacuous_confirmation_must_not_expire_the_last_drain() {
+    let (config, actions) = vacuous_confirmation_must_not_expire_the_last_drain_case();
+    replay(&config, actions);
+}
+
+/// Postgres twin: the re-promotion is a `update_worker_set` SQL phase — exercise it on the real
+/// backend, keeping the two storages at parity on the fix.
+#[test]
+fn vacuous_confirmation_must_not_expire_the_last_drain_pg() {
+    let (config, actions) = vacuous_confirmation_must_not_expire_the_last_drain_case();
+    replay_pg(&config, actions);
+}
+
+/// Captured from a `pg::churn_simulation` failure
+/// (`SIM_CASE_SEED=b70de3a3f1f6ca99c5801b76e6237bbb12b70db7f7fa57fc441a5abc8b454e17`): Stage 1's
+/// greedy from-empty packing is sensitive to the order chunks are fed, and the two backends feed
+/// different orders. Twelve equal-size chunks at `min_replication = 3` on four workers need 36 of
+/// 40 slots — feasible, but with no slack for a greedy misstep. Postgres feeds
+/// `(dataset, first_block)` order (`fetch_active_chunks_with_placement`'s `ORDER BY`); in that
+/// order the ring walk fills two workers completely while a sim-2 chunk still needs its third
+/// copy, which only those full workers could take, so `ensure_minimum` errors
+/// `NotEnoughCapacity` and the cycle records a shortage. The in-memory backend and the
+/// `is_ideal_feasible` cross-check feed the same chunks in `ChunkPk` order, which packs fine —
+/// the shortage is an artifact of greedy packing, not a genuine capacity shortfall (an in-memory
+/// twin of this capture converges without recording one).
+///
+/// Accepted, not fixed: perfect utilisation is not a goal, so the shortage cross-check grants
+/// greedy packing one max-chunk slot of headroom per worker (`is_ideal_feasible_with_headroom`) —
+/// a knife-edge set like this one is excused, and only a shortage on a set that packs *with* the
+/// slack panics. This replay pins the excusal: it converges through the recorded shortage. The
+/// trade-off is deliberate: on a deterministic knife-edge set the fleet freezes (nothing commits)
+/// until the chunk set or fleet changes, which production avoids by running with saturation
+/// headroom.
+#[test]
+fn churn_knife_edge_false_shortage_is_excused() {
+    let config = SimConfig {
+        worker_count: 3,
+        min_replication: 3,
+        saturation: 0.95,
+        ..base_config()
+    };
+    let nc = |key: u64, weight: u16, dataset: &str| {
+        new_chunk((mint_key(key), CHUNK_SIZE, weight, dataset.to_string()))
+    };
+
+    replay_pg(
+        &config,
+        vec![
+            Action::AddChunks(vec![nc(35300, 4, "s3://sim-2"), nc(57014, 4, "s3://sim-0")]),
+            Action::AddChunks(vec![
+                nc(39090, 1, "s3://sim-1"),
+                nc(50771, 12, "s3://sim-1"),
+            ]),
+            Action::AddChunks(vec![
+                nc(24942, 4, "s3://sim-2"),
+                nc(28061, 1, "s3://sim-2"),
+                nc(30370, 12, "s3://sim-0"),
+            ]),
+            Action::WorkerJoined(4),
+            Action::AddChunks(vec![
+                nc(52384, 12, "s3://sim-1"),
+                nc(56638, 1, "s3://sim-1"),
+                nc(56837, 4, "s3://sim-1"),
+                nc(59000, 12, "s3://sim-1"),
+                nc(57437, 1, "s3://sim-0"),
+            ]),
+            Action::CheckConverged(ConvergenceCheck::FloorLocallyFeasible),
+        ],
+    );
 }

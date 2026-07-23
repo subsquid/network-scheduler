@@ -12,7 +12,8 @@ placement algorithm that feeds it is in [capacity-aware-scheduling.md](capacity-
 The scheduler maintains two independent assignment streams:
 
 - **Worker assignment** — what each worker must physically hold. A superset of every active
-  portal assignment. Minted **once per scheduling cycle**.
+  portal assignment, except pairs deleted by same-cycle floor preemption
+  ([ADR 0001](adr/0001-same-cycle-floor-preemption.md)). Minted **once per scheduling cycle**.
 - **Portal assignment** — a point-in-time view of the data lake that portals route by. Multiple
   portals may sit on different (recent) portal assignments and are expected to converge. Minted
   **once per visibility cycle**.
@@ -299,6 +300,12 @@ Because a stale row is minted the instant a pair leaves the ideal, `ideal ∪ st
 portal view. The drain follows the same timing rule as the chunk-level drop (Invariant 4), with a
 derived rather than stored anchor.
 
+One deliberate exception ([ADR 0001](adr/0001-same-cycle-floor-preemption.md)): a pair deleted by
+same-cycle floor preemption is *not* minted stale — the space is what the starved floor claimed —
+so a still-routed evicted pair can lag outside `ideal ∪ stale` until confirmation sheds it. That
+routing lag is bounded and counted (`portal_consistency_misses`); the strand invariant is that the
+chunk keeps a covered holder somewhere.
+
 ### Per-cycle logic
 
 Stale rows are minted and expired in the **scheduling cycle**; their drain *starts* in the
@@ -337,6 +344,17 @@ what advances the confirmed routing portals read; it is **not** part of the visi
 When a chunk is removed entirely via the chunk-level mechanism (`dropped_from_worker_assignment_at`
 set — gate A), its stale rows and ideal row go too; the whole-chunk removal supersedes any per-pair
 holdover.
+
+**Worker departures** (`update_worker_set`): a departed worker's stale rows are dropped — its
+copies left with it — and its ideal rows wait for the next cycle's diff. One guard runs at the
+same moment. A departure shrinks the confirmation quorum, so the watermark can pass an assignment
+whose sole recipients never applied it — a *vacuous* confirmation that step 4's expiry would then
+act on, deleting the fleet's only fetched copy (Invariant 2 broken at pair granularity). So if a
+chunk's committed-ideal holders are now all departed, its active stale holders are **re-promoted**
+into the committed ideal: the superseded copy becomes a first-class holder again — counted by the
+retention floor, never expiring — before Invariant 4's clock can destroy it. Excess copies shed as
+ordinary drains in later cycles; a rejoining recipient re-downloads via the normal confirmed
+handoff.
 
 **Publish** (when building the worker assignment): `sched_ideal_chunk_workers` unioned with the
 **entire** `sched_stale_mappings` table (pending and draining), deduplicated per chunk.

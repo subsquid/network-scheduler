@@ -498,10 +498,21 @@ impl InMemoryStorage {
         fired
     }
 
-    /// Evict workers that went stale strictly before `stale_cutoff`.
+    /// Evict workers that went stale strictly before `stale_cutoff`, taking their stale mappings
+    /// along (the Postgres FK does this via `ON DELETE CASCADE`).
     fn evict_stale_workers(&mut self, stale_cutoff: TimeUnit) {
-        self.sched_workers
-            .retain(|_, entry| !matches!(entry.inactive_since, Some(ts) if ts < stale_cutoff));
+        let evicted: HashSet<WorkerPk> = self
+            .sched_workers
+            .iter()
+            .filter(|(_, entry)| matches!(entry.inactive_since, Some(ts) if ts < stale_cutoff))
+            .map(|(id, _)| *id)
+            .collect();
+        if evicted.is_empty() {
+            return;
+        }
+        self.sched_workers.retain(|id, _| !evicted.contains(id));
+        self.sched_stale_mappings
+            .retain(|(_, worker_id), _| !evicted.contains(worker_id));
     }
 
     /// True if `dropped_at_portal` names a portal assignment created at or before `cutoff` — i.e.
@@ -575,6 +586,7 @@ impl InMemoryStorage {
     fn record_reshuffle_stale_mappings(
         &mut self,
         ideal_mappings: &BTreeMap<ChunkPk, HashSet<WorkerPk>>,
+        evicted: &HashSet<(ChunkPk, WorkerPk)>,
         new_worker_aid: WorkerAssignmentId,
     ) {
         for (pk, current_workers) in &self.sched_ideal_chunk_workers {
@@ -588,7 +600,14 @@ impl InMemoryStorage {
             let ideal_workers = ideal_mappings.get(pk);
             for &worker_id in current_workers {
                 let still_assigned = ideal_workers.is_some_and(|iw| iw.contains(&worker_id));
-                if !still_assigned {
+                // Only an active worker drains: a departed one serves nothing, so its copies
+                // vanish. Mirrors the Postgres mint's `inactive_since IS NULL` filter.
+                let worker_active = self
+                    .sched_workers
+                    .get(&worker_id)
+                    .is_some_and(|entry| entry.inactive_since.is_none());
+                // An evicted pair is deleted this cycle, not drained: never mint it as stale.
+                if !still_assigned && worker_active && !evicted.contains(&(*pk, worker_id)) {
                     self.sched_stale_mappings
                         .entry((*pk, worker_id))
                         .or_insert(StaleMapping {
@@ -866,9 +885,54 @@ impl SchedulerStorage for InMemoryStorage {
             );
         }
 
-        let departed_set: HashSet<WorkerPk> = departed.iter().copied().collect();
-        self.sched_stale_mappings
-            .retain(|(_, worker_id), _| !departed_set.contains(worker_id));
+        if !departed.is_empty() {
+            let departed_set: HashSet<WorkerPk> = departed.iter().copied().collect();
+            self.sched_stale_mappings
+                .retain(|(_, worker_id), _| !departed_set.contains(worker_id));
+
+            // Give a drain back its committed-holder status when every worker it was handing
+            // off to has departed. Confirmation is a quorum of *active* workers, so a
+            // recipient's departure lets the handoff count as "confirmed" without any download
+            // (a vacuous confirmation — Invariant 2, docs/mvcc-storage.md); the drain's expiry
+            // clock would then delete the fleet's last real copy. Promotion takes the copy off
+            // the expiry clock and under the retention floor. Excess copies become ordinary
+            // drains in later cycles; departed ideal rows fall out with the next cycle's diff.
+            let handoff_void: HashSet<ChunkPk> = self
+                .sched_ideal_chunk_workers
+                .iter()
+                .filter(|(_, holders)| {
+                    !holders.is_empty()
+                        && holders.iter().all(|w| {
+                            self.sched_workers
+                                .get(w)
+                                .is_none_or(|entry| entry.inactive_since.is_some())
+                        })
+                })
+                .map(|(pk, _)| *pk)
+                .collect();
+            let promoted: Vec<(ChunkPk, WorkerPk)> = self
+                .sched_stale_mappings
+                .keys()
+                .filter(|(pk, worker_id)| {
+                    handoff_void.contains(pk)
+                        && self
+                            .sched_workers
+                            .get(worker_id)
+                            .is_some_and(|entry| entry.inactive_since.is_none())
+                })
+                .copied()
+                .collect();
+            for (pk, worker_id) in promoted {
+                self.sched_stale_mappings.remove(&(pk, worker_id));
+                let holders = self
+                    .sched_ideal_chunk_workers
+                    .get_mut(&pk)
+                    .expect("promoted chunk came from the ideal");
+                if !holders.contains(&worker_id) {
+                    holders.push(worker_id);
+                }
+            }
+        }
 
         self.evict_stale_workers(now.saturating_sub(gc_ticks));
 
@@ -896,6 +960,27 @@ impl SchedulerStorage for InMemoryStorage {
         // `BTreeMap` the snapshot is built as.
         let current_placement: CurrentPlacement = self.current_placement().into_iter().collect();
 
+        // Split-role eviction inputs (roles documented on `SchedulingAlgorithm::schedule`). The
+        // routing is filtered to portal-visible chunks, mirroring the Postgres
+        // `fetch_confirmed_routing` predicate, so both backends see the same routed set. No
+        // active-worker filter: departed holders are dropped downstream by the same position
+        // mapping as `current_placement`.
+        let committed: CurrentPlacement = self
+            .sched_ideal_chunk_workers
+            .iter()
+            .map(|(pk, workers)| (*pk, workers.clone()))
+            .collect();
+        let confirmed_routing: CurrentPlacement = self
+            .sched_confirmed_chunk_workers
+            .iter()
+            .filter(|(pk, _)| {
+                self.sched_chunk_metadata
+                    .get(pk)
+                    .is_some_and(|meta| meta.portal_visible())
+            })
+            .map(|(pk, workers)| (*pk, workers.clone()))
+            .collect();
+
         let chunks: Vec<(ChunkPk, AlgoChunk)> = self
             .chunks
             .iter()
@@ -904,11 +989,19 @@ impl SchedulerStorage for InMemoryStorage {
                     .get(pk)
                     .is_none_or(|m| m.worker_servable())
             })
-            .map(|(pk, chunk)| (*pk, chunk.into()))
+            .map(|(pk, chunk)| {
+                let is_portal_visible = self
+                    .sched_chunk_metadata
+                    .get(pk)
+                    .is_some_and(|meta| meta.portal_visible());
+                (*pk, AlgoChunk::new(chunk, is_portal_visible))
+            })
             .collect();
+        // Departed workers are not capacity. Mirrors the Postgres `decode_workers` filter.
         let workers: Vec<(WorkerPk, Worker)> = self
             .sched_workers
             .iter()
+            .filter(|(_, entry)| entry.inactive_since.is_none())
             .map(|(id, entry)| {
                 (
                     *id,
@@ -925,8 +1018,16 @@ impl SchedulerStorage for InMemoryStorage {
         let ScheduleOutput {
             mapping,
             replication_by_weight,
+            evicted,
         } = algorithm
-            .schedule(chunks, workers, &current_placement, config)
+            .schedule(
+                chunks,
+                workers,
+                &current_placement,
+                &committed,
+                &confirmed_routing,
+                config,
+            )
             .map_err(|_| StorageError::Shortage)?;
 
         // This oracle keeps set-based bookkeeping, so index the returned `Vec` into a map once.
@@ -947,7 +1048,15 @@ impl SchedulerStorage for InMemoryStorage {
         let new_worker_aid = self.counters.worker_assignment_id.next();
         self.sched_worker_assignments.insert(new_worker_aid, now);
 
-        self.record_reshuffle_stale_mappings(&ideal_mappings, new_worker_aid);
+        // Evicted copies are DELETED this cycle, not drained. Drop any pre-existing stale row so the
+        // pair is in neither ideal nor stale -> the worker assignment omits it -> the worker deletes
+        // it. The mint below skips these too, covering a pair that was in the OLD ideal.
+        let evicted: HashSet<(ChunkPk, WorkerPk)> = evicted.into_iter().collect();
+        for pair in &evicted {
+            self.sched_stale_mappings.remove(pair);
+        }
+
+        self.record_reshuffle_stale_mappings(&ideal_mappings, &evicted, new_worker_aid);
 
         // Must precede commit_ideal_mappings, which overwrites the old ideal.
         self.record_worker_assignment_diff(&ideal_mappings, new_worker_aid);
@@ -964,9 +1073,18 @@ impl SchedulerStorage for InMemoryStorage {
             }
         }
 
-        // Bundle from the assignment's own chunks — consistent by construction, no storage scan.
-        let schemas: BTreeMap<SchemaId, DatasetSchema> = assignment
-            .schema_ids()
+        // Bundle covers every chunk in its routable window — entered a worker assignment, not yet
+        // tombstoned — not just this cycle's placement (ADR 0002): the portal can still route a
+        // chunk the latest assignment dropped (promoted off an earlier confirmed entry, draining
+        // for M ticks), so keying on current placement would yank a schema still being read.
+        let mut schema_ids: BTreeSet<SchemaId> = assignment.schema_ids();
+        schema_ids.extend(
+            self.sched_chunk_metadata
+                .iter()
+                .filter(|(_, meta)| meta.entered_worker_assignment() && !meta.tombstoned())
+                .filter_map(|(pk, _)| self.chunks.get(pk).map(|c| c.schema_id)),
+        );
+        let schemas: BTreeMap<SchemaId, DatasetSchema> = schema_ids
             .into_iter()
             .filter_map(|id| self.schemas.get(&id).map(|schema| (id, schema.clone())))
             .collect();

@@ -13,8 +13,10 @@
 //! Feasibility is judged at the *converged* state, not per step: shedding replicas leaves stale
 //! copies on disk, so the footprint is transiently inflated and a burst may legitimately not all
 //! land this cycle. Once drains clear and the output stabilises, every chunk must hold
-//! `min_replication` (or the recorded shortage is cross-checked as genuine — unplaceable even from
-//! an empty fleet).
+//! `min_replication` (or the recorded shortage is cross-checked as justified — unplaceable from an
+//! empty fleet with one max-chunk slot of headroom per worker; a knife-edge set that only packs
+//! exactly is excused, since greedy stage-1 packing is feed-order sensitive and perfect
+//! utilisation is not a goal).
 //!
 //! Checked on every transition: per-step safety (no-overcommit, retention floor, new-chunk
 //! atomicity); portal routing consistency within the M-tick stale window — below a 100% quorum the
@@ -34,6 +36,11 @@
 //!   the run so its log survives; the harness prints the `docker logs` command to read the plans.
 //! - `SIM_WORKERS`, `SIM_CHUNKS`, `SIM_WORKER_CAPACITY`, `SIM_RANDOM_SIZES` — world-shape
 //!   overrides for debugging.
+
+// Case runners return `TestError`, whose `Fail` variant carries the failing
+// `(SimConfig, Vec<Action>)` — the payload a replay reads. Boxing it to shrink the `Err` would
+// fight the state-machine runner's return type for no benefit in a test-only module.
+#![allow(clippy::result_large_err)]
 
 use proptest::test_runner::{Config, RngAlgorithm, TestError, TestRng, TestRunner};
 use rand::rngs::StdRng;

@@ -8,7 +8,7 @@ use super::*;
 use crate::scheduler_storage::postgres::PostgresStorage;
 use crate::scheduler_storage::test_harness::pg_harness::fresh_db;
 
-/// Postgres parity for [`add_outcome_distinguishes_progress_from_shortage`].
+/// Postgres parity for the `AddOutcome` half of [`over_subscribing_burst_is_inserted_and_recorded`].
 #[test]
 fn pg_add_outcome_distinguishes_progress_from_shortage() {
     let storage = fresh_db("pg_add_outcome", 1);
@@ -69,6 +69,7 @@ proptest! {
             chunk_cap: None,
             datasets: datasets.clone(),
             confirm_threshold_pct: 100,
+            gc_ticks: 0,
         };
         let storage = fresh_db("pg_drain_churn", id);
         let mut sim = SimUnderTest::<PostgresStorage>::from_config_with(&config, storage);

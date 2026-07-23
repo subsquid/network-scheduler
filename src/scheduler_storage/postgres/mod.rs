@@ -6,13 +6,10 @@
 //!
 //! `Tick` values are logical integer timestamps stored in `BIGINT` columns;
 //! `m_ticks`/`gc_ticks` are raw tick counts used in integer arithmetic.
-
-// `register_correction`; also enabled by `pg-testkit` for offline tools (reshuffle-sim).
 #[cfg(any(test, feature = "pg-testkit"))]
 mod correction;
 mod debug;
 pub mod explain;
-// Not yet wired into a production caller; remove once the scheduler loop uses it.
 mod nonoverlap;
 mod registration;
 mod rows;
@@ -26,14 +23,14 @@ mod workers;
 #[cfg(test)]
 mod tests;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::Context;
 use sqlx::Connection;
 use sqlx::postgres::PgConnection;
 
 use crate::metrics::{PhaseTimer, Timer};
-use crate::scheduler_storage::algorithm::{ScheduleOutput, SchedulingAlgorithm};
+use crate::scheduler_storage::algorithm::{CurrentPlacement, ScheduleOutput, SchedulingAlgorithm};
 use crate::scheduler_storage::{
     AssignmentId, ChunkPk, DatasetPk, NewChunk, PortalAssignment, SchedulerStorage, SchemaBundle,
     SchemaId, StorageError, Tick, WorkerAssignment,
@@ -319,6 +316,7 @@ impl SchedulerStorage for PostgresStorage {
             workers::upsert_active(&mut tx, &peer_ids, &versions).await?;
             let departed = workers::mark_departed(&mut tx, &peer_ids, now).await?;
             workers::delete_stale_mappings(&mut tx, &departed).await?;
+            workers::promote_orphaned_drains(&mut tx, &departed).await?;
             workers::gc_inactive(&mut tx, now, gc_ticks).await?;
             tx.commit().await.context("update_worker_set: commit")?;
 
@@ -362,8 +360,18 @@ impl SchedulerStorage for PostgresStorage {
             let phase::ActiveChunks {
                 for_algo: chunks_for_algo,
                 current_placement,
+                committed_placement,
                 published: published_chunks,
+                bundle_schema_ids,
             } = phase::fetch_active_chunks_with_placement(&mut tx).await?;
+
+            // Confirmed routing for the eviction victim-ordering hint (best-effort). Read in the same
+            // tx as the placement so both see a consistent snapshot; filtered to portal-visible chunks
+            // server-side, matching the in-memory backend's routed set.
+            let confirmed_routing: CurrentPlacement = visibility::fetch_confirmed_routing(&mut tx)
+                .await?
+                .into_iter()
+                .collect();
 
             let worker_rows = phase::fetch_workers(&mut tx).await?;
             let phase::DecodedWorkers {
@@ -374,6 +382,7 @@ impl SchedulerStorage for PostgresStorage {
             let ScheduleOutput {
                 mapping: ideal_mappings,
                 replication_by_weight,
+                evicted,
             } = {
                 let mut timer = PhaseTimer::new("run_scheduling_cycle:schedule");
                 let chunk_count = chunks_for_algo.len() as u64;
@@ -382,6 +391,8 @@ impl SchedulerStorage for PostgresStorage {
                         chunks_for_algo,
                         workers_for_algo,
                         &current_placement,
+                        &committed_placement,
+                        &confirmed_routing,
                         config,
                     )
                     .map_err(|_| StorageError::Shortage)?;
@@ -394,7 +405,7 @@ impl SchedulerStorage for PostgresStorage {
             // Stage the new ideal into the future twin, then diff it against the live ideal to
             // derive the cycle's deltas and swap the twins.
             phase::write_future_ideal(&mut tx, &ideal_mappings, batch_size).await?;
-            phase::apply_deltas_and_swap(&mut tx, new_wa_id).await?;
+            phase::apply_deltas_and_swap(&mut tx, new_wa_id, &evicted).await?;
 
             tx.commit().await.context("run_scheduling_cycle: commit")?;
 
@@ -408,10 +419,14 @@ impl SchedulerStorage for PostgresStorage {
             )
             .await?;
 
-            // Bundle schemas come from the assignment's own chunks, so it's consistent with the
-            // assignment by construction. Only the content load hits the DB, and schema content is
+            // Bundle covers the assignment's chunks (ideal ∪ stale) plus every chunk in its
+            // routable window — entered a worker assignment, not yet tombstoned — so a chunk the
+            // latest assignment dropped but an earlier confirmed entry still routes to keeps its
+            // schema (ADR 0002). Only the content load hits the DB, and schema content is
             // immutable per id, so the by-id read is safe under concurrent writers.
-            let schema_ids: Vec<SchemaId> = wa.schema_ids().into_iter().collect();
+            let mut schema_ids: BTreeSet<SchemaId> = wa.schema_ids();
+            schema_ids.extend(bundle_schema_ids);
+            let schema_ids: Vec<SchemaId> = schema_ids.into_iter().collect();
             let bundle =
                 SchemaBundle::from_schemas(schema::load_schemas(conn, Some(&schema_ids)).await?);
             Ok::<_, StorageError>((wa, bundle))

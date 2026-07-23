@@ -84,11 +84,14 @@ impl SchedulingAlgorithm for StaticSchedulingAlgorithm {
         _chunks: Vec<(ChunkPk, AlgoChunk)>,
         _workers: Vec<(WorkerPk, Worker)>,
         _current_placement: &CurrentPlacement,
+        _committed: &CurrentPlacement,
+        _confirmed_routing: &CurrentPlacement,
         _config: &(),
     ) -> anyhow::Result<ScheduleOutput> {
         Ok(ScheduleOutput {
             mapping: self.mapping.clone(),
             replication_by_weight: BTreeMap::new(),
+            evicted: Vec::new(),
         })
     }
 }

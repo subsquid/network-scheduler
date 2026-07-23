@@ -1,20 +1,27 @@
-//! Checks over a storage [`Snapshot`] that flag placements the scheduler should never produce.
-//! Three things are checked:
-//!   - no worker stores more bytes than its capacity;
-//!   - each chunk gets enough copies. A chunk's target copy count is the *floor* (`min_replication`).
-//!     A new chunk is made visible only once it has the whole floor — never partially — and an
-//!     existing chunk doesn't abruptly lose copies it already holds. The floor is a goal, not a
-//!     guarantee: under saturation a chunk may rest below it — an accepted tradeoff, not a bug;
-//!   - a portal only routes a query to a worker that actually holds the chunk: while a routed
-//!     chunk still has any active, accountable worker, at least one routed worker must really hold
-//!     it (within the drain window M). This — not the floor — is what keeps a chunk answerable.
+//! Checks over a storage [`Snapshot`] that flag placements the scheduler must never produce. Each
+//! check only *detects*: it returns the first problem as a ready-to-panic message (plus the
+//! offending chunk when the failure dump needs it) and never panics itself — the SUT reports.
+//!
+//! Three families are checked:
+//!   - **Capacity** — no worker stores more bytes than its capacity.
+//!   - **Floor** — each chunk should reach `min_replication` copies. A new chunk turns visible only
+//!     with its whole floor (never partial); an existing chunk never abruptly loses copies it holds.
+//!     The floor is a goal, not a guarantee: under saturation a chunk may rest below it — a tradeoff,
+//!     not a bug.
+//!   - **Routing coverage** — a portal only routes a query to a worker that can answer it. This, not
+//!     the floor, is what keeps a chunk answerable. See the coverage model below.
+//!
+//! # Coverage model (ADR 0001): durability is hard, routing is best-effort
+//! Same-cycle floor preemption may delete an above-floor copy that routing still points at, and
+//! confirmation lag is unbounded below a full quorum — so routing can trail the durable placement.
+//! A chunk that keeps a covered holder *somewhere* is **covered**; a stale route to it is bounded
+//! routing-lag, not a failure ([`portal_consistency_misses`] counts these). A chunk with no covered
+//! holder at all is **globally uncovered** — an unanswerable query, the only fatal case. Two states
+//! are exempt entirely: routing only to departed workers (their stale rows are purged on departure —
+//! an availability event) and a recorded shortage (an over-subscribed fleet can't hold every floor).
 //!
 //! Chunk-correction checks live separately, in
 //! [`correction_oracle`](crate::scheduler_storage::test_harness::correction_oracle).
-//!
-//! Each check only detects: it returns the first problem it finds as a ready-to-panic message
-//! (plus the offending chunk when the failure dump needs it) and never panics itself — the SUT
-//! does the reporting.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
@@ -23,15 +30,15 @@ use crate::scheduler_storage::{
     ChunkPk, PortalAssignment, SchemaBundle, Tick, WorkerAssignment, WorkerPk,
 };
 
-/// Every chunk the portal routes must be held by at least one of its routed workers — by what the
-/// worker actually downloaded (`holds`), not the published assignment (that superset is
-/// `published_coverage`'s job). Otherwise a query lands on a worker without the data and fails. Only
-/// checked while `snapshot_age < m_ticks`; beyond M a worker may have legitimately deleted it.
+/// Routing coverage by physical possession: within the M window, a routed chunk must be physically
+/// held (`holds` — not the published listing, which is [`published_coverage`]'s job) by one of its
+/// routed workers, or a query lands on a worker without the data. Beyond M the check stands down (a
+/// worker may have legitimately deleted it).
 ///
-/// A violation needs a routed worker that is still active and caught up to the snapshot's watermark
-/// while none of the routed workers holds the chunk. Routing only to departed workers is a
-/// replication concern, not MVCC; below a 100% quorum, routing to stragglers is the documented X%
-/// tradeoff (`docs/mvcc-storage.md`, "Slow confirmation").
+/// Fires only when the chunk is globally uncovered *and* a routed worker is still active and caught
+/// up to the snapshot's watermark; otherwise it is excused bounded routing-lag (`covered_anywhere`)
+/// or the X% straggler tradeoff (see the module coverage model; `docs/mvcc-storage.md`, "Slow
+/// confirmation").
 pub(super) fn portal_consistency(
     snapshot: &PortalAssignment,
     snapshot_age: Tick,
@@ -39,6 +46,7 @@ pub(super) fn portal_consistency(
     holds: impl Fn(WorkerPk, &ChunkPk) -> bool,
     is_active: impl Fn(WorkerPk) -> bool,
     accountable: impl Fn(WorkerPk) -> bool,
+    covered_anywhere: impl Fn(&ChunkPk) -> bool,
 ) -> Result<(), String> {
     if snapshot_age >= m_ticks {
         return Ok(()); // beyond M, degradation is allowed
@@ -47,10 +55,30 @@ pub(super) fn portal_consistency(
         if routed.iter().any(|&w| holds(w, chunk)) {
             continue;
         }
+        // Durability intact elsewhere ⇒ bounded routing-lag, not a strand (see the doc above).
+        if covered_anywhere(chunk) {
+            continue;
+        }
         if routed.iter().any(|&w| is_active(w) && accountable(w)) {
             return Err(format!(
                 "portal routes chunk {chunk:?} to workers {routed:?} but no active routed worker \
-                 holds it (snapshot age {snapshot_age} < M={m_ticks}) — a query for this chunk would fail",
+                 holds it and the chunk has no covered holder anywhere (snapshot age \
+                 {snapshot_age} < M={m_ticks}) — a query for this chunk would fail",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// A published portal assignment never routes a chunk to nobody: an empty holder set is
+/// unserveable, and both backends delete the row instead of storing one. The consistency oracles
+/// can't see this — they quantify over routed workers, so an empty set passes them vacuously.
+pub(super) fn routing_is_non_empty(snapshot: &PortalAssignment) -> Result<(), String> {
+    for (chunk, routed) in &snapshot.chunk_workers {
+        if routed.is_empty() {
+            return Err(format!(
+                "portal assignment routes chunk {chunk:?} to no worker — the entry should have \
+                 been removed, not published empty",
             ));
         }
     }
@@ -82,14 +110,69 @@ pub(super) fn portal_consistency_misses(
         .count()
 }
 
-/// Superset invariant (`docs/mvcc-storage.md`, "Deferred removal"): the published worker
-/// assignment (`ideal ∪ stale`) must cover every `(chunk, worker)` pair the portal assignment
-/// routes. Otherwise a worker could delete a chunk that portals still route to it.
+/// Routing coverage by the published assignment (ADR 0001, revised): for every chunk with an active
+/// routed worker, the worker assignment (`ideal ∪ stale`) must list an active holder **anywhere** —
+/// not necessarily a routed one. Fires only when the chunk is globally uncovered; covered-elsewhere
+/// is bounded routing-lag (module coverage model; consistent with ADR 0002). Only active workers
+/// count on both sides, and the caller stands the check down during a recorded shortage
+/// (`is_infeasible`).
 ///
-/// Only pairs whose worker is still active are checked. A departed worker's stale rows are purged
-/// on departure, so transient routing to a departed worker is a documented availability event, not
-/// a coverage bug.
+/// The default check counts a chunk as covered when it is *listed* — an assignment row names an
+/// active holder. A listing is only intent, though: that worker may not have downloaded the bytes
+/// yet. `require_physical` tightens "covered" to a listed active holder that *actually* holds the
+/// chunk (`holds`); a chunk that is listed but held by nobody — covered on paper only — then fails.
+/// Paper-only coverage is legitimate and transient (a rejoined worker is re-listed while its disk is
+/// still empty; a committed-but-never-fetched replacement can lag unboundedly), so this mode is
+/// **classification-only, at every quorum** — never fatal here. Eviction-caused physical loss is
+/// made fatal by the SUT's edge-triggered `assert_physical_retention`.
 pub(super) fn published_coverage(
+    portal: &PortalAssignment,
+    worker: Option<&WorkerAssignment>,
+    is_active: impl Fn(WorkerPk) -> bool,
+    holds: impl Fn(WorkerPk, &ChunkPk) -> bool,
+    require_physical: bool,
+) -> Result<(), String> {
+    for (chunk, routed) in &portal.chunk_workers {
+        // A fully-departed routing is an availability event, not a strand — skip it.
+        if !routed.iter().any(|&w| is_active(w)) {
+            continue;
+        }
+        // Covered iff the assignment lists ANY active holder — the routed workers need not be
+        // among them.
+        let listed_holders = worker.and_then(|assignment| assignment.chunk_workers.get(chunk));
+        let covered_anywhere =
+            listed_holders.is_some_and(|holders| holders.iter().any(|&w| is_active(w)));
+        if !covered_anywhere {
+            return Err(format!(
+                "published worker assignment strands portal routing: portal routes chunk \
+                 {chunk:?} to active workers {routed:?}, but the worker assignment (ideal ∪ stale) \
+                 lists no active holder for it anywhere — the chunk has no covered holder at all and \
+                 is unanswerable",
+            ));
+        }
+        if require_physical {
+            let covered_physically = listed_holders
+                .is_some_and(|holders| holders.iter().any(|&w| is_active(w) && holds(w, chunk)));
+            if !covered_physically {
+                return Err(format!(
+                    "published worker assignment covers chunk {chunk:?} on paper only: it lists \
+                     active holders, but none of them physically holds the chunk — legitimate \
+                     transiently in a departure→rejoin window, a defect when eviction caused it \
+                     (which the physical-retention edge check polices)",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Fixed-point routing liveness: at a drained fixed point (ideal stable, stale empty, every routing
+/// diff replayed, no shortage) all deliberate routing lag has resolved, so the confirmed routing
+/// must agree with the worker assignment **pair-by-pair** — every active routed worker is listed as
+/// a holder of the chunk it is routed for. This is what makes "bounded routing-lag" a checked bound:
+/// a stale pair that survives quiescence is a stuck routing update (a diff never emitted or
+/// misapplied), not lag.
+pub(super) fn routing_matches_assignment_at_fixed_point(
     portal: &PortalAssignment,
     worker: Option<&WorkerAssignment>,
     is_active: impl Fn(WorkerPk) -> bool,
@@ -99,18 +182,17 @@ pub(super) fn published_coverage(
             if !is_active(w) {
                 continue;
             }
-            let covered = worker.is_some_and(|assignment| {
+            let listed = worker.is_some_and(|assignment| {
                 assignment
                     .chunk_workers
                     .get(chunk)
                     .is_some_and(|holders| holders.contains(&w))
             });
-            if !covered {
+            if !listed {
                 return Err(format!(
-                    "published worker assignment does not cover portal routing: portal routes \
-                     chunk {chunk:?} to active worker {w:?}, but the worker assignment \
-                     (ideal ∪ stale) no longer includes that pair — the worker may delete data \
-                     portals still route to",
+                    "at the drained fixed point the portal still routes chunk {chunk:?} to active \
+                     worker {w:?}, which the worker assignment does not list as a holder — a \
+                     permanently stale routing pair (stuck routing update), not bounded lag",
                 ));
             }
         }
@@ -164,11 +246,8 @@ pub(super) fn step_safety(
     min_replication: usize,
 ) -> Result<(), String> {
     no_overcommit(after, capacity)?;
-    let live_held: BTreeMap<ChunkPk, BTreeSet<WorkerPk>> = held
-        .iter()
-        .filter(|(pk, _)| !removing.contains(pk))
-        .map(|(pk, holders)| (*pk, holders.clone()))
-        .collect();
+    let mut live_held = held.clone();
+    live_held.retain(|pk, _| !removing.contains(pk));
     let mut published = after.physical_holders_by_pk();
     published.retain(|pk, _| !removing.contains(pk));
     retention_and_atomic_publication(&live_held, &published, min_replication)
@@ -544,30 +623,59 @@ mod tests {
 
     #[test]
     fn portal_consistency_fires_when_accountable_worker_lacks_chunk() {
+        // No routed worker holds it and it is covered nowhere — a genuine miss, still fatal under
+        // the relaxed (ADR 0001) oracle.
         let snapshot = portal(&[(0, &[1, 2])]);
-        let verdict = portal_consistency(&snapshot, 0, 5, |_, _| false, |_| true, |_| true);
+        let verdict =
+            portal_consistency(&snapshot, 0, 5, |_, _| false, |_| true, |_| true, |_| false);
         assert!(verdict.is_err());
     }
 
     #[test]
     fn portal_consistency_passes_when_any_routed_worker_holds() {
         let snapshot = portal(&[(0, &[1, 2])]);
+        let verdict = portal_consistency(
+            &snapshot,
+            0,
+            5,
+            |w, _| w == WorkerPk(2),
+            |_| true,
+            |_| true,
+            |_| false,
+        );
+        assert!(verdict.is_ok());
+    }
+
+    #[test]
+    fn portal_consistency_excused_when_chunk_covered_elsewhere() {
+        // No routed worker holds it, but the chunk keeps a covered holder somewhere (durability
+        // intact) — a deliberate preemption's bounded routing-lag, not a strand.
+        let snapshot = portal(&[(0, &[1, 2])]);
         let verdict =
-            portal_consistency(&snapshot, 0, 5, |w, _| w == WorkerPk(2), |_| true, |_| true);
+            portal_consistency(&snapshot, 0, 5, |_, _| false, |_| true, |_| true, |_| true);
         assert!(verdict.is_ok());
     }
 
     #[test]
     fn portal_consistency_tolerates_snapshot_at_or_beyond_m() {
         let snapshot = portal(&[(0, &[1])]);
-        let verdict = portal_consistency(&snapshot, 5, 5, |_, _| false, |_| true, |_| true);
+        let verdict =
+            portal_consistency(&snapshot, 5, 5, |_, _| false, |_| true, |_| true, |_| false);
         assert!(verdict.is_ok());
     }
 
     #[test]
     fn portal_consistency_tolerates_fully_departed_routing() {
         let snapshot = portal(&[(0, &[1, 2])]);
-        let verdict = portal_consistency(&snapshot, 0, 5, |_, _| false, |_| false, |_| true);
+        let verdict = portal_consistency(
+            &snapshot,
+            0,
+            5,
+            |_, _| false,
+            |_| false,
+            |_| true,
+            |_| false,
+        );
         assert!(verdict.is_ok());
     }
 
@@ -575,7 +683,15 @@ mod tests {
     fn portal_consistency_tolerates_unaccountable_stragglers() {
         // Every routed worker is an active straggler — this is the X% tradeoff, not a violation.
         let snapshot = portal(&[(0, &[1, 2])]);
-        let verdict = portal_consistency(&snapshot, 0, 5, |_, _| false, |_| true, |_| false);
+        let verdict = portal_consistency(
+            &snapshot,
+            0,
+            5,
+            |_, _| false,
+            |_| true,
+            |_| false,
+            |_| false,
+        );
         assert!(verdict.is_ok());
     }
 
@@ -589,43 +705,120 @@ mod tests {
             |_, _| false,
             |_| true,
             |w| w == WorkerPk(2),
+            |_| false,
         );
         assert!(verdict.is_err());
     }
 
     // ---- published_coverage ----------------------------------------------------------------
 
+    /// Listing-only variant most tests use: every worker "holds" everything, physical not required.
+    fn coverage_listed(
+        pa: &PortalAssignment,
+        wa: Option<&WorkerAssignment>,
+        is_active: impl Fn(WorkerPk) -> bool,
+    ) -> Result<(), String> {
+        published_coverage(pa, wa, is_active, |_, _| true, false)
+    }
+
     #[test]
-    fn published_coverage_fires_on_uncovered_active_pair() {
+    fn published_coverage_fires_on_globally_uncovered_chunk() {
+        // Chunk 0 is routed to active worker 1, and the worker assignment's sole holder (2) is
+        // departed (inactive) — so the chunk has NO covered holder anywhere. Genuinely unanswerable:
+        // the strand oracle still fires.
         let pa = portal(&[(0, &[1])]);
         let wa = worker_assignment(&[(0, &[2])]);
-        assert!(published_coverage(&pa, Some(&wa), |_| true).is_err());
+        assert!(coverage_listed(&pa, Some(&wa), |w| w == WorkerPk(1)).is_err());
     }
 
     #[test]
     fn published_coverage_fires_on_missing_chunk() {
+        // Absent from the worker assignment with a live active routed worker is a strand, not a
+        // removal — a removed chunk would be de-visibilitied and absent from the portal too.
         let pa = portal(&[(0, &[1])]);
         let wa = worker_assignment(&[]);
-        assert!(published_coverage(&pa, Some(&wa), |_| true).is_err());
+        assert!(coverage_listed(&pa, Some(&wa), |_| true).is_err());
     }
 
     #[test]
     fn published_coverage_passes_when_worker_assignment_covers_routing() {
         let pa = portal(&[(0, &[1])]);
         let wa = worker_assignment(&[(0, &[1, 2])]);
-        assert!(published_coverage(&pa, Some(&wa), |_| true).is_ok());
+        assert!(coverage_listed(&pa, Some(&wa), |_| true).is_ok());
+    }
+
+    #[test]
+    fn published_coverage_passes_when_chunk_keeps_a_covered_holder() {
+        // Same-cycle preemption deleted the (chunk 0, worker 1) pair while it is still routed, but the
+        // chunk keeps a covered active holder on worker 2. The global-coverage rule tolerates this —
+        // the chunk is still answerable somewhere (bounded routing-lag, not a strand).
+        let pa = portal(&[(0, &[1, 2])]);
+        let wa = worker_assignment(&[(0, &[2])]);
+        assert!(coverage_listed(&pa, Some(&wa), |_| true).is_ok());
+    }
+
+    #[test]
+    fn published_coverage_passes_when_routed_uncovered_but_chunk_covered_elsewhere() {
+        // Neither routed worker (1, 2) holds the chunk, but the worker assignment covers it on a
+        // non-routed active holder (3). Bounded routing-lag: the chunk is answerable via worker 3, so
+        // the oracle tolerates the stale routing rather than demanding routing consistency.
+        let pa = portal(&[(0, &[1, 2])]);
+        let wa = worker_assignment(&[(0, &[3])]);
+        assert!(coverage_listed(&pa, Some(&wa), |_| true).is_ok());
     }
 
     #[test]
     fn published_coverage_skips_departed_workers() {
         let pa = portal(&[(0, &[1])]);
         let wa = worker_assignment(&[(0, &[2])]);
-        assert!(published_coverage(&pa, Some(&wa), |_| false).is_ok());
+        assert!(coverage_listed(&pa, Some(&wa), |_| false).is_ok());
     }
 
     #[test]
     fn published_coverage_with_no_worker_assignment_requires_empty_routing() {
-        assert!(published_coverage(&portal(&[]), None, |_| true).is_ok());
-        assert!(published_coverage(&portal(&[(0, &[1])]), None, |_| true).is_err());
+        assert!(coverage_listed(&portal(&[]), None, |_| true).is_ok());
+        assert!(coverage_listed(&portal(&[(0, &[1])]), None, |_| true).is_err());
+    }
+
+    #[test]
+    fn published_coverage_fires_on_paper_only_coverage_when_physical_required() {
+        // The assignment lists an active holder (2), but nobody physically holds the chunk — a
+        // committed-but-never-fetched replacement. Fatal at a full quorum, tolerated below it.
+        let pa = portal(&[(0, &[1])]);
+        let wa = worker_assignment(&[(0, &[2])]);
+        let nobody_holds = |_, _: &ChunkPk| false;
+        assert!(published_coverage(&pa, Some(&wa), |_| true, nobody_holds, true).is_err());
+        assert!(published_coverage(&pa, Some(&wa), |_| true, nobody_holds, false).is_ok());
+    }
+
+    #[test]
+    fn published_coverage_physical_requirement_met_by_any_listed_holder() {
+        // Worker 2 physically holds the chunk; worker 3 is a fresh listing still downloading. One
+        // physical holder anywhere satisfies the requirement.
+        let pa = portal(&[(0, &[1])]);
+        let wa = worker_assignment(&[(0, &[2, 3])]);
+        let holds = |w, _: &ChunkPk| w == WorkerPk(2);
+        assert!(published_coverage(&pa, Some(&wa), |_| true, holds, true).is_ok());
+    }
+
+    // ---- routing_matches_assignment_at_fixed_point -----------------------------------------
+
+    #[test]
+    fn fixed_point_routing_fires_on_stale_pair() {
+        // Worker 1 is routed for chunk 0 but no longer listed as its holder — at quiescence that is
+        // a stuck routing update, even though the chunk is covered elsewhere (worker 2).
+        let pa = portal(&[(0, &[1])]);
+        let wa = worker_assignment(&[(0, &[2])]);
+        assert!(routing_matches_assignment_at_fixed_point(&pa, Some(&wa), |_| true).is_err());
+    }
+
+    #[test]
+    fn fixed_point_routing_passes_when_pairs_match_and_skips_departed() {
+        let pa = portal(&[(0, &[1, 9])]);
+        let wa = worker_assignment(&[(0, &[1, 2])]);
+        // Worker 9 is departed — exempt; worker 1 is routed and listed.
+        assert!(
+            routing_matches_assignment_at_fixed_point(&pa, Some(&wa), |w| w != WorkerPk(9)).is_ok()
+        );
     }
 }

@@ -64,6 +64,7 @@ pub struct AlgoChunk {
     pub id: ChunkId,
     pub size: u32,
     pub blocks: RangeInclusive<BlockNumber>,
+    pub is_portal_visible: bool,
 }
 
 impl SchedulingChunk for AlgoChunk {
@@ -108,13 +109,16 @@ pub struct WorkerAssignmentChunk {
     pub tables_present: Option<bit_vec::BitVec>,
 }
 
-impl From<&WorkerAssignmentChunk> for AlgoChunk {
-    fn from(chunk: &WorkerAssignmentChunk) -> Self {
+impl AlgoChunk {
+    /// The algorithm's view of a stored chunk. Portal visibility lives in the backend's lifecycle
+    /// metadata, not in the chunk, so the caller supplies it.
+    pub fn new(chunk: &WorkerAssignmentChunk, is_portal_visible: bool) -> Self {
         AlgoChunk {
             dataset: chunk.dataset.clone(),
             id: chunk.id.clone(),
             size: chunk.size,
             blocks: chunk.blocks.clone(),
+            is_portal_visible,
         }
     }
 }
@@ -229,7 +233,7 @@ pub trait SchedulerStorage {
     /// `PortalAssignment`, which can lag or fail on their own.
     fn active_schema_bundle(&self) -> Result<BTreeMap<SchemaId, DatasetSchema>, StorageError>;
 
-    /// Register new chunk replacemet for an old chunk. New chunk must have the same block range as
+    /// Register a new chunk replacement for an old chunk. New chunk must have the same block range as
     /// the old chunk. Also enabled by `pg-testkit` for offline tools (reshuffle-sim).
     #[cfg(any(test, feature = "pg-testkit"))]
     fn register_correction(

@@ -14,9 +14,9 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use super::super::SchedulingConfig;
 use super::utils::{
-    CHUNK_SIZE, CLOCK_STEP, DATASETS, GC_TICKS, M_TICKS, SCHEMA_POOL, WEIGHTS, WORKER_CAPACITY,
-    WeightTable, chunk_from_view, mint_key, record_weights, sim_datasets, storage_chunk,
-    trace_enabled,
+    CHUNK_SIZE, CLOCK_STEP, DATASETS, DEPARTURE_DETECTION_TICKS, M_TICKS, SCHEMA_POOL, WEIGHTS,
+    WORKER_CAPACITY, WeightTable, chunk_from_view, mint_key, record_weights, sim_datasets,
+    storage_chunk, trace_enabled,
 };
 use crate::scheduler_storage::algorithm::{CurrentPlacement, SchedulingAlgorithm};
 use crate::scheduler_storage::in_memory::InMemoryStorage;
@@ -26,7 +26,6 @@ use crate::scheduler_storage::{
     StorageError, Tick, WorkerAssignment, WorkerPk,
 };
 use crate::types::{DatasetSchema, Worker, WorkerStatus};
-use crate::weight::WeightStrategy;
 use proptest::statistics;
 use proptest_state_machine::iterative_runner::IterativeSutStateMachine;
 
@@ -113,6 +112,8 @@ pub(super) struct SimConfig {
     /// active workers have applied; 100 = all workers confirm; 0 = watermark skips to latest
     /// published assignment (no fetch required).
     pub(super) confirm_threshold_pct: u32,
+    /// Ticks a departed worker's row survives before a membership sync deletes it.
+    pub(super) gc_ticks: Tick,
 }
 
 impl SimConfig {
@@ -127,6 +128,7 @@ impl SimConfig {
             chunk_cap: None,
             datasets: sim_datasets(),
             confirm_threshold_pct: 100,
+            gc_ticks: 0,
         }
     }
 }
@@ -282,6 +284,7 @@ impl<D: SimStorage> IterativeSutStateMachine for SimUnderTest<D> {
             return;
         }
         sim.record_state_statistics();
+        sim.assert_no_orphaned_stale_mappings();
         sim.assert_published_coverage();
         sim.assert_portal_consistency();
         sim.assert_corrections_safety();
@@ -301,6 +304,15 @@ pub(super) struct PooledWorker {
     active: bool,
 }
 
+/// Capacity slack granted to the from-scratch packing probe (see
+/// [`SimUnderTest::floor_packs_from_scratch`]).
+enum Headroom {
+    None,
+    /// One max-chunk slot per worker — the tolerance the shortage cross-check grants greedy
+    /// stage-1 packing.
+    MaxChunkPerWorker,
+}
+
 /// The simulated world: a storage backend driven through the multistep scheduler, a logical clock,
 /// and the worker roster. Chunk and placement state live only in the storage.
 pub(super) struct SimUnderTest<D: SimStorage> {
@@ -311,6 +323,7 @@ pub(super) struct SimUnderTest<D: SimStorage> {
     /// Fixed worker pool — never resized; churn flips each worker's `active`.
     workers: Vec<PooledWorker>,
     config: SchedulingConfig,
+    gc_ticks: Tick,
     /// Logical clock.
     now: Tick,
     workers_state: WorkerFleet,
@@ -326,6 +339,10 @@ pub(super) struct SimUnderTest<D: SimStorage> {
     /// Confirmation watermark at the latest portal assignment's publication — the consistency
     /// oracle's accountability bound.
     latest_portal_watermark: AssignmentId,
+    /// Per departed worker, the newest assignment that still placed it — until the routing
+    /// watermark passes it, the oracles hold the worker to nothing (see
+    /// [`routing_has_caught_up_with_departure`](Self::routing_has_caught_up_with_departure)).
+    placed_until_departure: BTreeMap<WorkerPk, AssignmentId>,
     /// X% confirmation quorum.
     confirm_threshold_pct: u32,
     /// Converged latch: set by a terminal convergence check or one under a recorded shortage;
@@ -341,6 +358,12 @@ pub(super) struct SimUnderTest<D: SimStorage> {
     /// Whether the just-applied transition may have touched an oracle input (`false` only for
     /// `NoOp`) — lets the idle tail skip `check_invariants`.
     oracle_inputs_changed: bool,
+    /// Routed chunks that had ≥ 1 physical copy on an active worker at the last transition — the
+    /// baseline [`assert_physical_retention`](Self::assert_physical_retention) edges against.
+    physically_covered: BTreeSet<ChunkPk>,
+    /// Whether the just-applied transition removed a worker (`WorkerLeft`) — the one legitimate
+    /// cause for a routed chunk's physical coverage to vanish in a single step.
+    last_transition_shed_a_worker: bool,
     /// Per-operation trace toggle, captured from `SIM_TRACE` once at construction.
     trace: bool,
     /// One-shot latch: set once the first idle `NoOp` has been traced.
@@ -549,6 +572,21 @@ impl<D: SimStorage> SimUnderTest<D> {
     /// probing with an empty placement exercises both shortage sources (replication budget and
     /// stage-1 packing). Removing chunks are excluded — they are no longer demand.
     fn is_ideal_feasible(&self, workers: &[&Worker]) -> bool {
+        self.floor_packs_from_scratch(workers, Headroom::None)
+    }
+
+    /// The shortage cross-check's bar: the same probe with every worker's capacity reduced by the
+    /// largest probed chunk — one slot of slack per worker. Stage 1's greedy ring walk is
+    /// feed-order sensitive (and the backends feed different orders), so it may legitimately
+    /// refuse a set that only packs at a knife edge; a set that packs even *with* this slack is
+    /// one no wasted-slot artifact can excuse, so refusing it is a real scheduler bug. The margin
+    /// is absolute (`workers × max chunk`), vanishing relative to production-scale capacity.
+    /// See `churn_knife_edge_false_shortage_is_excused` for the capture that set the bar.
+    fn is_ideal_feasible_with_headroom(&self, workers: &[&Worker]) -> bool {
+        self.floor_packs_from_scratch(workers, Headroom::MaxChunkPerWorker)
+    }
+
+    fn floor_packs_from_scratch(&self, workers: &[&Worker], headroom: Headroom) -> bool {
         let worker_pairs: Vec<(WorkerPk, Worker)> = workers
             .iter()
             .copied()
@@ -564,12 +602,26 @@ impl<D: SimStorage> SimUnderTest<D> {
             .map(|view| (view.chunk_pk, chunk_from_view(view)))
             .collect();
         chunk_pairs.sort_by(|a, b| a.0.cmp(&b.0));
+        let margin = match headroom {
+            Headroom::None => 0,
+            Headroom::MaxChunkPerWorker => chunk_pairs
+                .iter()
+                .map(|(_, chunk)| u64::from(chunk.size))
+                .max()
+                .unwrap_or(0),
+        };
+        let config = SchedulingConfig {
+            worker_capacity: self.config.worker_capacity.saturating_sub(margin),
+            ..self.config.clone()
+        };
         self.algo
             .schedule(
                 chunk_pairs,
                 worker_pairs,
                 &CurrentPlacement::default(),
-                &self.config,
+                &CurrentPlacement::default(),
+                &CurrentPlacement::default(),
+                &config,
             )
             .is_ok()
     }
@@ -684,16 +736,18 @@ impl<D: SimStorage> SimUnderTest<D> {
     }
 
     // ---- Worker churn (membership) ----------------------------------------------------------
+    //
+    // Membership events update the registry directly; scheduling never syncs the fleet. Doing it
+    // here would collapse the window between a departure and the cycles that converge on it.
 
-    /// Switch the pool worker at `index` into the active fleet and reschedule. No-op if out of range
-    /// or already active.
+    /// Switch the pool worker at `index` into the active fleet and register it. No-op if out of
+    /// range or already active.
     pub(super) fn do_worker_joined(&mut self, index: usize) -> bool {
         if self.workers.get(index).map(|worker| worker.active) != Some(false) {
             return false;
         }
         self.workers[index].active = true;
         self.sync_worker_set();
-        self.run_cycle();
         self.trace_step(&format!(
             "AddWorker(W{index}) — {} workers",
             self.active_workers_count()
@@ -701,19 +755,18 @@ impl<D: SimStorage> SimUnderTest<D> {
         true
     }
 
-    /// Switch the pool worker at `index` out of the active fleet, evict it from the storage
-    /// registry, and reschedule. No-op if out of range or already absent.
+    /// Switch the pool worker at `index` out of the active fleet and mark it departed. No-op if
+    /// out of range or already absent.
     pub(super) fn do_worker_left(&mut self, index: usize) -> bool {
         if self.workers.get(index).map(|worker| worker.active) != Some(true) {
             return false;
         }
         self.workers[index].active = false;
-        // First sync marks the worker stale; advancing the clock and syncing again evicts it
-        // (`GC_TICKS = 0`), so the scheduler stops counting it as capacity *before* the reschedule.
+        // A departure is only observed after a full window of silence, so that time has passed on
+        // the clock too. Without the bump a portal snapshot taken before the departure still reads
+        // as fresh, and the oracles hold the worker to data it no longer serves.
+        self.now += DEPARTURE_DETECTION_TICKS;
         self.sync_worker_set();
-        self.now += CLOCK_STEP;
-        self.sync_worker_set();
-        self.run_cycle();
         self.trace_step(&format!(
             "RemoveWorker(W{index}) — {} workers",
             self.active_workers_count()
@@ -721,14 +774,78 @@ impl<D: SimStorage> SimUnderTest<D> {
         true
     }
 
-    /// Hand the current active fleet to the storage registry.
+    /// Hand the active fleet to the storage registry — departure marking and departed-worker
+    /// deletion run inside.
     fn sync_worker_set(&mut self) {
+        let mut registered_before: BTreeSet<WorkerPk> = BTreeSet::new();
+        let mut inactive_before: BTreeSet<WorkerPk> = BTreeSet::new();
+        for view in self.storage.get_workers(|_| true) {
+            registered_before.insert(view.worker_id);
+            if view.inactive_since.is_some() {
+                inactive_before.insert(view.worker_id);
+            }
+        }
         let active: Vec<Worker> = self.active_workers().into_iter().cloned().collect();
         self.storage
-            .update_worker_set(&active, self.now, GC_TICKS)
+            .update_worker_set(&active, self.now, self.gc_ticks)
             .expect("worker set update succeeds");
+        let latest_assignment = self
+            .latest_worker_assignment
+            .as_ref()
+            .map_or(0, |assignment| assignment.id);
+        let mut survivors = 0usize;
+        let mut any_departed = false;
+        for view in self.storage.get_workers(|_| true) {
+            if registered_before.contains(&view.worker_id) {
+                survivors += 1;
+            }
+            if view.inactive_since.is_some() {
+                any_departed = true;
+                // Edge-triggered: only on the active -> inactive transition, so the bound stays the
+                // newest assignment that could have placed the worker before it left.
+                if !inactive_before.contains(&view.worker_id) {
+                    self.placed_until_departure
+                        .insert(view.worker_id, latest_assignment);
+                }
+            } else if inactive_before.contains(&view.worker_id) {
+                // Rejoined (inactive -> active, same pk): the worker is placeable again, so its stale
+                // departure bound no longer applies — clear it, or coverage would keep treating this
+                // active holder as an unscrubbed departed route.
+                self.placed_until_departure.remove(&view.worker_id);
+            }
+        }
+        statistics::classify(
+            survivors < registered_before.len(),
+            "churn: worker deleted this sync",
+        );
+        statistics::classify(any_departed, "churn: departed worker still registered");
         let active_pks = self.active_worker_pks();
         self.workers_state.sync_active_workers(&active_pks);
+    }
+
+    /// Every stale mapping must reference an *active* worker. A departed one serves nothing, so
+    /// departure purges its mappings and the mint skips it; a deleted one takes its mappings with
+    /// it. Either way a mapping naming a non-active worker can never drain.
+    fn assert_no_orphaned_stale_mappings(&self) {
+        let mappings = self.storage.get_stale_mappings(|_| true);
+        if mappings.is_empty() {
+            return; // nothing to orphan — skip the registry fetch
+        }
+        let active: BTreeSet<WorkerPk> = self
+            .storage
+            .get_workers(|view| view.inactive_since.is_none())
+            .into_iter()
+            .map(|view| view.worker_id)
+            .collect();
+        let orphaned: Vec<_> = mappings
+            .into_iter()
+            .filter(|mapping| !active.contains(&mapping.worker_id))
+            .map(|mapping| (mapping.chunk_pk, mapping.worker_id))
+            .collect();
+        assert!(
+            orphaned.is_empty(),
+            "stale mappings held by departed or deleted workers: {orphaned:?}",
+        );
     }
 
     // ---- Convergence ------------------------------------------------------------------------
@@ -751,13 +868,24 @@ impl<D: SimStorage> SimUnderTest<D> {
         );
         if self.is_infeasible {
             // Under a shortage the all-or-nothing scheduler commits nothing, so the floor oracle
-            // doesn't apply; only cross-check that the refusal is justified from an empty fleet.
+            // doesn't apply; cross-check that the refusal is justified from an empty fleet. The
+            // probe grants one max-chunk slot of headroom per worker: greedy stage-1 packing is
+            // feed-order sensitive, so a set that only packs at a knife edge may be legitimately
+            // refused — perfect utilisation is not a goal. Refusing a set that packs *with* the
+            // slack is a real bug.
             assert!(
-                !self.is_ideal_feasible(&self.active_workers()),
-                "scheduler recorded a shortage, yet the set is placeable from an empty fleet — \
-                 incremental reconcile is weaker than scheduling from scratch (chunks={}, workers={})",
+                !self.is_ideal_feasible_with_headroom(&self.active_workers()),
+                "scheduler recorded a shortage, yet the set is placeable from an empty fleet with \
+                 a slot of headroom per worker — the refusal cannot be a wasted-slot artifact \
+                 (chunks={}, workers={})",
                 self.total_chunk_count(),
                 self.active_workers_count(),
+            );
+            // Surface how often the tolerance does work: a set that packs exactly but not with
+            // headroom is an excused knife-edge refusal, not a genuine shortage.
+            statistics::classify(
+                self.is_ideal_feasible(&self.active_workers()),
+                "converged: knife-edge shortage excused (packs exactly, not with headroom)",
             );
         } else {
             // Whole set placed: assert no room was wasted reaching the floor. Removing chunks
@@ -801,6 +929,52 @@ impl<D: SimStorage> SimUnderTest<D> {
                 &portal_assignment,
                 self.latest_portal_watermark,
                 self.now,
+            );
+        }
+        // Fixed-point routing liveness: the per-cycle strand check tolerates preempted-but-still-
+        // routed pairs as bounded routing-lag. At a drained, shortage-free fixed point all lag has
+        // resolved, so routing must match the assignment pair-by-pair — a mismatch here is a stuck
+        // routing update, not lag.
+        if let (false, Some(portal_assignment)) =
+            (self.is_infeasible, self.latest_portal_assignment.as_ref())
+        {
+            let active: BTreeSet<WorkerPk> = self.active_worker_pks().into_iter().collect();
+            if let Err(message) = placement_oracles::routing_matches_assignment_at_fixed_point(
+                portal_assignment,
+                self.latest_worker_assignment.as_ref(),
+                |worker| active.contains(&worker),
+            ) {
+                panic!("{message}");
+            }
+        }
+    }
+
+    /// ADR 0001 regression sentinel: every routed chunk — *including* one routed only to departed
+    /// workers, which the strand oracle exempts as an availability event — must keep an active
+    /// listed holder in the latest worker assignment. After a committed cycle this is exactly what
+    /// same-cycle floor preemption restores, and its absence is invisible to the per-step oracles;
+    /// regressions call this so deleting the preemption path fails a test, not just an oracle's
+    /// silence. No-op under a recorded shortage (nothing committed).
+    pub(super) fn assert_all_routed_chunks_have_a_listed_holder(&self) {
+        if self.is_infeasible {
+            return;
+        }
+        let Some(portal_assignment) = self.latest_portal_assignment.as_ref() else {
+            return;
+        };
+        let active: BTreeSet<WorkerPk> = self.active_worker_pks().into_iter().collect();
+        let worker_assignment = self.latest_worker_assignment.as_ref();
+        for chunk in portal_assignment.chunk_workers.keys() {
+            let covered = worker_assignment.is_some_and(|assignment| {
+                assignment
+                    .chunk_workers
+                    .get(chunk)
+                    .is_some_and(|holders| holders.iter().any(|w| active.contains(w)))
+            });
+            assert!(
+                covered,
+                "portal routes chunk {chunk:?} but the worker assignment lists no active holder \
+                 for it — same-cycle floor preemption should have re-placed it this cycle",
             );
         }
     }
@@ -1160,6 +1334,44 @@ impl<D: SimStorage> SimUnderTest<D> {
             f64::from(self.effective_replication_of(&snapshot)),
         );
         statistics::classify(self.is_infeasible, "state: shortage recorded (saturated)");
+        self.record_departed_worker_statistics(&snapshot);
+    }
+
+    /// Coverage of the departed-but-registered window. Measure-only: the scheduler no longer places
+    /// on departed workers, but the ideal keeps pre-departure placements until a cycle rewrites it.
+    fn record_departed_worker_statistics(&self, snapshot: &RawSnapshot) {
+        let departed: BTreeSet<WorkerPk> = self
+            .storage
+            .get_workers(|view| view.inactive_since.is_some())
+            .iter()
+            .map(|view| view.worker_id)
+            .collect();
+        // With no departed workers both classifiers are vacuously false — skip the scans but
+        // still record the miss, so the sweep percentages stay meaningful.
+        let stale_held = !departed.is_empty()
+            && !self
+                .storage
+                .get_stale_mappings(|mapping| departed.contains(&mapping.worker_id))
+                .is_empty();
+        statistics::classify(stale_held, "stale: held by departed worker");
+        let floor = usize::from(self.config.min_replication);
+        let phantom_floor = !departed.is_empty() && {
+            let excluded = self.chunks_excluded_from_floor();
+            snapshot
+                .chunk_pks
+                .iter()
+                .zip(&snapshot.ideal)
+                .filter(|(chunk_pk, _)| !excluded.contains(chunk_pk))
+                .any(|(_, holders)| {
+                    holders.len() >= floor
+                        && holders
+                            .iter()
+                            .filter(|worker| !departed.contains(worker))
+                            .count()
+                            < floor
+                })
+        };
+        statistics::classify(phantom_floor, "floor: met only via departed holders");
     }
 
     /// The active workers' worker pks, looked up from the live snapshot's peer-id map.
@@ -1201,7 +1413,15 @@ impl<D: SimStorage> SimUnderTest<D> {
         }
         let holds = |worker, chunk: &ChunkPk| self.workers_state.holds_chunk(worker, chunk);
         let is_active = |worker| active.contains(&worker);
-        let accountable = |worker| strict || self.workers_state.last_applied(worker) >= watermark;
+        let accountable = |worker| {
+            self.routing_has_caught_up_with_departure(worker, watermark)
+                && (strict || self.workers_state.last_applied(worker) >= watermark)
+        };
+        // Count misses at EVERY quorum, before any excuse or stand-down: the ADR justifies excused
+        // misses as "the envelope `portal_consistency_misses` counts", which is only true if the
+        // counter runs on the strict path too.
+        let misses =
+            placement_oracles::portal_consistency_misses(snapshot, age, M_TICKS, holds, is_active);
         if !strict {
             statistics::label("portal check: measured (<100% quorum)");
             let straggler_present = active
@@ -1211,9 +1431,6 @@ impl<D: SimStorage> SimUnderTest<D> {
                 straggler_present,
                 "portal check: straggler present (scoping live)",
             );
-            let misses = placement_oracles::portal_consistency_misses(
-                snapshot, age, M_TICKS, holds, is_active,
-            );
             statistics::measure(
                 "portal: routings a query would miss (<100% quorum)",
                 misses as f64,
@@ -1222,6 +1439,39 @@ impl<D: SimStorage> SimUnderTest<D> {
             return;
         }
         statistics::label("portal check: strict (100% quorum)");
+        statistics::measure(
+            "portal: routings a query would miss (100% quorum)",
+            misses as f64,
+        );
+        statistics::classify(
+            misses > 0,
+            "portal: excused/masked miss present (100% quorum)",
+        );
+        // Same shortage exemption as `assert_published_coverage`: an over-subscribed fleet can't
+        // hold every floor, so a chunk with no copy anywhere is unavoidable and the within-M read
+        // guarantee stands down (misses stay counted above).
+        if self.is_infeasible {
+            statistics::label("portal check: skipped (shortage)");
+            return;
+        }
+        // Durability-hard, routing best-effort (ADR 0001): a within-M miss is excused while the
+        // chunk keeps a covered holder in the latest worker assignment (`ideal ∪ stale`) — the
+        // eviction kept the committed floor, only the routing lags. Same predicate as
+        // `assert_published_coverage`; only a globally-uncovered chunk fires. Listing-based by
+        // necessity (a rejoined worker is legitimately listed with an empty disk); physical loss
+        // is policed by the edge check `assert_physical_retention`, not here.
+        let covered_anywhere = |chunk: &ChunkPk| {
+            self.latest_worker_assignment
+                .as_ref()
+                .is_some_and(|assignment| {
+                    assignment.chunk_workers.get(chunk).is_some_and(|holders| {
+                        holders.iter().any(|&w| {
+                            active.contains(&w)
+                                && self.routing_has_caught_up_with_departure(w, watermark)
+                        })
+                    })
+                })
+        };
         if let Err(message) = placement_oracles::portal_consistency(
             snapshot,
             age,
@@ -1229,26 +1479,91 @@ impl<D: SimStorage> SimUnderTest<D> {
             holds,
             is_active,
             accountable,
+            covered_anywhere,
         ) {
             panic!("{message}");
         }
     }
 
-    /// Structural superset invariant on the published views: the latest worker assignment
-    /// (`ideal ∪ stale`) must cover every pair the latest portal assignment routes — for workers
-    /// still active (a departed worker's holdovers are purged by design).
+    /// Whether the published routing has caught up with `worker`'s departure. Workers and portals
+    /// act on published assignments, so until the assignment that dropped the worker is confirmed
+    /// into the routing, portals are expected to still address it — and to find no data there if it
+    /// rejoined meanwhile. Nothing retracts routing at departure by design; the next cycle does.
+    fn routing_has_caught_up_with_departure(
+        &self,
+        worker: WorkerPk,
+        routing_watermark: AssignmentId,
+    ) -> bool {
+        self.placed_until_departure
+            .get(&worker)
+            .is_none_or(|&placed_until| routing_watermark > placed_until)
+    }
+
+    /// Strand invariant on the published views: no routed chunk is left **globally uncovered** —
+    /// the latest worker assignment (`ideal ∪ stale`) must list at least one holder that is active
+    /// and past its departure window
+    /// ([`routing_has_caught_up_with_departure`](Self::routing_has_caught_up_with_departure)). A
+    /// preempted still-routed pair is tolerated while the chunk keeps some covered holder —
+    /// bounded routing-lag, not a strand.
     fn assert_published_coverage(&self) {
         let Some(portal_assignment) = self.latest_portal_assignment.as_ref() else {
             return; // nothing published yet
         };
+        if let Err(message) = placement_oracles::routing_is_non_empty(portal_assignment) {
+            panic!("{message}");
+        }
         let active: BTreeSet<WorkerPk> = self.active_worker_pks().into_iter().collect();
+        let is_active = |worker| {
+            active.contains(&worker)
+                && self.routing_has_caught_up_with_departure(worker, self.latest_portal_watermark)
+        };
+        let holds = |worker, chunk: &ChunkPk| self.workers_state.holds_chunk(worker, chunk);
+        // In a recorded shortage the fleet cannot hold every floor, so a routed chunk can
+        // legitimately reach zero coverage while its routing lags (the scrub diff can't confirm
+        // under a full-quorum shortage, and stale copies expire) — the strand check stands down.
+        // NOT silently: the shortage flag is fleet-global, so a coverage bug on an unrelated chunk
+        // would pass unobserved here. Classify what the stand-down masks so "shortage" windows that
+        // routinely hide uncovered chunks stay visible in the statistics.
+        if self.is_infeasible {
+            let masked = placement_oracles::published_coverage(
+                portal_assignment,
+                self.latest_worker_assignment.as_ref(),
+                is_active,
+                holds,
+                false,
+            )
+            .is_err();
+            statistics::classify(
+                masked,
+                "strand check: uncovered routed chunk masked by shortage stand-down",
+            );
+            return;
+        }
         if let Err(message) = placement_oracles::published_coverage(
             portal_assignment,
             self.latest_worker_assignment.as_ref(),
-            |worker| active.contains(&worker),
+            is_active,
+            holds,
+            false,
         ) {
             panic!("{message}");
         }
+        // Paper-only coverage (listed holders, zero physical copies) is legitimate in departure→
+        // rejoin windows (a rejoined worker starts with an empty disk), so it can't be fatal by
+        // state at any quorum — the *edge* check `assert_physical_retention` makes eviction-caused
+        // physical loss fatal. Classified here for visibility.
+        let paper_only = placement_oracles::published_coverage(
+            portal_assignment,
+            self.latest_worker_assignment.as_ref(),
+            is_active,
+            holds,
+            true,
+        )
+        .is_err();
+        statistics::classify(
+            paper_only,
+            "strand check: covered by listing only (no physical holder)",
+        );
     }
 
     /// Shared by the generic [`IterativeSutStateMachine`] impl and the concrete Postgres impl
@@ -1257,6 +1572,7 @@ impl<D: SimStorage> SimUnderTest<D> {
         self.schedule_status = ScheduleStatus::NoSchedulerRun;
         // Only a `NoOp` is guaranteed to leave every oracle input untouched.
         self.oracle_inputs_changed = !matches!(transition, Action::NoOp);
+        self.last_transition_shed_a_worker = matches!(transition, Action::WorkerLeft(_));
         statistics::label(action_kind(&transition));
         if matches!(transition, Action::NoOp) {
             self.trace_noop();
@@ -1311,7 +1627,77 @@ impl<D: SimStorage> SimUnderTest<D> {
             }
             Action::NoOp => {}
         }
+        self.assert_physical_retention();
         self
+    }
+
+    /// Physical-retention oracle (edge-triggered): a routed chunk with ≥ 1 physical copy on an
+    /// active worker must not reach zero copies in one transition, unless that transition was a
+    /// departure (`WorkerLeft` — the data leaves with the worker, a documented availability event).
+    /// This is the check the state-based coverage oracles cannot make: paper-only coverage is
+    /// legitimate in departure→rejoin windows, but the *edge* is attributable — outside departures
+    /// only a worker applying an assignment deletes a copy, and dropping a routed chunk's last
+    /// copy for a replacement that hasn't downloaded yet is precisely the possession bug the
+    /// eviction guard exists to prevent.
+    ///
+    /// At a full quorum the edge is fatal, and the shortage latch is deliberately NOT an excuse:
+    /// shortage cycles commit nothing, so every assignment applied during a streak was
+    /// guard-vetted while feasible — loss under the latch is a guard bug, not a shortage effect.
+    /// Below a full quorum, drain expiry keyed to the quorum watermark can legitimately outrun a
+    /// laggard replacement, so the edge is only classified (in or out of shortage).
+    fn assert_physical_retention(&mut self) {
+        let active = self.active_worker_pks();
+        let removing = self.storage.chunks_in_removal();
+        let (covered_now, lost) = match self.latest_portal_assignment.as_ref() {
+            Some(portal_assignment) => {
+                let covered_now: BTreeSet<ChunkPk> = portal_assignment
+                    .chunk_workers
+                    .keys()
+                    .copied()
+                    .filter(|chunk| !removing.contains(chunk))
+                    .filter(|chunk| {
+                        active
+                            .iter()
+                            .any(|&w| self.workers_state.holds_chunk(w, chunk))
+                    })
+                    .collect();
+                let lost: Vec<ChunkPk> = self
+                    .physically_covered
+                    .iter()
+                    .copied()
+                    .filter(|chunk| {
+                        portal_assignment.chunk_workers.contains_key(chunk)
+                            && !removing.contains(chunk)
+                            && !covered_now.contains(chunk)
+                    })
+                    .collect();
+                (covered_now, lost)
+            }
+            None => (BTreeSet::new(), Vec::new()),
+        };
+        let strict = self.confirm_threshold_pct >= 100;
+        let lost_without_departure = !lost.is_empty() && !self.last_transition_shed_a_worker;
+        if lost_without_departure && strict {
+            panic!(
+                "physical retention breached: routed chunk(s) {lost:?} went from ≥1 physical copy \
+                 to zero in a single non-departure transition{} — a worker deleted a routed chunk's \
+                 last downloaded copy for a replacement that hasn't downloaded yet",
+                if self.is_infeasible {
+                    " (during a recorded shortage, which commits nothing and so cannot justify it)"
+                } else {
+                    ""
+                },
+            );
+        }
+        statistics::classify(
+            lost_without_departure && self.is_infeasible,
+            "physical retention: loss coincided with shortage latch (<100% quorum)",
+        );
+        statistics::classify(
+            lost_without_departure && !self.is_infeasible,
+            "physical retention: routed chunk lost its last copy without a departure (<100% quorum)",
+        );
+        self.physically_covered = covered_now;
     }
 }
 
@@ -1374,6 +1760,7 @@ impl<D: SimStorage> SimUnderTest<D> {
             storage,
             workers,
             config: scheduling_config,
+            gc_ticks: config.gc_ticks,
             now: 0,
             workers_state: WorkerFleet::default(),
             portal_state: Portal::default(),
@@ -1381,6 +1768,7 @@ impl<D: SimStorage> SimUnderTest<D> {
             latest_worker_bundle: None,
             latest_portal_assignment: None,
             latest_portal_watermark: 0,
+            placed_until_departure: BTreeMap::new(),
             confirm_threshold_pct: config.confirm_threshold_pct,
             converge_checked: false,
             real_steps: 0,
@@ -1388,6 +1776,8 @@ impl<D: SimStorage> SimUnderTest<D> {
             is_infeasible: false,
             // `true` so a pre-transition invariant check (e.g. `test_sequential`'s) runs.
             oracle_inputs_changed: true,
+            physically_covered: BTreeSet::new(),
+            last_transition_shed_a_worker: false,
             trace: trace_enabled(),
             noop_traced: false,
             step: 0,
@@ -1448,10 +1838,15 @@ impl<D: SimStorage> SimUnderTest<D> {
         active[quorum..].to_vec()
     }
 
-    /// Whether the fleet could still place every chunk's floor if the pool worker at `index`
-    /// left. Probes the scheduler on the surviving fleet (same path as [`is_ideal_feasible`]),
-    /// catching both aggregate-budget and stage-1 packing shortages — lets the churn model
-    /// generate only recoverable removals.
+    /// Whether the fleet could still place every chunk's floor if the pool worker at `index` left.
+    /// Two gates: (1) [`is_ideal_feasible`] — the surviving fleet's aggregate/stage-1 packing must
+    /// fit every floor from scratch; and (2) [`departure_keeps_a_physical_holder`] — no
+    /// portal-visible chunk may lose its last durable (committed-ideal ∩ held) copy with the
+    /// departure. Gate 2 closes the departure-outpaces-re-replication residual: a chunk whose sole
+    /// durable holder departs needs a fresh re-download, which a saturated fleet can starve across
+    /// the next cycles — genuine loss no scheduler can mask. It still admits departures whenever
+    /// replication is healthy (≥ 2 durable copies survive losing one), so the churn walk keeps
+    /// generating real removals.
     pub(super) fn is_removal_recoverable(&self, index: usize) -> bool {
         let Some(victim) = self.workers.get(index).filter(|w| w.active) else {
             return true; // absent or out of range — removing it changes nothing
@@ -1463,6 +1858,57 @@ impl<D: SimStorage> SimUnderTest<D> {
             .filter(|worker| worker.id != victim_id)
             .collect();
         self.is_ideal_feasible(&survivors)
+            && self.departure_keeps_a_physical_holder(&victim_id.to_string(), &survivors)
+    }
+
+    /// Whether every portal-visible chunk the victim physically holds keeps at least one *other*
+    /// active durable holder after `victim_peer` leaves — one in the chunk's **committed ideal**
+    /// that also physically holds it (`holds_chunk`): the reconcile preserves an ideal copy every
+    /// cycle, and it is already resident so saturation cannot starve a re-download. A survivor's
+    /// merely-physical copy is not enough — it can be a draining stale mapping the next cycles
+    /// expire, so counting it green-lights a departure the strand oracle then flags as genuine
+    /// loss.
+    fn departure_keeps_a_physical_holder(&self, victim_peer: &str, survivors: &[&Worker]) -> bool {
+        let pk_by_peer: HashMap<String, WorkerPk> = self
+            .storage
+            .get_workers(|_| true)
+            .into_iter()
+            .map(|w| (w.peer_id, w.worker_id))
+            .collect();
+        let Some(&victim_pk) = pk_by_peer.get(victim_peer) else {
+            return true; // victim not in storage — nothing to lose
+        };
+        let survivor_pks: Vec<WorkerPk> = survivors
+            .iter()
+            .filter_map(|w| pk_by_peer.get(&w.id.to_string()).copied())
+            .collect();
+
+        // Committed ideal per chunk — stale/draining copies are scheduled to expire, so they
+        // cannot back a durability guarantee.
+        let snapshot = self.storage.snapshot();
+        let ideal_by_pk: BTreeMap<ChunkPk, &BTreeSet<WorkerPk>> = (0..snapshot.len())
+            .map(|i| (snapshot.chunk_pks[i], &snapshot.ideal[i]))
+            .collect();
+
+        let removing = self.storage.chunks_in_removal();
+        for pk in self.storage.visible_chunks() {
+            if removing.contains(&pk) {
+                continue; // a chunk being removed legitimately loses every copy
+            }
+            // Only the victim's own held chunks are at risk from its departure.
+            if !self.workers_state.holds_chunk(victim_pk, &pk) {
+                continue;
+            }
+            let ideal = ideal_by_pk.get(&pk);
+            let survivor_holds = survivor_pks.iter().any(|&w| {
+                ideal.is_some_and(|holders| holders.contains(&w))
+                    && self.workers_state.holds_chunk(w, &pk)
+            });
+            if !survivor_holds {
+                return false; // victim holds this visible chunk's last durable copy — unrecoverable
+            }
+        }
+        true
     }
 
     pub(super) fn total_chunk_count(&self) -> usize {

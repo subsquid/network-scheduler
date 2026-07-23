@@ -108,6 +108,68 @@ pub(super) async fn delete_stale_mappings(
     Ok(())
 }
 
+/// Turn a draining copy back into a committed holder when every worker it was handing off to has left.
+///
+/// Why: "confirmed" means a quorum of *active* workers acknowledged the handoff. Once the recipients
+/// leave, the quorum stops waiting for them, so the handoff counts as confirmed even though no one
+/// ever downloaded the copy (vacuous confirmation — Invariant 2, docs/mvcc-storage.md). The drain's
+/// expiry clock trusts that and would delete the fleet's last real copy; promoting it back to
+/// committed takes it off that clock and under the retention floor.
+///
+/// No follow-up needed: leftover copies become ordinary drains next cycle, and the departed workers'
+/// ideal rows drop out with the next diff.
+///
+/// Run after [`mark_departed`] (departures now visible) and [`delete_stale_mappings`] (every leftover
+/// stale row belongs to an active worker).
+pub(super) async fn promote_orphaned_drains(
+    tx: &mut Transaction<'_, Postgres>,
+    departed: &[WorkerPk],
+) -> Result<()> {
+    if departed.is_empty() {
+        return Ok(());
+    }
+    let mut timer = PhaseTimer::new("update_worker_set:promote_orphaned_drains");
+    let res = sqlx::query(
+        r#"
+        WITH orphaned AS (
+            SELECT i.chunk_pk
+            FROM sched_ideal_chunk_workers i
+            WHERE i.worker_ids && $1
+              AND cardinality(i.worker_ids) > 0
+              AND NOT EXISTS (
+                  SELECT 1 FROM sched_workers w
+                  WHERE w.id = ANY(i.worker_ids) AND w.inactive_since IS NULL
+              )
+        ),
+        promoted AS (
+            DELETE FROM sched_stale_mappings st
+            USING orphaned o, sched_workers w
+            WHERE st.chunk_pk = o.chunk_pk
+              AND w.id = st.worker_id
+              AND w.inactive_since IS NULL
+            RETURNING st.chunk_pk, st.worker_id
+        )
+        UPDATE sched_ideal_chunk_workers i
+        SET worker_ids = (
+            SELECT array_agg(DISTINCT v ORDER BY v)
+            FROM unnest(i.worker_ids || p.extra) AS v
+        )
+        FROM (
+            SELECT chunk_pk, array_agg(worker_id) AS extra
+            FROM promoted
+            GROUP BY chunk_pk
+        ) p
+        WHERE i.chunk_pk = p.chunk_pk
+        "#,
+    )
+    .bind(departed)
+    .execute(&mut **tx)
+    .await
+    .context("update_worker_set: promote orphaned drains")?;
+    timer.stmt(res.rows_affected());
+    Ok(())
+}
+
 /// Delete workers inactive for longer than `gc_ticks`.
 pub(super) async fn gc_inactive(
     tx: &mut Transaction<'_, Postgres>,

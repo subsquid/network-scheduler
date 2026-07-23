@@ -85,6 +85,8 @@ impl<D: SimStorage> IterativeModelStateMachine for FloodModel<D> {
                     chunk_cap: None,
                     datasets: sim_datasets(),
                     confirm_threshold_pct: 100,
+                    // The scripted flood has no worker churn, so retention never applies.
+                    gc_ticks: 0,
                 },
             )
             .boxed()

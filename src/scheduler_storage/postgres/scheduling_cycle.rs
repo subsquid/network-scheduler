@@ -1,7 +1,7 @@
 //! Phase helpers for [`PostgresStorage::run_scheduling_cycle`], run inside the
 //! cycle's transaction, plus the post-commit [`build_worker_assignment`] read.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 
 use anyhow::{Context, Result};
@@ -15,8 +15,8 @@ use sqlx::{Postgres, Transaction};
 use crate::metrics::{PhaseTimer, Timer};
 use crate::scheduler_storage::algorithm::CurrentPlacement;
 use crate::scheduler_storage::{
-    AlgoChunk, AssignmentId, AssignmentWorker, ChunkPk, WorkerAssignment, WorkerAssignmentChunk,
-    WorkerPk,
+    AlgoChunk, AssignmentId, AssignmentWorker, ChunkPk, SchemaId, WorkerAssignment,
+    WorkerAssignmentChunk, WorkerPk,
 };
 use crate::types::Worker;
 
@@ -139,9 +139,13 @@ pub(super) struct ActiveChunks {
     pub(super) for_algo: Vec<(ChunkPk, AlgoChunk)>,
     /// ideal ∪ stale; entries only for placed chunks.
     pub(super) current_placement: CurrentPlacement,
+    /// ideal alone
+    pub(super) committed_placement: CurrentPlacement,
     /// Full-column decode of the active rows, reused by the post-commit
     /// [`build_worker_assignment`] so it needn't re-read the chunks; shares `for_algo`'s `Arc`s.
     pub(super) published: FxHashMap<ChunkPk, WorkerAssignmentChunk>,
+    /// schema_ids of every chunk that has entered a worker assignment and is not yet tombstoned (ADR 0002)
+    pub(super) bundle_schema_ids: BTreeSet<SchemaId>,
 }
 
 /// Reads every active chunk — registered, and neither `rejected` nor removed (tombstoned) — spanning
@@ -157,6 +161,10 @@ pub(super) async fn fetch_active_chunks_with_placement(
         SELECT c.chunk_pk, d.name AS dataset_name, c.chunk_id, c.size,
                c.schema_id, c.tables_present,
                c.first_block, c.last_block_delta,
+               (s.applied_at_portal_assignment_id IS NOT NULL
+                AND s.dropped_at_portal_assignment_id IS NULL) AS is_portal_visible,
+               (s.applied_at_worker_assignment_id IS NOT NULL) AS entered_worker_assignment,
+               i.worker_ids AS ideal_worker_ids,
                {PLACEMENT_MERGE}
         FROM chunks c
         JOIN datasets d ON d.id = c.dataset_id
@@ -174,7 +182,9 @@ pub(super) async fn fetch_active_chunks_with_placement(
     let mut out = ActiveChunks {
         for_algo: Vec::new(),
         current_placement: CurrentPlacement::default(),
+        committed_placement: CurrentPlacement::default(),
         published: FxHashMap::default(),
+        bundle_schema_ids: BTreeSet::new(),
     };
     let mut count = 0u64;
     while let Some(mut row) = stream
@@ -187,8 +197,15 @@ pub(super) async fn fetch_active_chunks_with_placement(
         if let Some(holders) = row.worker_ids.take() {
             out.current_placement.insert(pk, holders);
         }
+        if let Some(committed) = row.ideal_worker_ids.take() {
+            out.committed_placement.insert(pk, committed);
+        }
         let chunk = chunk_from_row(row.chunk, dataset);
-        out.for_algo.push((pk, AlgoChunk::from(&chunk)));
+        out.for_algo
+            .push((pk, AlgoChunk::new(&chunk, row.is_portal_visible)));
+        if row.entered_worker_assignment {
+            out.bundle_schema_ids.insert(chunk.schema_id);
+        }
         out.published.insert(pk, chunk);
         count += 1;
     }
@@ -207,8 +224,8 @@ pub(super) async fn fetch_workers(tx: &mut Transaction<'_, Postgres>) -> Result<
     Ok(rows)
 }
 
-/// Apply all four post-write deltas and promote the new ideal as a single simple-query batch — one
-/// round-trip instead of eight. The statements run sequentially inside the cycle transaction (each
+/// Apply the post-write deltas and promote the new ideal as a single simple-query batch — one
+/// round-trip instead of one per statement. The statements run sequentially inside the cycle transaction (each
 /// sees the previous one's effects, exactly as when they were separate calls), and the swap is
 /// textually last so the diff/stale statements still read the live (pre-swap) ideal. The phases are
 /// mutually independent — disjoint rows, different target tables — so batching them changes nothing
@@ -220,9 +237,17 @@ pub(super) async fn fetch_workers(tx: &mut Transaction<'_, Postgres>) -> Result<
 pub(super) async fn apply_deltas_and_swap(
     tx: &mut Transaction<'_, Postgres>,
     new_wa_id: AssignmentId,
+    evicted: &[(ChunkPk, WorkerPk)],
 ) -> Result<()> {
     let mut timer = PhaseTimer::new("run_scheduling_cycle:apply_deltas_and_swap");
-    let sql = SQL_DELTAS_AND_SWAP.replace("$WA", &new_wa_id.to_string());
+    // Integer surrogate pks we mint/own — literal substitution is as safe as `$WA`. Empty `evicted`
+    // yields `'{}'`, a valid empty array, so the eviction DELETE is a no-op and always present.
+    let evicted_chunks = evicted.iter().map(|(c, _)| c.0).format(",").to_string();
+    let evicted_workers = evicted.iter().map(|(_, w)| w.0).format(",").to_string();
+    let sql = SQL_DELTAS_AND_SWAP
+        .replace("$WA", &new_wa_id.to_string())
+        .replace("$EVICTED_CHUNKS", &evicted_chunks)
+        .replace("$EVICTED_WORKERS", &evicted_workers);
     let res = sqlx::raw_sql(sqlx::AssertSqlSafe(sql))
         .execute(&mut **tx)
         .await
@@ -232,18 +257,24 @@ pub(super) async fn apply_deltas_and_swap(
 }
 
 /// The batch run by [`apply_deltas_and_swap`], one round-trip via the simple query protocol. `$WA`
-/// is the new worker-assignment id, substituted before execution. Sections, in execution order:
-///   1. Mint superseded stale: holders the future ideal drops that still hold a draining copy —
-///      known workers only (a GC'd worker holds nothing, and its stale row would break the FK), and
-///      not chunks mid portal-drop. `DO NOTHING` keeps any pre-existing stale row.
-///   2. Record routing diffs in one FULL JOIN pass (both PKs merge-join): chunks whose holder set
-///      changed or entered (emit future holders) or were dropped (emit `'{}'` via the COALESCE).
-///      Canonical arrays make `IS DISTINCT FROM` an exact set test, and it also covers the
-///      one-sided rows: a NULL side is distinct from any holder set.
-///   3. Resolve flip-flops: a pair back in the new ideal is no longer stale.
-///   4. Stamp entered chunks: first-touch the assignment id onto chunks new to the ideal.
-///   5. Swap: truncate the old ideal, then 3-way rename so the future twin becomes live and the old
-///      one is left empty for the next cycle.
+/// is the new worker-assignment id, substituted before execution.
+///
+/// One cycle's placement change has to land as a unit: every copy the new ideal abandons must keep
+/// serving through its grace window, every deletion the reconcile decided must actually free its
+/// bytes, and portals must learn exactly what moved. Sections, in execution order:
+///   1. Start the grace window for abandoned copies (Invariant 4): holders the new ideal drops
+///      keep serving as drains. Active workers only — a departed worker's copies left with it —
+///      and not chunks mid whole-chunk drop, which runs on its own clock.
+///   2. Make floor preemption real: a reclaimed copy must free its bytes *now* — deleting instead
+///      of draining is what actually produces the room the starved floor was promised (ADR 0001).
+///   3. Tell portals what moved: one diff row per chunk whose holder set changed, appeared, or
+///      vanished, so the routing can replay the change once workers confirm the assignment.
+///   4. Cancel self-resolved removals: a pair the new ideal takes back was never really leaving,
+///      so its drain (and the clock on it) must not outlive the decision.
+///   5. Start the lifecycle of newcomers: a chunk's first appearance in an ideal is the anchor
+///      that later gates its portal promotion and schema-bundle membership (ADR 0002).
+///   6. Make the new ideal live: swap the staged twin in, leaving the old table empty and ready
+///      to stage the next cycle.
 const SQL_DELTAS_AND_SWAP: &str = r#"
 INSERT INTO sched_stale_mappings (chunk_pk, worker_id, superseded_at_worker_assignment_id)
 SELECT c.chunk_pk, u.worker_id, $WA
@@ -251,13 +282,20 @@ FROM sched_ideal_chunk_workers c
 LEFT JOIN sched_future_ideal_chunk_workers f ON f.chunk_pk = c.chunk_pk
 CROSS JOIN LATERAL UNNEST(c.worker_ids) AS u(worker_id)
 WHERE u.worker_id <> ALL (COALESCE(f.worker_ids, '{}'::int[]))
-  AND EXISTS (SELECT 1 FROM sched_workers sw WHERE sw.id = u.worker_id)
+  AND EXISTS (
+      SELECT 1 FROM sched_workers sw
+      WHERE sw.id = u.worker_id AND sw.inactive_since IS NULL
+  )
   AND NOT EXISTS (
       SELECT 1 FROM sched_chunk_metadata m
       WHERE m.chunk_pk = c.chunk_pk
         AND m.dropped_at_portal_assignment_id IS NOT NULL
   )
 ON CONFLICT (chunk_pk, worker_id) DO NOTHING;
+
+DELETE FROM sched_stale_mappings s
+USING unnest('{$EVICTED_CHUNKS}'::bigint[], '{$EVICTED_WORKERS}'::int[]) AS ev(chunk_pk, worker_id)
+WHERE s.chunk_pk = ev.chunk_pk AND s.worker_id = ev.worker_id;
 
 INSERT INTO sched_worker_assignment_diffs (worker_assignment_id, chunk_pk, worker_ids)
 SELECT $WA, COALESCE(f.chunk_pk, c.chunk_pk), COALESCE(f.worker_ids, '{}'::int[])
@@ -354,6 +392,10 @@ pub(super) async fn write_future_ideal(
 
 /// Decoded workers: `published` is what the assignment exposes; `for_algo` is what the scheduling
 /// algorithm consumes (keyed the same, paired with the parsed `Worker`).
+///
+/// Departed workers are left out of `for_algo` — absence from the active set means a full
+/// detection window without a sighting, so they are not capacity. They stay in `published`, which
+/// is the assignment's metadata lookup.
 pub(super) struct DecodedWorkers {
     pub(super) published: BTreeMap<WorkerPk, AssignmentWorker>,
     pub(super) for_algo: Vec<(WorkerPk, Worker)>,
@@ -365,20 +407,22 @@ pub(super) fn decode_workers(worker_rows: &[WorkerRow]) -> Result<DecodedWorkers
     let mut for_algo: Vec<(WorkerPk, Worker)> = Vec::with_capacity(worker_rows.len());
     for row in worker_rows {
         let (id, worker) = assignment_worker_from_row(row)?;
-        let version = row
-            .version
-            .as_deref()
-            .map(Version::parse)
-            .transpose()
-            .with_context(|| format!("invalid version for worker {}", row.id))?;
-        for_algo.push((
-            id,
-            Worker {
-                id: worker.peer_id,
-                status: worker.status,
-                version,
-            },
-        ));
+        if row.inactive_since.is_none() {
+            let version = row
+                .version
+                .as_deref()
+                .map(Version::parse)
+                .transpose()
+                .with_context(|| format!("invalid version for worker {}", row.id))?;
+            for_algo.push((
+                id,
+                Worker {
+                    id: worker.peer_id,
+                    status: worker.status,
+                    version,
+                },
+            ));
+        }
         published.insert(id, worker);
     }
     Ok(DecodedWorkers {
