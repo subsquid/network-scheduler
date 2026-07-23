@@ -31,7 +31,7 @@ fn active_chunks_feed_in_dataset_name_then_block_order() {
 
     let feed: Vec<(String, u64)> = storage.with_conn(async |conn| {
         let mut tx = conn.begin().await.expect("begin");
-        let active = scheduling_cycle::fetch_active_chunks_with_placement(&mut tx)
+        let active = scheduling_cycle::fetch_active_chunks_with_placement(&mut tx, 0)
             .await
             .expect("fetch active chunks");
         active

@@ -56,6 +56,9 @@ pub struct PostgresStorage {
     rt: tokio::runtime::Runtime,
     conn: std::cell::RefCell<PgConnection>,
     batch_size: usize,
+    /// Last cycle's active-chunk count — the capacity hint for the next cycle's decode maps.
+    /// Exact to within one cycle's churn; 0 before the first cycle (plain map growth).
+    active_chunk_hint: usize,
 }
 
 impl PostgresStorage {
@@ -98,6 +101,7 @@ impl PostgresStorage {
             rt,
             conn: std::cell::RefCell::new(conn),
             batch_size: DEFAULT_BATCH_SIZE,
+            active_chunk_hint: 0,
         })
     }
 
@@ -337,7 +341,8 @@ impl SchedulerStorage for PostgresStorage {
         use scheduling_cycle as phase;
 
         let batch_size = self.batch_size;
-        self.with_conn(async move |conn| {
+        let capacity_hint = self.active_chunk_hint;
+        let (assignment, bundle, active_count) = self.with_conn(async move |conn| {
             let _timer = Timer::new("run_scheduling_cycle");
             // Phase A — clock-driven GC, committed up front so it survives a Phase B
             // shortage rollback; otherwise stale never drains under a sustained shortage.
@@ -367,7 +372,8 @@ impl SchedulerStorage for PostgresStorage {
                 confirmed_routing,
                 published: published_chunks,
                 bundle_schema_ids,
-            } = phase::fetch_active_chunks_with_placement(&mut tx).await?;
+            } = phase::fetch_active_chunks_with_placement(&mut tx, capacity_hint).await?;
+            let active_count = chunks_for_algo.len();
 
             let worker_rows = phase::fetch_workers(&mut tx).await?;
             let phase::DecodedWorkers {
@@ -425,8 +431,10 @@ impl SchedulerStorage for PostgresStorage {
             let schema_ids: Vec<SchemaId> = schema_ids.into_iter().collect();
             let bundle =
                 SchemaBundle::from_schemas(schema::load_schemas(conn, Some(&schema_ids)).await?);
-            Ok::<_, StorageError>((wa, bundle))
-        })
+            Ok::<_, StorageError>((wa, bundle, active_count))
+        })?;
+        self.active_chunk_hint = active_count;
+        Ok((assignment, bundle))
     }
 
     fn confirm_worker_assignment(

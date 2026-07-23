@@ -154,8 +154,11 @@ pub(super) struct ActiveChunks {
 /// Reads every active chunk — registered, and neither `rejected` nor removed (tombstoned) — spanning
 /// the lifecycle from **pending** (registered but not yet placed) through **marked-for-removal**.
 /// Pending chunks are included so the algorithm can place them; they carry no `current_placement` entry.
+/// `capacity_hint` pre-sizes the 6M+-entry decode maps; the caller passes the previous cycle's
+/// active-chunk count (exact to within one cycle's churn, 0 on the first cycle — plain growth).
 pub(super) async fn fetch_active_chunks_with_placement(
     tx: &mut Transaction<'_, Postgres>,
+    capacity_hint: usize,
 ) -> Result<ActiveChunks> {
     let mut timer = PhaseTimer::new("run_scheduling_cycle:fetch_active_chunks_with_placement");
 
@@ -177,17 +180,6 @@ pub(super) async fn fetch_active_chunks_with_placement(
         name_by_id.insert(id, name.clone());
         rank_of.insert(name, rank as u32);
     }
-
-    // Planner estimate of the chunk count, to pre-size the 6M+-entry maps (best-effort: a stale
-    // estimate only costs some rehash growth, exactly the status quo).
-    let estimated_rows: i64 = sqlx::query_scalar(
-        "SELECT GREATEST(reltuples, 0)::BIGINT FROM pg_class WHERE relname = 'chunks'",
-    )
-    .fetch_optional(&mut **tx)
-    .await
-    .context("run_scheduling_cycle: estimate chunk count")?
-    .unwrap_or(0);
-    let capacity = usize::try_from(estimated_rows).unwrap_or(0);
 
     let sql = format!(
         r#"
@@ -214,13 +206,14 @@ pub(super) async fn fetch_active_chunks_with_placement(
     );
     let mut stream = sqlx::query_as::<_, ActiveChunkRow>(sqlx::AssertSqlSafe(sql)).fetch(&mut **tx);
 
-    let with_capacity = || CurrentPlacement::with_capacity_and_hasher(capacity, Default::default());
+    let with_capacity =
+        || CurrentPlacement::with_capacity_and_hasher(capacity_hint, Default::default());
     let mut out = ActiveChunks {
-        for_algo: Vec::with_capacity(capacity),
+        for_algo: Vec::with_capacity(capacity_hint),
         current_placement: with_capacity(),
         committed_placement: with_capacity(),
         confirmed_routing: with_capacity(),
-        published: FxHashMap::with_capacity_and_hasher(capacity, Default::default()),
+        published: FxHashMap::with_capacity_and_hasher(capacity_hint, Default::default()),
         bundle_schema_ids: BTreeSet::new(),
     };
     let mut count = 0u64;
