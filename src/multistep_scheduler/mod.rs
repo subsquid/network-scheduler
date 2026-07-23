@@ -5,7 +5,9 @@
 //! - **floor** — a chunk's `min_replication` mandatory copies;
 //! - **bonus** — weight-earned extras above the floor (up to its weight cap), shed first when room is tight;
 //! - **ideal** — placement on hypothetically-empty workers;
-//! - **held** — copies physically on a worker now (free to keep).
+//! - **held** — copies the current assignment keeps on a worker. Workers apply assignments
+//!   asynchronously, so a held copy is *instructed*, not necessarily downloaded yet; retaining
+//!   one costs no new bytes.
 //! Draining copies are not distinguished from other held copies — that split lives in the caller.
 //!
 //! Stage 1 ([`ideal_chunk_workers`]) computes the ideal. Stage 2 ([`Reconcile`]) re-walks the same
@@ -53,8 +55,10 @@ pub struct ScheduledChunk<'a> {
 ///
 /// The three placement views are per-chunk lists of **positions into `workers`**; the caller owns
 /// the PeerId↔position mapping:
-/// - `current[i]` — who physically holds chunk `i` now, draining copies included. Leave out copies
-///   on departed workers; they count as missing.
+/// - `current[i]` — the copies the current plan keeps for chunk `i` (assignment rows, draining
+///   ones included). Workers apply assignments asynchronously, so these are *instructed* copies,
+///   not proven downloads — the only possession proof is `routed`. Leave out copies on departed
+///   workers; they count as missing.
 /// - `committed[i]` — the previous cycle's committed ideal. Eviction never takes a donor below
 ///   `min(min_replication, |committed|)` of these copies — its durability floor.
 /// - `routed[i]` — who the confirmed routing still points at. Orders eviction victims
@@ -625,7 +629,8 @@ struct Reconcile<'a> {
     chunk_workers: Vec<Vec<WorkerIndex>>,
     /// Stage-1 ideal worker list per chunk (preference + convergence target).
     ideal: &'a [Vec<WorkerIndex>],
-    /// Current holders per chunk, in input order; draining copies included.
+    /// Copies the current plan keeps per chunk (assignment rows, draining included) — instructed,
+    /// not necessarily downloaded yet.
     held: &'a [Vec<WorkerIndex>],
     /// Pre-cycle committed-ideal holders per chunk — the durability floor eviction must not breach.
     /// The exact set `step_safety` retention measures against, unlike the drain-and-download-polluted
@@ -1014,7 +1019,8 @@ impl<'a> Reconcile<'a> {
         }
     }
 
-    /// Whether worker `w` physically holds chunk `chunk_index` right now.
+    /// Whether the current plan keeps chunk `chunk_index` on worker `w` (its bytes are already
+    /// charged; possession itself is not guaranteed — workers apply asynchronously).
     fn is_held(&self, chunk_index: usize, w: WorkerIndex) -> bool {
         self.held[chunk_index].contains(&w)
     }
