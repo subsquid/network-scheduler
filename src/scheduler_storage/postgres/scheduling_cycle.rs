@@ -257,22 +257,24 @@ pub(super) async fn apply_deltas_and_swap(
 }
 
 /// The batch run by [`apply_deltas_and_swap`], one round-trip via the simple query protocol. `$WA`
-/// is the new worker-assignment id, substituted before execution. Sections, in execution order:
-///   1. Mint superseded stale: holders the future ideal drops that still hold a draining copy —
-///      *active* workers only (a departed worker serves nothing, so its copies vanish rather than
-///      drain), and not chunks mid portal-drop. `DO NOTHING` keeps any pre-existing stale row.
-///   2. Delete floor-preemption evictions: draining copies the reconcile evicted this cycle to
-///      floor a holderless chunk. Deleted, not drained — removes both a copy section 1 just
-///      re-staled (was in the old ideal) and the common case, a pre-existing stale row the mint
-///      never touched.
-///   3. Record routing diffs in one FULL JOIN pass (both PKs merge-join): chunks whose holder set
-///      changed or entered (emit future holders) or were dropped (emit `'{}'` via the COALESCE).
-///      Canonical arrays make `IS DISTINCT FROM` an exact set test, and it also covers the
-///      one-sided rows: a NULL side is distinct from any holder set.
-///   4. Resolve flip-flops: a pair back in the new ideal is no longer stale.
-///   5. Stamp entered chunks: first-touch the assignment id onto chunks new to the ideal.
-///   6. Swap: truncate the old ideal, then 3-way rename so the future twin becomes live and the old
-///      one is left empty for the next cycle.
+/// is the new worker-assignment id, substituted before execution.
+///
+/// One cycle's placement change has to land as a unit: every copy the new ideal abandons must keep
+/// serving through its grace window, every deletion the reconcile decided must actually free its
+/// bytes, and portals must learn exactly what moved. Sections, in execution order:
+///   1. Start the grace window for abandoned copies (Invariant 4): holders the new ideal drops
+///      keep serving as drains. Active workers only — a departed worker's copies left with it —
+///      and not chunks mid whole-chunk drop, which runs on its own clock.
+///   2. Make floor preemption real: a reclaimed copy must free its bytes *now* — deleting instead
+///      of draining is what actually produces the room the starved floor was promised (ADR 0001).
+///   3. Tell portals what moved: one diff row per chunk whose holder set changed, appeared, or
+///      vanished, so the routing can replay the change once workers confirm the assignment.
+///   4. Cancel self-resolved removals: a pair the new ideal takes back was never really leaving,
+///      so its drain (and the clock on it) must not outlive the decision.
+///   5. Start the lifecycle of newcomers: a chunk's first appearance in an ideal is the anchor
+///      that later gates its portal promotion and schema-bundle membership (ADR 0002).
+///   6. Make the new ideal live: swap the staged twin in, leaving the old table empty and ready
+///      to stage the next cycle.
 const SQL_DELTAS_AND_SWAP: &str = r#"
 INSERT INTO sched_stale_mappings (chunk_pk, worker_id, superseded_at_worker_assignment_id)
 SELECT c.chunk_pk, u.worker_id, $WA
