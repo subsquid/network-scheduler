@@ -6,13 +6,10 @@
 //!
 //! `Tick` values are logical integer timestamps stored in `BIGINT` columns;
 //! `m_ticks`/`gc_ticks` are raw tick counts used in integer arithmetic.
-
-// `register_correction`; also enabled by `pg-testkit` for offline tools (reshuffle-sim).
 #[cfg(any(test, feature = "pg-testkit"))]
 mod correction;
 mod debug;
 pub mod explain;
-// Not yet wired into a production caller; remove once the scheduler loop uses it.
 mod nonoverlap;
 mod registration;
 mod rows;
