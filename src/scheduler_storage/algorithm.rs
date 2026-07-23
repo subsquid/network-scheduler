@@ -1,6 +1,6 @@
 //! Pluggable scheduling algorithm for the scheduling cycle. [`DefaultSchedulingAlgorithm`]
 //! delegates to the single-step [`crate::scheduling`]; [`MultistepAlgorithm`] delegates to the
-//! placement-aware [`crate::multistep_scheduler`]. Tests can substitute a mock.
+//! placement-aware [`crate::multistep_scheduler`]
 
 use crate::cli::DatasetsConfig;
 use crate::multistep_scheduler::{
@@ -20,8 +20,6 @@ use std::collections::{BTreeMap, HashMap};
 use std::ops::RangeInclusive;
 use std::sync::Arc;
 
-/// Lets `(ChunkPk, AlgoChunk)` pairs flow through [`WeightStrategy::prepare`]: it weights the chunk
-/// but returns the whole pair, so the pk rides along with each result instead of being re-associated.
 impl SchedulingChunk for (ChunkPk, AlgoChunk) {
     fn dataset(&self) -> &Arc<String> {
         &self.1.dataset
@@ -41,39 +39,22 @@ impl SchedulingChunk for (ChunkPk, AlgoChunk) {
 /// form the stored ideal keeps for next cycle's `IS DISTINCT FROM` diff.
 pub type IdealMapping = Vec<(ChunkPk, Vec<WorkerPk>)>;
 
-/// Per-chunk holders physically on disk now (`ideal ∪ stale`), keyed by the i64 surrogate pk.
-/// `FxHashMap`: at up to 10M entries, built and probed once per chunk, SipHash dominates the cost.
+/// Per-chunk holders (`ideal ∪ stale`), keyed by the i64 surrogate pk.
 pub type CurrentPlacement = FxHashMap<ChunkPk, Vec<WorkerPk>>;
 
-/// A scheduling run's output: the ideal placement and the chosen replication factor per chunk weight.
 pub struct ScheduleOutput {
     pub mapping: IdealMapping,
     pub replication_by_weight: BTreeMap<u16, u16>,
-    /// `(chunk, worker)` pairs the reconcile deleted this cycle to free room for a chunk that
-    /// could not otherwise reach `min_replication` (as many copies as it takes — chunk sizes vary).
-    ///
-    /// These must be deleted outright, not drained: storage turns any copy dropped from the ideal
-    /// into a `stale` mapping that serves reads for M ticks, and cannot tell an eviction from an
-    /// ordinary reshuffle drop by the ideal diff alone — an evicted copy left to drain would occupy
-    /// the worker alongside the copy it made room for. Empty for the placement-blind scheduler,
-    /// which never evicts.
-    ///
-    /// Would be unneeded if the algorithm returned the full placement (ideal plus retained drains),
-    /// making eviction implicit in a pair's absence — see issue #110.
+    /// (chunk, worker) pairs that were marked for deletion immediatly by the algorithm to
+    /// compensate for chunks that ended up below min_replication. (may happen on the worker departure)
     pub evicted: Vec<(ChunkPk, WorkerPk)>,
 }
 
 /// Computes the ideal chunk → workers mapping for one scheduling cycle.
 ///
-/// `current_placement` is the per-chunk holder set physically on disk now
-/// (`ideal ∪ stale`). Placement-aware algorithms reconcile against it (held
-/// copies are free to keep but occupy footprint); placement-blind ones ignore it.
-///
-/// `committed` and `confirmed_routing` split out two roles the flattened `current_placement` mixes
-/// (see [`crate::multistep_scheduler::schedule`]): `committed` is the pre-cycle *committed ideal*
-/// (the durability floor eviction must not breach — hard), and `confirmed_routing` is the confirmed
-/// routing (best-effort: it orders eviction victims but never blocks one). Placement-blind algorithms
-/// ignore both.
+/// `current_placement` is the per-chunk holder (`ideal ∪ stale`)
+/// `committed` is the previous ideal placement (without drained copies)
+/// `confirmed_routing` is the confirmed portal routing
 pub trait SchedulingAlgorithm {
     type Config;
 
@@ -161,9 +142,7 @@ impl SchedulingAlgorithm for DefaultSchedulingAlgorithm {
     }
 }
 
-/// Placement-aware implementation: wraps [`crate::multistep_scheduler::schedule`], mapping storage
-/// surrogate ids to the scheduler's positions. It reconciles against `current_placement` (held and
-/// draining copies count as footprint) and takes chunk weights from the injected [`WeightStrategy`].
+/// Placement-aware implementation: wraps [`crate::multistep_scheduler::schedule`]
 pub struct MultistepAlgorithm<S>
 where
     S: WeightStrategy + Sync + Send,
@@ -217,19 +196,14 @@ where
             .map(|(i, w)| (w.id, i))
             .collect();
 
-        // `prepare` weights the chunks — dropping any it doesn't cover, possibly reordering — and
-        // carries each chunk's pk through in the result tuple. One pass over its output builds the
-        // scheduler input alongside the pk and current-placement vectors it must stay index-aligned
-        // with: `scheduled[i]`, `scheduled_pks[i]`, and `current[i]` all describe the same chunk. A
-        // holder whose worker is absent from this fleet is dropped.
+        // `prepare` weights the chunks (dropping uncovered ones, possibly reordering) and carries
+        // each pk through. One pass builds the index-aligned `scheduled[i]`/`scheduled_pks[i]`/
+        // `current[i]`, all describing the same chunk.
         let prepared = self.weight_strategy.prepare(chunks);
 
         let mut scheduled: Vec<MultistepScheduledChunk<'_>> = Vec::with_capacity(prepared.len());
         let mut scheduled_pks: Vec<ChunkPk> = Vec::with_capacity(prepared.len());
         let mut current: Vec<Vec<WorkerIndex>> = Vec::with_capacity(prepared.len());
-        // `committed` (durability floor) and `routed` (confirmed routing) stay index-aligned with
-        // `current`/`scheduled_pks`, built from the same `positions` mapping so a departed holder is
-        // dropped identically in all three.
         let mut committed_pos: Vec<Vec<WorkerIndex>> = Vec::with_capacity(prepared.len());
         let mut routed_pos: Vec<Vec<WorkerIndex>> = Vec::with_capacity(prepared.len());
         let positions = |holders: Option<&Vec<WorkerPk>>| -> Vec<WorkerIndex> {
@@ -291,10 +265,8 @@ where
     }
 }
 
-/// Sort by `PeerId` so the worker order is stable across cycles.
-/// The cache keys on this order *and* indexes its rings by worker position, so reusing cached rings
-/// needs the same order — a different one would point those positions at the wrong peers. This only
-/// affects the cache-hit rate, never the placement.
+/// Stable `PeerId` order so the [`WorkerRingCache`] reuses its rings across cycles instead of
+/// rebuilding (it rebuilds whenever the id order changes). Cache-hit rate only, never placement.
 fn sorted_by_peer_id(mut workers: Vec<(WorkerPk, Worker)>) -> Vec<(WorkerPk, Worker)> {
     workers.sort_unstable_by_key(|(_, w)| w.id);
     workers
