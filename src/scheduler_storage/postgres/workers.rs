@@ -108,16 +108,21 @@ pub(super) async fn delete_stale_mappings(
     Ok(())
 }
 
-/// Re-promote drains whose handoff targets all departed. A departure can make the confirmation
-/// of a handoff vacuous: the quorum shrank, so the watermark may pass an assignment its
-/// recipients never applied (docs/mvcc-storage.md, Invariant 2 at pair granularity). If a
-/// chunk's committed-ideal holders are now all departed, its active stale holders return to the
-/// committed ideal — the superseded copy becomes a first-class holder again before Invariant 4's
-/// clock can destroy the only fetched copy. Excess copies shed as ordinary drains in later
-/// cycles; the departed ideal rows are left for the next cycle's diff (the stale mint already
-/// skips inactive workers). Runs after [`mark_departed`] and [`delete_stale_mappings`], so the
-/// orphan predicate sees this sync's departures and every surviving stale row names an active
-/// worker.
+/// Give a drain back its committed-holder status when every worker it was handing off to has
+/// departed.
+///
+/// Why: confirmation is a quorum of *active* workers. When a recipient departs, the quorum
+/// stops waiting for it, so the handoff assignment can count as "confirmed" even though the
+/// recipient never downloaded anything (a vacuous confirmation — Invariant 2,
+/// docs/mvcc-storage.md). The drain's expiry clock trusts that confirmation and would delete
+/// the fleet's last real copy. Promoting the drain holder back to committed takes it off the
+/// expiry clock and puts it under the retention floor.
+///
+/// Aftermath needs no special handling: excess copies become ordinary drains in later cycles,
+/// and the departed workers' ideal rows fall out with the next cycle's diff.
+///
+/// Must run after [`mark_departed`] (this sync's departures are visible) and
+/// [`delete_stale_mappings`] (every remaining stale row belongs to an active worker).
 pub(super) async fn promote_orphaned_drains(
     tx: &mut Transaction<'_, Postgres>,
     departed: &[WorkerPk],

@@ -890,14 +890,13 @@ impl SchedulerStorage for InMemoryStorage {
             self.sched_stale_mappings
                 .retain(|(_, worker_id), _| !departed_set.contains(worker_id));
 
-            // A departure can make the confirmation of a handoff vacuous: the quorum shrank, so
-            // the watermark may pass an assignment its recipients never applied
-            // (docs/mvcc-storage.md, Invariant 2 at pair granularity). If a chunk's
-            // committed-ideal holders are now all departed, re-promote its active stale holders
-            // to committed ideal — the superseded copy becomes a first-class holder again before
-            // Invariant 4's clock can destroy the only fetched copy. Excess copies shed as
-            // ordinary drains in later cycles; the departed ideal rows are left for the next
-            // cycle's diff (the stale mint already skips inactive workers).
+            // Give a drain back its committed-holder status when every worker it was handing
+            // off to has departed. Confirmation is a quorum of *active* workers, so a
+            // recipient's departure lets the handoff count as "confirmed" without any download
+            // (a vacuous confirmation — Invariant 2, docs/mvcc-storage.md); the drain's expiry
+            // clock would then delete the fleet's last real copy. Promotion takes the copy off
+            // the expiry clock and under the retention floor. Excess copies become ordinary
+            // drains in later cycles; departed ideal rows fall out with the next cycle's diff.
             let handoff_void: HashSet<ChunkPk> = self
                 .sched_ideal_chunk_workers
                 .iter()
