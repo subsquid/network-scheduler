@@ -139,16 +139,12 @@ pub(super) struct ActiveChunks {
     pub(super) for_algo: Vec<(ChunkPk, AlgoChunk)>,
     /// ideal ∪ stale; entries only for placed chunks.
     pub(super) current_placement: CurrentPlacement,
-    /// Committed ideal alone (no stale) — the eviction durability floor. Entries only for chunks
-    /// with a committed ideal row.
+    /// ideal alone
     pub(super) committed_placement: CurrentPlacement,
     /// Full-column decode of the active rows, reused by the post-commit
     /// [`build_worker_assignment`] so it needn't re-read the chunks; shares `for_algo`'s `Arc`s.
     pub(super) published: FxHashMap<ChunkPk, WorkerAssignmentChunk>,
-    /// schema_ids of every chunk that has entered a worker assignment and is not yet tombstoned —
-    /// unioned into the frozen bundle so a chunk still routable (even after the latest assignment
-    /// dropped it, off an earlier confirmed entry) keeps its schema (ADR 0002). Held here so the
-    /// post-commit bundle build needn't re-read it.
+    /// schema_ids of every chunk that has entered a worker assignment and is not yet tombstoned (ADR 0002)
     pub(super) bundle_schema_ids: BTreeSet<SchemaId>,
 }
 
