@@ -978,387 +978,35 @@ fn shortage_schema_bundle_misses_in_flight_chunk_case() -> (SimConfig, Vec<Actio
         gc_ticks: NEVER_GC_TICKS,
         ..base_config()
     };
+    let nc = |key: u64, weight: u16, dataset: &str| {
+        new_chunk((mint_key(key), CHUNK_SIZE, weight, format!("s3://{dataset}")))
+    };
+    // One `AddChunks` batch per line (rustfmt would explode each onto its own line); the case is a
+    // frozen delta-debugged fixture, so hand-packing costs no future churn.
+    #[rustfmt::skip]
     let actions = vec![
-        Action::AddChunks(vec![
-            new_chunk((
-                "00000000000000062822".into(),
-                1048576,
-                4,
-                "s3://sim-1".into(),
-            )),
-            new_chunk((
-                "00000000000000008667".into(),
-                1048576,
-                1,
-                "s3://sim-1".into(),
-            )),
-            new_chunk((
-                "00000000000000050543".into(),
-                1048576,
-                12,
-                "s3://sim-2".into(),
-            )),
-        ]),
-        Action::AddChunks(vec![
-            new_chunk((
-                "00000000000000006631".into(),
-                1048576,
-                1,
-                "s3://sim-2".into(),
-            )),
-            new_chunk((
-                "00000000000000005017".into(),
-                1048576,
-                4,
-                "s3://sim-0".into(),
-            )),
-            new_chunk((
-                "00000000000000057041".into(),
-                1048576,
-                1,
-                "s3://sim-0".into(),
-            )),
-            new_chunk((
-                "00000000000000005596".into(),
-                1048576,
-                12,
-                "s3://sim-2".into(),
-            )),
-        ]),
+        Action::AddChunks(vec![nc(62822, 4, "sim-1"), nc(8667, 1, "sim-1"), nc(50543, 12, "sim-2")]),
+        Action::AddChunks(vec![nc(6631, 1, "sim-2"), nc(5017, 4, "sim-0"), nc(57041, 1, "sim-0"), nc(5596, 12, "sim-2")]),
         Action::WorkerJoined(9),
         Action::WorkerJoined(11),
-        Action::AddChunks(vec![
-            new_chunk((
-                "00000000000000050796".into(),
-                1048576,
-                1,
-                "s3://sim-2".into(),
-            )),
-            new_chunk((
-                "00000000000000034259".into(),
-                1048576,
-                12,
-                "s3://sim-2".into(),
-            )),
-            new_chunk((
-                "00000000000000001758".into(),
-                1048576,
-                1,
-                "s3://sim-2".into(),
-            )),
-            new_chunk((
-                "00000000000000037011".into(),
-                1048576,
-                1,
-                "s3://sim-2".into(),
-            )),
-            new_chunk((
-                "00000000000000064296".into(),
-                1048576,
-                12,
-                "s3://sim-0".into(),
-            )),
-        ]),
-        Action::AddChunks(vec![
-            new_chunk((
-                "00000000000000056401".into(),
-                1048576,
-                12,
-                "s3://sim-1".into(),
-            )),
-            new_chunk((
-                "00000000000000046547".into(),
-                1048576,
-                12,
-                "s3://sim-2".into(),
-            )),
-            new_chunk((
-                "00000000000000038358".into(),
-                1048576,
-                1,
-                "s3://sim-0".into(),
-            )),
-            new_chunk((
-                "00000000000000025072".into(),
-                1048576,
-                12,
-                "s3://sim-2".into(),
-            )),
-            new_chunk((
-                "00000000000000024018".into(),
-                1048576,
-                4,
-                "s3://sim-1".into(),
-            )),
-        ]),
-        Action::AddChunks(vec![
-            new_chunk((
-                "00000000000000015917".into(),
-                1048576,
-                4,
-                "s3://sim-2".into(),
-            )),
-            new_chunk((
-                "00000000000000043358".into(),
-                1048576,
-                1,
-                "s3://sim-1".into(),
-            )),
-            new_chunk((
-                "00000000000000058239".into(),
-                1048576,
-                1,
-                "s3://sim-0".into(),
-            )),
-            new_chunk((
-                "00000000000000017204".into(),
-                1048576,
-                1,
-                "s3://sim-2".into(),
-            )),
-            new_chunk((
-                "00000000000000000220".into(),
-                1048576,
-                12,
-                "s3://sim-0".into(),
-            )),
-        ]),
+        Action::AddChunks(vec![nc(50796, 1, "sim-2"), nc(34259, 12, "sim-2"), nc(1758, 1, "sim-2"), nc(37011, 1, "sim-2"), nc(64296, 12, "sim-0")]),
+        Action::AddChunks(vec![nc(56401, 12, "sim-1"), nc(46547, 12, "sim-2"), nc(38358, 1, "sim-0"), nc(25072, 12, "sim-2"), nc(24018, 4, "sim-1")]),
+        Action::AddChunks(vec![nc(15917, 4, "sim-2"), nc(43358, 1, "sim-1"), nc(58239, 1, "sim-0"), nc(17204, 1, "sim-2"), nc(220, 12, "sim-0")]),
         Action::WorkerJoined(10),
-        Action::AddChunks(vec![
-            new_chunk((
-                "00000000000000012800".into(),
-                1048576,
-                4,
-                "s3://sim-2".into(),
-            )),
-            new_chunk((
-                "00000000000000030433".into(),
-                1048576,
-                4,
-                "s3://sim-1".into(),
-            )),
-            new_chunk((
-                "00000000000000016078".into(),
-                1048576,
-                4,
-                "s3://sim-2".into(),
-            )),
-            new_chunk((
-                "00000000000000029109".into(),
-                1048576,
-                12,
-                "s3://sim-2".into(),
-            )),
-            new_chunk((
-                "00000000000000060512".into(),
-                1048576,
-                4,
-                "s3://sim-2".into(),
-            )),
-        ]),
-        Action::AddChunks(vec![
-            new_chunk((
-                "00000000000000031243".into(),
-                1048576,
-                1,
-                "s3://sim-2".into(),
-            )),
-            new_chunk((
-                "00000000000000031398".into(),
-                1048576,
-                12,
-                "s3://sim-0".into(),
-            )),
-            new_chunk((
-                "00000000000000024095".into(),
-                1048576,
-                12,
-                "s3://sim-1".into(),
-            )),
-            new_chunk((
-                "00000000000000061110".into(),
-                1048576,
-                12,
-                "s3://sim-1".into(),
-            )),
-        ]),
-        Action::AddChunks(vec![
-            new_chunk((
-                "00000000000000062076".into(),
-                1048576,
-                4,
-                "s3://sim-0".into(),
-            )),
-            new_chunk((
-                "00000000000000048527".into(),
-                1048576,
-                12,
-                "s3://sim-2".into(),
-            )),
-        ]),
-        Action::AddChunks(vec![
-            new_chunk((
-                "00000000000000059142".into(),
-                1048576,
-                12,
-                "s3://sim-2".into(),
-            )),
-            new_chunk((
-                "00000000000000017311".into(),
-                1048576,
-                1,
-                "s3://sim-1".into(),
-            )),
-            new_chunk((
-                "00000000000000040615".into(),
-                1048576,
-                1,
-                "s3://sim-2".into(),
-            )),
-            new_chunk((
-                "00000000000000003569".into(),
-                1048576,
-                1,
-                "s3://sim-0".into(),
-            )),
-            new_chunk((
-                "00000000000000047652".into(),
-                1048576,
-                4,
-                "s3://sim-1".into(),
-            )),
-        ]),
+        Action::AddChunks(vec![nc(12800, 4, "sim-2"), nc(30433, 4, "sim-1"), nc(16078, 4, "sim-2"), nc(29109, 12, "sim-2"), nc(60512, 4, "sim-2")]),
+        Action::AddChunks(vec![nc(31243, 1, "sim-2"), nc(31398, 12, "sim-0"), nc(24095, 12, "sim-1"), nc(61110, 12, "sim-1")]),
+        Action::AddChunks(vec![nc(62076, 4, "sim-0"), nc(48527, 12, "sim-2")]),
+        Action::AddChunks(vec![nc(59142, 12, "sim-2"), nc(17311, 1, "sim-1"), nc(40615, 1, "sim-2"), nc(3569, 1, "sim-0"), nc(47652, 4, "sim-1")]),
         Action::SetMinReplication(2),
-        Action::AddChunks(vec![new_chunk((
-            "00000000000000007424".into(),
-            1048576,
-            1,
-            "s3://sim-0".into(),
-        ))]),
-        Action::AddChunks(vec![
-            new_chunk((
-                "00000000000000055665".into(),
-                1048576,
-                12,
-                "s3://sim-2".into(),
-            )),
-            new_chunk((
-                "00000000000000005210".into(),
-                1048576,
-                12,
-                "s3://sim-2".into(),
-            )),
-        ]),
-        Action::AddChunks(vec![
-            new_chunk((
-                "00000000000000001122".into(),
-                1048576,
-                12,
-                "s3://sim-2".into(),
-            )),
-            new_chunk((
-                "00000000000000037710".into(),
-                1048576,
-                4,
-                "s3://sim-2".into(),
-            )),
-            new_chunk((
-                "00000000000000041327".into(),
-                1048576,
-                12,
-                "s3://sim-0".into(),
-            )),
-        ]),
-        Action::AddChunks(vec![
-            new_chunk((
-                "00000000000000065227".into(),
-                1048576,
-                12,
-                "s3://sim-2".into(),
-            )),
-            new_chunk((
-                "00000000000000020805".into(),
-                1048576,
-                1,
-                "s3://sim-2".into(),
-            )),
-            new_chunk((
-                "00000000000000065148".into(),
-                1048576,
-                1,
-                "s3://sim-2".into(),
-            )),
-            new_chunk((
-                "00000000000000027132".into(),
-                1048576,
-                4,
-                "s3://sim-2".into(),
-            )),
-        ]),
-        Action::AddChunks(vec![
-            new_chunk((
-                "00000000000000019312".into(),
-                1048576,
-                1,
-                "s3://sim-2".into(),
-            )),
-            new_chunk((
-                "00000000000000006606".into(),
-                1048576,
-                4,
-                "s3://sim-2".into(),
-            )),
-            new_chunk((
-                "00000000000000003645".into(),
-                1048576,
-                1,
-                "s3://sim-2".into(),
-            )),
-            new_chunk((
-                "00000000000000031802".into(),
-                1048576,
-                12,
-                "s3://sim-0".into(),
-            )),
-        ]),
-        Action::SetDatasetSchema {
-            dataset: "s3://sim-1".into(),
-            schema: SCHEMA_POOL[1].clone(),
-        },
+        Action::AddChunks(vec![nc(7424, 1, "sim-0")]),
+        Action::AddChunks(vec![nc(55665, 12, "sim-2"), nc(5210, 12, "sim-2")]),
+        Action::AddChunks(vec![nc(1122, 12, "sim-2"), nc(37710, 4, "sim-2"), nc(41327, 12, "sim-0")]),
+        Action::AddChunks(vec![nc(65227, 12, "sim-2"), nc(20805, 1, "sim-2"), nc(65148, 1, "sim-2"), nc(27132, 4, "sim-2")]),
+        Action::AddChunks(vec![nc(19312, 1, "sim-2"), nc(6606, 4, "sim-2"), nc(3645, 1, "sim-2"), nc(31802, 12, "sim-0")]),
+        Action::SetDatasetSchema { dataset: "s3://sim-1".into(), schema: SCHEMA_POOL[1].clone() },
         Action::CheckConverged(ConvergenceCheck::FloorLocallyFeasible),
         Action::SetMinReplication(1),
-        Action::AddChunks(vec![
-            new_chunk((
-                "00000000000000052877".into(),
-                1048576,
-                4,
-                "s3://sim-0".into(),
-            )),
-            new_chunk((
-                "00000000000000022506".into(),
-                1048576,
-                4,
-                "s3://sim-2".into(),
-            )),
-            new_chunk((
-                "00000000000000007926".into(),
-                1048576,
-                12,
-                "s3://sim-1".into(),
-            )),
-            new_chunk((
-                "00000000000000032987".into(),
-                1048576,
-                12,
-                "s3://sim-0".into(),
-            )),
-            new_chunk((
-                "00000000000000044551".into(),
-                1048576,
-                1,
-                "s3://sim-1".into(),
-            )),
-        ]),
+        Action::AddChunks(vec![nc(52877, 4, "sim-0"), nc(22506, 4, "sim-2"), nc(7926, 12, "sim-1"), nc(32987, 12, "sim-0"), nc(44551, 1, "sim-1")]),
         Action::WorkerLeft(4),
         Action::AdvanceClock(4),
         Action::SetMinReplication(2),
@@ -1395,194 +1043,31 @@ fn rejoined_worker_covers_its_chunks() {
         gc_ticks: 15,
         ..base_config()
     };
-    replay(
-        &config,
-        vec![
-            Action::AddChunks(vec![
-                new_chunk((
-                    "00000000000000051262".into(),
-                    1048576,
-                    12,
-                    "s3://sim-1".into(),
-                )),
-                new_chunk((
-                    "00000000000000019230".into(),
-                    1048576,
-                    12,
-                    "s3://sim-0".into(),
-                )),
-                new_chunk((
-                    "00000000000000040079".into(),
-                    1048576,
-                    12,
-                    "s3://sim-0".into(),
-                )),
-                new_chunk((
-                    "00000000000000035074".into(),
-                    1048576,
-                    12,
-                    "s3://sim-1".into(),
-                )),
-                new_chunk((
-                    "00000000000000036465".into(),
-                    1048576,
-                    12,
-                    "s3://sim-2".into(),
-                )),
-            ]),
-            Action::SetMinReplication(1),
-            Action::AddChunks(vec![
-                new_chunk((
-                    "00000000000000048988".into(),
-                    1048576,
-                    12,
-                    "s3://sim-1".into(),
-                )),
-                new_chunk((
-                    "00000000000000011031".into(),
-                    1048576,
-                    12,
-                    "s3://sim-1".into(),
-                )),
-                new_chunk((
-                    "00000000000000023450".into(),
-                    1048576,
-                    1,
-                    "s3://sim-1".into(),
-                )),
-                new_chunk((
-                    "00000000000000048788".into(),
-                    1048576,
-                    1,
-                    "s3://sim-1".into(),
-                )),
-            ]),
-            Action::WorkerFetchAssignment {
-                worker: 1,
-                succeeds: true,
-            },
-            Action::AddChunks(vec![
-                new_chunk((
-                    "00000000000000046781".into(),
-                    1048576,
-                    4,
-                    "s3://sim-1".into(),
-                )),
-                new_chunk((
-                    "00000000000000022076".into(),
-                    1048576,
-                    4,
-                    "s3://sim-1".into(),
-                )),
-            ]),
-            Action::WorkerLeft(2),
-            Action::WorkerJoined(2),
-            Action::AddChunks(vec![
-                new_chunk((
-                    "00000000000000009497".into(),
-                    1048576,
-                    4,
-                    "s3://sim-0".into(),
-                )),
-                new_chunk((
-                    "00000000000000001876".into(),
-                    1048576,
-                    1,
-                    "s3://sim-1".into(),
-                )),
-                new_chunk((
-                    "00000000000000047202".into(),
-                    1048576,
-                    12,
-                    "s3://sim-2".into(),
-                )),
-            ]),
-            Action::AddChunks(vec![
-                new_chunk((
-                    "00000000000000063259".into(),
-                    1048576,
-                    12,
-                    "s3://sim-1".into(),
-                )),
-                new_chunk((
-                    "00000000000000033532".into(),
-                    1048576,
-                    12,
-                    "s3://sim-1".into(),
-                )),
-            ]),
-            Action::AddChunks(vec![new_chunk((
-                "00000000000000006850".into(),
-                1048576,
-                4,
-                "s3://sim-0".into(),
-            ))]),
-            Action::WorkerFetchAssignment {
-                worker: 3,
-                succeeds: true,
-            },
-            Action::WorkerFetchAssignment {
-                worker: 4,
-                succeeds: true,
-            },
-            Action::AddChunks(vec![
-                new_chunk((
-                    "00000000000000021701".into(),
-                    1048576,
-                    4,
-                    "s3://sim-0".into(),
-                )),
-                new_chunk((
-                    "00000000000000023690".into(),
-                    1048576,
-                    12,
-                    "s3://sim-0".into(),
-                )),
-            ]),
-            Action::WorkerFetchAssignment {
-                worker: 0,
-                succeeds: true,
-            },
-            Action::WorkerFetchAssignment {
-                worker: 6,
-                succeeds: true,
-            },
-            Action::WorkerFetchAssignment {
-                worker: 5,
-                succeeds: true,
-            },
-            Action::WorkerFetchAssignment {
-                worker: 2,
-                succeeds: true,
-            },
-            Action::AddChunks(vec![
-                new_chunk((
-                    "00000000000000042038".into(),
-                    1048576,
-                    12,
-                    "s3://sim-0".into(),
-                )),
-                new_chunk((
-                    "00000000000000038427".into(),
-                    1048576,
-                    12,
-                    "s3://sim-1".into(),
-                )),
-                new_chunk((
-                    "00000000000000045246".into(),
-                    1048576,
-                    1,
-                    "s3://sim-2".into(),
-                )),
-                new_chunk((
-                    "00000000000000002114".into(),
-                    1048576,
-                    4,
-                    "s3://sim-2".into(),
-                )),
-            ]),
-        ],
-    );
+    let nc = |key: u64, weight: u16, dataset: &str| {
+        new_chunk((mint_key(key), CHUNK_SIZE, weight, format!("s3://{dataset}")))
+    };
+    // One action per line; rustfmt would explode each batch, and this frozen fixture never changes.
+    #[rustfmt::skip]
+    replay(&config, vec![
+        Action::AddChunks(vec![nc(51262, 12, "sim-1"), nc(19230, 12, "sim-0"), nc(40079, 12, "sim-0"), nc(35074, 12, "sim-1"), nc(36465, 12, "sim-2")]),
+        Action::SetMinReplication(1),
+        Action::AddChunks(vec![nc(48988, 12, "sim-1"), nc(11031, 12, "sim-1"), nc(23450, 1, "sim-1"), nc(48788, 1, "sim-1")]),
+        Action::WorkerFetchAssignment { worker: 1, succeeds: true },
+        Action::AddChunks(vec![nc(46781, 4, "sim-1"), nc(22076, 4, "sim-1")]),
+        Action::WorkerLeft(2),
+        Action::WorkerJoined(2),
+        Action::AddChunks(vec![nc(9497, 4, "sim-0"), nc(1876, 1, "sim-1"), nc(47202, 12, "sim-2")]),
+        Action::AddChunks(vec![nc(63259, 12, "sim-1"), nc(33532, 12, "sim-1")]),
+        Action::AddChunks(vec![nc(6850, 4, "sim-0")]),
+        Action::WorkerFetchAssignment { worker: 3, succeeds: true },
+        Action::WorkerFetchAssignment { worker: 4, succeeds: true },
+        Action::AddChunks(vec![nc(21701, 4, "sim-0"), nc(23690, 12, "sim-0")]),
+        Action::WorkerFetchAssignment { worker: 0, succeeds: true },
+        Action::WorkerFetchAssignment { worker: 6, succeeds: true },
+        Action::WorkerFetchAssignment { worker: 5, succeeds: true },
+        Action::WorkerFetchAssignment { worker: 2, succeeds: true },
+        Action::AddChunks(vec![nc(42038, 12, "sim-0"), nc(38427, 12, "sim-1"), nc(45246, 1, "sim-2"), nc(2114, 4, "sim-2")]),
+    ]);
 }
 
 /// Captured from the seed-pinned churn walk

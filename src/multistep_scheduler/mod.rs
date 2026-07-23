@@ -1,12 +1,11 @@
 //! Multi-step (reconciliation) scheduling: given the current placement, produces a feasible step
 //! toward the ideal rather than a placement-blind ideal.
 //!
-//! Standalone — not on the production scheduling path.
-//!
-//! Terminology: **floor** — a chunk's `min_replication` mandatory copies; **bonus** — weight-earned
-//! extras above the floor (up to its weight cap), shed first when room is tight; **ideal** —
-//! placement on hypothetically-empty workers; **held** — copies physically on a worker now (free to
-//! keep).
+//! Terminology:
+//! - **floor** — a chunk's `min_replication` mandatory copies;
+//! - **bonus** — weight-earned extras above the floor (up to its weight cap), shed first when room is tight;
+//! - **ideal** — placement on hypothetically-empty workers;
+//! - **held** — copies physically on a worker now (free to keep).
 //! Draining copies are not distinguished from other held copies — that split lives in the caller.
 //!
 //! Stage 1 ([`ideal_chunk_workers`]) computes the ideal. Stage 2 ([`Reconcile`]) re-walks the same
