@@ -784,6 +784,12 @@ impl<'a> Reconcile<'a> {
     /// the floor. Everything above the committed floor — bonus copies and leftover drains — stays
     /// reclaimable; weight/bonus replication is soft, floors are hard.
     ///
+    /// *Hard — possession.* Committed rows don't prove possession (a committed replacement may never
+    /// have fetched), so evicting a **routed** copy — the algorithm's only possession proof — further
+    /// requires a surviving committed copy that is itself routed; and a **portal-visible** donor always
+    /// keeps ≥ 1 held copy, even at `|committed| = 0`, so preemption can never manufacture the
+    /// holderless-visible state it exists to close.
+    ///
     /// *Soft — routing, differentiated by the starved chunk's visibility.* `routed[X]` orders victims:
     /// copies the routing has already moved off (`w ∉ routed[X]`) are evicted before still-routed ones.
     /// - **C portal-visible** (an existing degraded chunk — the ADR-0001 case): routing is pure
@@ -817,6 +823,7 @@ impl<'a> Reconcile<'a> {
         let worker_capacity = self.worker_capacity;
         let committed = self.committed;
         let routed = self.routed;
+        let held_all = self.held;
         let held_by_worker = &self.held_by_worker;
         let allocated = &mut self.allocated;
         let worker_chunks = &mut self.worker_chunks;
@@ -864,6 +871,28 @@ impl<'a> Reconcile<'a> {
                                 .count()
                                 >= floor
                         }
+                        // Possession-confirmed durability: a committed row alone doesn't prove the
+                        // copy was ever downloaded — a committed-but-never-fetched replacement can
+                        // lag unboundedly, so counting it as the survivor would let eviction
+                        // hard-delete the donor's only physical copy. A *routed* copy is the one
+                        // possession proof the algorithm has (the confirmed routing only addresses
+                        // workers that confirmed holding), so deleting a routed copy additionally
+                        // requires a surviving committed copy that is itself routed.
+                        && (!routed[xi].contains(&worker)
+                            || committed[xi].iter().any(|&w2| {
+                                w2 != worker
+                                    && !evicted.contains(&(x, w2))
+                                    && routed[xi].contains(&w2)
+                            }))
+                        // A portal-visible donor keeps ≥ 1 held copy. With |committed[X]| = 0
+                        // (all committed holders departed) the floor guard above is vacuous, but
+                        // taking a visible chunk's last lingering copy recreates the exact
+                        // holderless-visible state preemption exists to close. Non-visible chunks
+                        // (incl. being-removed, ideal = ∅) stay freely reclaimable.
+                        && (!chunks[xi].is_portal_visible
+                            || held_all[xi]
+                                .iter()
+                                .any(|&w2| w2 != worker && !evicted.contains(&(x, w2))))
                 })
                 .map(|x| {
                     let still_routed = routed[x as usize].contains(&worker);

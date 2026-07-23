@@ -133,10 +133,19 @@ pub(super) fn portal_consistency_misses(
 /// The caller also stands this check down during a recorded shortage (`is_infeasible`): an
 /// over-subscribed fleet cannot hold every floor, so a visible chunk reaching zero copies there is
 /// unavoidable, not a defect — the same category as the departed-worker exemption.
+/// With `require_physical` (a full-quorum run, where the confirmation watermark cannot advance past
+/// an unfetched worker), "covered" is additionally required to be *physical*: at least one active
+/// listed holder must really hold the chunk (`holds`). A listing row alone doesn't prove possession —
+/// a committed-but-never-fetched replacement can lag unboundedly — so a chunk whose only listed
+/// holders never downloaded it is unanswerable despite being "covered" on paper. Below a full quorum
+/// possession genuinely lags the listing (the documented X% tradeoff), so there the physical side is
+/// telemetry, not fatal (the caller classifies it).
 pub(super) fn published_coverage(
     portal: &PortalAssignment,
     worker: Option<&WorkerAssignment>,
     is_active: impl Fn(WorkerPk) -> bool,
+    holds: impl Fn(WorkerPk, &ChunkPk) -> bool,
+    require_physical: bool,
 ) -> Result<(), String> {
     for (chunk, routed) in &portal.chunk_workers {
         // A fully-departed routing is an availability event, not a strand — skip it.
@@ -146,12 +155,9 @@ pub(super) fn published_coverage(
         // Covered iff the worker assignment lists ANY active holder for this chunk, anywhere. The
         // routed workers need not be among them — a still-routed copy eviction deleted is tolerated as
         // long as some covered holder remains.
-        let covered_anywhere = worker.is_some_and(|assignment| {
-            assignment
-                .chunk_workers
-                .get(chunk)
-                .is_some_and(|holders| holders.iter().any(|&w| is_active(w)))
-        });
+        let listed_holders = worker.and_then(|assignment| assignment.chunk_workers.get(chunk));
+        let covered_anywhere =
+            listed_holders.is_some_and(|holders| holders.iter().any(|&w| is_active(w)));
         if !covered_anywhere {
             return Err(format!(
                 "published worker assignment strands portal routing: portal routes chunk \
@@ -159,6 +165,50 @@ pub(super) fn published_coverage(
                  lists no active holder for it anywhere — the chunk has no covered holder at all and \
                  is unanswerable",
             ));
+        }
+        let covered_physically = listed_holders
+            .is_some_and(|holders| holders.iter().any(|&w| is_active(w) && holds(w, chunk)));
+        if require_physical && !covered_physically {
+            return Err(format!(
+                "published worker assignment covers chunk {chunk:?} on paper only: it lists active \
+                 holders, but none of them physically holds the chunk — at a full quorum every \
+                 confirmed copy is fetched, so a listing with zero physical copies means a real copy \
+                 was deleted for an unfetched replacement and the chunk is unanswerable",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Fixed-point routing liveness: at a drained fixed point (ideal stable, stale empty, every routing
+/// diff replayed, no shortage) all deliberate routing lag has resolved, so the confirmed routing must
+/// agree with the worker assignment **pair-by-pair** — every active routed worker is listed as a
+/// holder of the chunk it is routed for. This restores the strict pre-preemption per-pair check
+/// exactly where it is sound, and is what makes "bounded routing-lag" a checked bound: a stale pair
+/// that survives quiescence is a stuck routing update (a diff never emitted or misapplied), not lag.
+pub(super) fn routing_matches_assignment_at_fixed_point(
+    portal: &PortalAssignment,
+    worker: Option<&WorkerAssignment>,
+    is_active: impl Fn(WorkerPk) -> bool,
+) -> Result<(), String> {
+    for (chunk, routed) in &portal.chunk_workers {
+        for &w in routed {
+            if !is_active(w) {
+                continue;
+            }
+            let listed = worker.is_some_and(|assignment| {
+                assignment
+                    .chunk_workers
+                    .get(chunk)
+                    .is_some_and(|holders| holders.contains(&w))
+            });
+            if !listed {
+                return Err(format!(
+                    "at the drained fixed point the portal still routes chunk {chunk:?} to active \
+                     worker {w:?}, which the worker assignment does not list as a holder — a \
+                     permanently stale routing pair (stuck routing update), not bounded lag",
+                ));
+            }
         }
     }
     Ok(())
@@ -685,6 +735,15 @@ mod tests {
 
     // ---- published_coverage ----------------------------------------------------------------
 
+    /// Listing-only variant most tests use: every worker "holds" everything, physical not required.
+    fn coverage_listed(
+        pa: &PortalAssignment,
+        wa: Option<&WorkerAssignment>,
+        is_active: impl Fn(WorkerPk) -> bool,
+    ) -> Result<(), String> {
+        published_coverage(pa, wa, is_active, |_, _| true, false)
+    }
+
     #[test]
     fn published_coverage_fires_on_globally_uncovered_chunk() {
         // Chunk 0 is routed to active worker 1, and the worker assignment's sole holder (2) is
@@ -692,7 +751,7 @@ mod tests {
         // the strand oracle still fires.
         let pa = portal(&[(0, &[1])]);
         let wa = worker_assignment(&[(0, &[2])]);
-        assert!(published_coverage(&pa, Some(&wa), |w| w == WorkerPk(1)).is_err());
+        assert!(coverage_listed(&pa, Some(&wa), |w| w == WorkerPk(1)).is_err());
     }
 
     #[test]
@@ -701,14 +760,14 @@ mod tests {
         // removal — a removed chunk would be de-visibilitied and absent from the portal too.
         let pa = portal(&[(0, &[1])]);
         let wa = worker_assignment(&[]);
-        assert!(published_coverage(&pa, Some(&wa), |_| true).is_err());
+        assert!(coverage_listed(&pa, Some(&wa), |_| true).is_err());
     }
 
     #[test]
     fn published_coverage_passes_when_worker_assignment_covers_routing() {
         let pa = portal(&[(0, &[1])]);
         let wa = worker_assignment(&[(0, &[1, 2])]);
-        assert!(published_coverage(&pa, Some(&wa), |_| true).is_ok());
+        assert!(coverage_listed(&pa, Some(&wa), |_| true).is_ok());
     }
 
     #[test]
@@ -718,7 +777,7 @@ mod tests {
         // the chunk is still answerable somewhere (bounded routing-lag, not a strand).
         let pa = portal(&[(0, &[1, 2])]);
         let wa = worker_assignment(&[(0, &[2])]);
-        assert!(published_coverage(&pa, Some(&wa), |_| true).is_ok());
+        assert!(coverage_listed(&pa, Some(&wa), |_| true).is_ok());
     }
 
     #[test]
@@ -728,19 +787,61 @@ mod tests {
         // the oracle tolerates the stale routing rather than demanding routing consistency.
         let pa = portal(&[(0, &[1, 2])]);
         let wa = worker_assignment(&[(0, &[3])]);
-        assert!(published_coverage(&pa, Some(&wa), |_| true).is_ok());
+        assert!(coverage_listed(&pa, Some(&wa), |_| true).is_ok());
     }
 
     #[test]
     fn published_coverage_skips_departed_workers() {
         let pa = portal(&[(0, &[1])]);
         let wa = worker_assignment(&[(0, &[2])]);
-        assert!(published_coverage(&pa, Some(&wa), |_| false).is_ok());
+        assert!(coverage_listed(&pa, Some(&wa), |_| false).is_ok());
     }
 
     #[test]
     fn published_coverage_with_no_worker_assignment_requires_empty_routing() {
-        assert!(published_coverage(&portal(&[]), None, |_| true).is_ok());
-        assert!(published_coverage(&portal(&[(0, &[1])]), None, |_| true).is_err());
+        assert!(coverage_listed(&portal(&[]), None, |_| true).is_ok());
+        assert!(coverage_listed(&portal(&[(0, &[1])]), None, |_| true).is_err());
+    }
+
+    #[test]
+    fn published_coverage_fires_on_paper_only_coverage_when_physical_required() {
+        // The assignment lists an active holder (2), but nobody physically holds the chunk — a
+        // committed-but-never-fetched replacement. Fatal at a full quorum, tolerated below it.
+        let pa = portal(&[(0, &[1])]);
+        let wa = worker_assignment(&[(0, &[2])]);
+        let nobody_holds = |_, _: &ChunkPk| false;
+        assert!(published_coverage(&pa, Some(&wa), |_| true, nobody_holds, true).is_err());
+        assert!(published_coverage(&pa, Some(&wa), |_| true, nobody_holds, false).is_ok());
+    }
+
+    #[test]
+    fn published_coverage_physical_requirement_met_by_any_listed_holder() {
+        // Worker 2 physically holds the chunk; worker 3 is a fresh listing still downloading. One
+        // physical holder anywhere satisfies the requirement.
+        let pa = portal(&[(0, &[1])]);
+        let wa = worker_assignment(&[(0, &[2, 3])]);
+        let holds = |w, _: &ChunkPk| w == WorkerPk(2);
+        assert!(published_coverage(&pa, Some(&wa), |_| true, holds, true).is_ok());
+    }
+
+    // ---- routing_matches_assignment_at_fixed_point -----------------------------------------
+
+    #[test]
+    fn fixed_point_routing_fires_on_stale_pair() {
+        // Worker 1 is routed for chunk 0 but no longer listed as its holder — at quiescence that is
+        // a stuck routing update, even though the chunk is covered elsewhere (worker 2).
+        let pa = portal(&[(0, &[1])]);
+        let wa = worker_assignment(&[(0, &[2])]);
+        assert!(routing_matches_assignment_at_fixed_point(&pa, Some(&wa), |_| true).is_err());
+    }
+
+    #[test]
+    fn fixed_point_routing_passes_when_pairs_match_and_skips_departed() {
+        let pa = portal(&[(0, &[1, 9])]);
+        let wa = worker_assignment(&[(0, &[1, 2])]);
+        // Worker 9 is departed — exempt; worker 1 is routed and listed.
+        assert!(
+            routing_matches_assignment_at_fixed_point(&pa, Some(&wa), |w| w != WorkerPk(9)).is_ok()
+        );
     }
 }

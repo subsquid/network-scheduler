@@ -59,9 +59,19 @@ A copy of chunk `X` on worker `w` may be reclaimed to floor another chunk **iff*
    measures against — so counting survivors here is what keeps eviction from hard-deleting a copy the
    donor's durability floor still needs. This is the durability-hard guard (it fixes the retention
    breach where a re-promoted drain was miscounted as a floor copy and a committed copy hard-deleted).
-   `|committed[X]| = 0` (holderless or being removed) ⇒ floor 0 ⇒ freely reclaimable. Everything above
+   `|committed[X]| = 0` (holderless or being removed) ⇒ floor 0 ⇒ freely reclaimable — *unless* `X`
+   is portal-visible, in which case its **last held copy** is never taken (see the possession
+   amendment below): deleting it would manufacture the holderless-visible state preemption exists to
+   close. Everything above
    the committed floor — weight-earned **bonus** copies and leftover **draining** copies — is fair
    game; weight/bonus replication is soft, floors are hard.
+
+2. **Its deletion is possession-safe.** A committed row alone doesn't prove the copy was ever
+   downloaded — a committed-but-never-fetched replacement can lag unboundedly. The confirmed routing
+   is the algorithm's one possession proof (it only addresses workers that confirmed holding), so
+   deleting a **routed** copy additionally requires a surviving committed copy that is itself routed.
+   Counting an unfetched survivor would let eviction hard-delete the donor's only physical copy while
+   every oracle sees a "covered" chunk.
 
 Routing is a **soft** input, never a veto: `confirmed_routing[X]` only *orders* eviction victims —
 copies the routing has already moved off are evicted before still-routed ones, so a still-routed copy
@@ -175,6 +185,39 @@ M a routed worker can momentarily hold nothing while the durable copy lives else
 is therefore excused for a chunk that **keeps a covered holder anywhere** (durability intact) and fires
 only on a **globally uncovered** chunk — identical in spirit to `published_coverage` and the existing
 departed-worker exemption. `step_safety`/retention is untouched — durability is still hard.
+
+### How the relaxation stays honest (hardening)
+
+The relaxed oracles cut at the same joint as the eviction guard — both reasoned about assignment
+*listings*, not physical possession — so the one failure the guard could still create (deleting the
+only fetched copy for a never-fetched survivor) was invisible to the one oracle that was weakened.
+Four measures keep the envelope checked rather than asserted:
+
+- **Possession-confirmed eviction** (the guard rules above): the scheduler can no longer produce the
+  zero-physical-copy state by preemption.
+- **Physical retention, edge-triggered** (`assert_physical_retention`): a routed chunk that had ≥ 1
+  physical copy must not reach zero physical copies in a single transition unless that transition was
+  a departure (data leaves with the worker) or a recorded shortage (drain expiry under a stalled
+  scrub). State-based physical checks can't be fatal — "listed holder with an empty disk" is
+  legitimate in departure→rejoin windows — but the *edge* is attributable: outside departures, only a
+  worker applying an assignment that dropped its copy deletes data, and dropping a routed chunk's
+  last downloaded copy for an un-downloaded replacement is the possession bug the guard forbids.
+  Fatal at a full quorum; classified below it (quorum-keyed drain expiry can legitimately outrun a
+  laggard replacement). Paper-only coverage (listed, zero physical) is additionally classified in the
+  statistics at every quorum.
+- **Misses are counted at every quorum**: `portal_consistency_misses` runs on the strict path too, so
+  "the envelope `portal_consistency_misses` counts" is true in the default configuration, and the
+  shortage stand-down classifies what it masks (`strand check: uncovered routed chunk masked by
+  shortage stand-down`) instead of going silent.
+- **The bound on "bounded" routing-lag**: at every drained, shortage-free fixed point
+  (`CheckConverged`) the confirmed routing must match the worker assignment **pair-by-pair** — the
+  strict pre-preemption check, reinstated exactly where deliberate lag has provably resolved. A stale
+  pair that survives quiescence is a stuck routing update, and fires.
+
+The flagship regressions additionally probe the mechanism end-to-end
+(`assert_all_routed_chunks_have_a_listed_holder`): the departure-emptied chunk is routed only at the
+departed worker, which the strand oracle deliberately exempts — without the probe, deleting the
+preemption path entirely would leave every replay green.
 
 ## Precondition: the departure residual is kept out of the walk, not hidden
 

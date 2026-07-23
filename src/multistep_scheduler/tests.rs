@@ -1321,3 +1321,125 @@ fn new_chunk_defers_from_a_routed_copy_but_visible_preempts() {
         "X keeps its committed floor copy on w0"
     );
 }
+
+// Possession-confirmed durability: committed rows alone don't prove a copy was ever downloaded.
+// X is committed on w0 and w1, but only w0 is routed — w1 is a replacement the confirmation has
+// never covered, so for all the algorithm knows it was never fetched. Evicting the routed copy on
+// w0 would satisfy the committed-survivor count (w1 remains) while deleting the chunk's only
+// proven-physical copy. The possession rule vetoes exactly that: a routed copy may go only if a
+// surviving committed copy is itself routed. C must not seat, and X's routed copy stays.
+#[test]
+fn reclaim_never_takes_the_only_routed_copy_for_an_unfetched_survivor() {
+    let (holders, evicted) = drive_reconcile(
+        2,
+        1000,
+        1,
+        &[
+            // X: committed on both workers, held rows on both, but the routing has only ever
+            // confirmed w0. Its floor walk starts at w1, so this cycle publishes w1 first and
+            // leaves the w0 copy an eviction candidate.
+            ChunkLayout {
+                size: 1000,
+                ideal: vec![0, 1],
+                held: vec![0, 1],
+                committed: vec![0, 1],
+                routed: vec![0],
+                hashes: vec![1],
+                is_portal_visible: true,
+            },
+            // C: starved & portal-visible, ring order w0,w1 — its only reclaim candidate is X's
+            // routed copy on w0, which the possession rule protects.
+            ChunkLayout {
+                size: 1000,
+                ideal: vec![0],
+                held: vec![],
+                committed: vec![],
+                routed: vec![],
+                hashes: vec![0],
+                is_portal_visible: true,
+            },
+        ],
+    );
+    assert!(
+        evicted.is_empty(),
+        "the only routed (proven-physical) copy must never be evicted for a committed-but-\
+         never-routed survivor; got {evicted:?}",
+    );
+    assert!(
+        holders[0].contains(&0),
+        "X keeps its routed copy on w0; got {holders:?}"
+    );
+    assert!(
+        holders[1].is_empty(),
+        "starved C stays short rather than deleting the last proven copy; got {holders:?}"
+    );
+}
+
+// A portal-visible donor keeps its last held copy even when its committed floor is vacuous.
+// X is visible with |committed| = 0 (its committed holders departed) and one lingering held copy
+// on w1 while its replacement downloads on w0. Under the bare `|committed| = 0 ⇒ floor 0` rule
+// that lingering copy is freely reclaimable — deleting it recreates the holderless-visible state
+// preemption exists to close. The visible-donor rule vetoes it; C stays short.
+#[test]
+fn reclaim_never_takes_a_visible_chunks_last_held_copy() {
+    let (holders, evicted) = drive_reconcile(
+        2,
+        1000,
+        1,
+        &[
+            // X: visible, committed floor vacuous (holders departed); one held copy left on w1,
+            // fresh replacement placing on w0.
+            ChunkLayout {
+                size: 500,
+                ideal: vec![0],
+                held: vec![1],
+                committed: vec![],
+                routed: vec![],
+                hashes: vec![0],
+                is_portal_visible: true,
+            },
+            // F: pins the other half of w1 at its floor.
+            ChunkLayout {
+                size: 500,
+                ideal: vec![1],
+                held: vec![1],
+                committed: vec![1],
+                routed: vec![1],
+                hashes: vec![1],
+                is_portal_visible: false,
+            },
+            // G: pins the other half of w0 at its floor.
+            ChunkLayout {
+                size: 500,
+                ideal: vec![0],
+                held: vec![0],
+                committed: vec![0],
+                routed: vec![0],
+                hashes: vec![0],
+                is_portal_visible: false,
+            },
+            // C: starved & visible, wants w1 — its only candidate there is X's last held copy.
+            ChunkLayout {
+                size: 500,
+                ideal: vec![1],
+                held: vec![],
+                committed: vec![],
+                routed: vec![],
+                hashes: vec![1],
+                is_portal_visible: true,
+            },
+        ],
+    );
+    assert!(
+        evicted.is_empty(),
+        "a visible chunk's last held copy must never be reclaimed; got {evicted:?}",
+    );
+    assert!(
+        holders[3].is_empty(),
+        "starved C stays short rather than stranding X holderless; got {holders:?}"
+    );
+    assert!(
+        holders[0].contains(&0),
+        "X's replacement still places on w0; got {holders:?}"
+    );
+}

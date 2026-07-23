@@ -901,7 +901,12 @@ fn departure_leaves_a_visible_chunk_holderless_case() -> (SimConfig, Vec<Action>
 #[test]
 fn departure_leaves_a_visible_chunk_holderless() {
     let (config, actions) = departure_leaves_a_visible_chunk_holderless_case();
-    replay(&config, actions);
+    let sut = replay(&config, actions);
+    // ADR 0001 sentinel: the departure-emptied chunk is routed only at the departed worker, which
+    // the strand oracles deliberately exempt — so without this probe, deleting the preemption
+    // mechanism would leave this replay green. The probe demands what preemption guarantees: after
+    // the committed cycle, every routed chunk has an active listed holder again.
+    sut.assert_all_routed_chunks_have_a_listed_holder();
 }
 
 /// Postgres twin: exercises the eviction delete on the real backend (populated
@@ -909,7 +914,8 @@ fn departure_leaves_a_visible_chunk_holderless() {
 #[test]
 fn departure_leaves_a_visible_chunk_holderless_pg() {
     let (config, actions) = departure_leaves_a_visible_chunk_holderless_case();
-    replay_pg(&config, actions);
+    let sut = replay_pg(&config, actions);
+    sut.assert_all_routed_chunks_have_a_listed_holder();
 }
 
 /// Captured by the in-memory `churn_simulation`
