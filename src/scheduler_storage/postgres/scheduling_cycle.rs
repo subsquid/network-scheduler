@@ -161,7 +161,7 @@ pub(super) async fn fetch_active_chunks_with_placement(
     let mut timer = PhaseTimer::new("run_scheduling_cycle:fetch_active_chunks_with_placement");
 
     // The dataset list in the server's collation order; the sort below uses its ranks, so the
-    // big query neither joins `datasets` (6M+ name texts stay off the wire) nor sorts. `id`
+    // big query neither joins `datasets` (no per-row name text on the wire) nor sorts. `id`
     // tiebreaks names a non-C collation may compare equal.
     let dataset_rows: Vec<(i16, String)> =
         sqlx::query_as("SELECT id, name FROM datasets ORDER BY name, id")
