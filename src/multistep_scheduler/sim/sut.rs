@@ -305,6 +305,15 @@ pub(super) struct PooledWorker {
     active: bool,
 }
 
+/// Capacity slack granted to the from-scratch packing probe (see
+/// [`SimUnderTest::floor_packs_from_scratch`]).
+enum Headroom {
+    None,
+    /// One max-chunk slot per worker — the tolerance the shortage cross-check grants greedy
+    /// stage-1 packing.
+    MaxChunkPerWorker,
+}
+
 /// The simulated world: a storage backend driven through the multistep scheduler, a logical clock,
 /// and the worker roster. Chunk and placement state live only in the storage.
 pub(super) struct SimUnderTest<D: SimStorage> {
@@ -564,6 +573,21 @@ impl<D: SimStorage> SimUnderTest<D> {
     /// probing with an empty placement exercises both shortage sources (replication budget and
     /// stage-1 packing). Removing chunks are excluded — they are no longer demand.
     fn is_ideal_feasible(&self, workers: &[&Worker]) -> bool {
+        self.floor_packs_from_scratch(workers, Headroom::None)
+    }
+
+    /// The shortage cross-check's bar: the same probe with every worker's capacity reduced by the
+    /// largest probed chunk — one slot of slack per worker. Stage 1's greedy ring walk is
+    /// feed-order sensitive (and the backends feed different orders), so it may legitimately
+    /// refuse a set that only packs at a knife edge; a set that packs even *with* this slack is
+    /// one no wasted-slot artifact can excuse, so refusing it is a real scheduler bug. The margin
+    /// is absolute (`workers × max chunk`), vanishing relative to production-scale capacity.
+    /// See `churn_knife_edge_false_shortage_is_excused` for the capture that set the bar.
+    fn is_ideal_feasible_with_headroom(&self, workers: &[&Worker]) -> bool {
+        self.floor_packs_from_scratch(workers, Headroom::MaxChunkPerWorker)
+    }
+
+    fn floor_packs_from_scratch(&self, workers: &[&Worker], headroom: Headroom) -> bool {
         let worker_pairs: Vec<(WorkerPk, Worker)> = workers
             .iter()
             .copied()
@@ -579,6 +603,18 @@ impl<D: SimStorage> SimUnderTest<D> {
             .map(|view| (view.chunk_pk, chunk_from_view(view)))
             .collect();
         chunk_pairs.sort_by(|a, b| a.0.cmp(&b.0));
+        let margin = match headroom {
+            Headroom::None => 0,
+            Headroom::MaxChunkPerWorker => chunk_pairs
+                .iter()
+                .map(|(_, chunk)| u64::from(chunk.size))
+                .max()
+                .unwrap_or(0),
+        };
+        let config = SchedulingConfig {
+            worker_capacity: self.config.worker_capacity.saturating_sub(margin),
+            ..self.config.clone()
+        };
         self.algo
             .schedule(
                 chunk_pairs,
@@ -586,7 +622,7 @@ impl<D: SimStorage> SimUnderTest<D> {
                 &CurrentPlacement::default(),
                 &CurrentPlacement::default(),
                 &CurrentPlacement::default(),
-                &self.config,
+                &config,
             )
             .is_ok()
     }
@@ -833,13 +869,24 @@ impl<D: SimStorage> SimUnderTest<D> {
         );
         if self.is_infeasible {
             // Under a shortage the all-or-nothing scheduler commits nothing, so the floor oracle
-            // doesn't apply; only cross-check that the refusal is justified from an empty fleet.
+            // doesn't apply; cross-check that the refusal is justified from an empty fleet. The
+            // probe grants one max-chunk slot of headroom per worker: greedy stage-1 packing is
+            // feed-order sensitive, so a set that only packs at a knife edge may be legitimately
+            // refused — perfect utilisation is not a goal. Refusing a set that packs *with* the
+            // slack is a real bug.
             assert!(
-                !self.is_ideal_feasible(&self.active_workers()),
-                "scheduler recorded a shortage, yet the set is placeable from an empty fleet — \
-                 incremental reconcile is weaker than scheduling from scratch (chunks={}, workers={})",
+                !self.is_ideal_feasible_with_headroom(&self.active_workers()),
+                "scheduler recorded a shortage, yet the set is placeable from an empty fleet with \
+                 a slot of headroom per worker — the refusal cannot be a wasted-slot artifact \
+                 (chunks={}, workers={})",
                 self.total_chunk_count(),
                 self.active_workers_count(),
+            );
+            // Surface how often the tolerance does work: a set that packs exactly but not with
+            // headroom is an excused knife-edge refusal, not a genuine shortage.
+            statistics::classify(
+                self.is_ideal_feasible(&self.active_workers()),
+                "converged: knife-edge shortage excused (packs exactly, not with headroom)",
             );
         } else {
             // Whole set placed: assert no room was wasted reaching the floor. Removing chunks
