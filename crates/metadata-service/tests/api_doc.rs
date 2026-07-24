@@ -1,23 +1,23 @@
-//! Keeps `docs/api.md` and the router in lockstep with the `#[utoipa::path]` annotations.
+//! Keeps `docs/metadata-service-api.md` and the router in lockstep with the `#[utoipa::path]` annotations.
 
 use metadata_service::openapi::{ApiDoc, render_markdown};
 use utoipa::OpenApi;
 
-const DOC_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../docs/api.md");
+const DOC_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../docs/metadata-service-api.md");
 
-/// `docs/api.md` must match what the annotations render. Bless with
+/// `docs/metadata-service-api.md` must match what the annotations render. Bless with
 /// `UPDATE_API_DOC=1 cargo test -p metadata-service --test api_doc`.
 #[test]
 fn api_markdown_is_current() {
     let rendered = render_markdown(&ApiDoc::openapi());
     if std::env::var("UPDATE_API_DOC").is_ok() {
-        std::fs::write(DOC_PATH, &rendered).expect("write docs/api.md");
+        std::fs::write(DOC_PATH, &rendered).expect("write docs/metadata-service-api.md");
         return;
     }
     let committed = std::fs::read_to_string(DOC_PATH).unwrap_or_default();
     assert_eq!(
         committed, rendered,
-        "docs/api.md is stale — regenerate with UPDATE_API_DOC=1 cargo test -p metadata-service --test api_doc"
+        "docs/metadata-service-api.md is stale — regenerate with UPDATE_API_DOC=1 cargo test -p metadata-service --test api_doc"
     );
 }
 
