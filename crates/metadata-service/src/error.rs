@@ -32,7 +32,7 @@ impl From<JsonRejection> for ServiceError {
 }
 
 /// `{ error, message, …structured fields }`. Empty/None fields are omitted.
-#[derive(Debug, Serialize, Default)]
+#[derive(Debug, Serialize, Default, utoipa::ToSchema)]
 pub struct ErrorBody {
     pub error: &'static str,
     pub message: String,

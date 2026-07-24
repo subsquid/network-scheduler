@@ -8,7 +8,7 @@ use scheduler_metadata::{DatasetSchema, NewDataset, ReadSchemaId, SchemaId};
 use serde::{Deserialize, Serialize};
 
 // ---- POST /datasets ----
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct CreateDatasetRequest {
     pub location: String,
@@ -26,14 +26,14 @@ impl From<CreateDatasetRequest> for NewDataset {
     }
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct CreateDatasetResponse {
     pub name: String,
     pub created: bool,
 }
 
 // ---- POST write-schema (request body IS DatasetSchema) → {schema_id} ----
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct WriteSchemaResponse {
     pub schema_id: i32,
 }
@@ -44,7 +44,7 @@ impl From<SchemaId> for WriteSchemaResponse {
 }
 
 // ---- PUT read-schema (request body IS DatasetSchema) → {read_schema_id} ----
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct ReadSchemaResponse {
     pub read_schema_id: i32,
 }
@@ -57,21 +57,21 @@ impl From<ReadSchemaId> for ReadSchemaResponse {
 }
 
 // ---- GET read-schema (current) ----
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct CurrentReadSchemaResponse {
     pub read_schema_id: i32,
     pub schema: DatasetSchema,
 }
 
 // ---- GET write-schemas/{id} (one) ----
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct WriteSchemaViewResponse {
     pub schema_id: i32,
     pub schema: DatasetSchema,
 }
 
 // ---- GET write-schemas (list) ----
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct SchemaInfoDto {
     pub schema_id: i32,
     pub active: bool,
@@ -87,31 +87,31 @@ impl From<SchemaInfo> for SchemaInfoDto {
     }
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct SchemaListResponse {
     pub schemas: Vec<SchemaInfoDto>,
 }
 
 // ---- POST chunks (the wire chunk IS the crate's `IngestChunk`, deserialized directly) ----
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct InsertChunksRequest {
     pub chunks: Vec<IngestChunk>,
 }
 
 // ---- POST corrections (the wire correction IS the crate's `Correction`) ----
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct CorrectionsRequest {
     pub corrections: Vec<Correction>,
 }
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct CorrectionsResponse {
     pub corrected: usize,
 }
 
 // ---- GET head (the resume point; null = no data yet) ----
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct HeadResponse {
     pub stored_head: Option<u64>,
 }
@@ -124,7 +124,7 @@ impl From<Head> for HeadResponse {
 }
 
 // ---- GET status ----
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ChunkStatusWire {
     Pending,
@@ -132,7 +132,7 @@ pub enum ChunkStatusWire {
     Rejected,
     NotFound,
 }
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct ChunkStatusResponse {
     pub status: ChunkStatusWire,
 }

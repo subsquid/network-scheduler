@@ -6,12 +6,14 @@ use serde::{Deserialize, Serialize};
 /// and read schema (`read_schemas`).
 // `deny_unknown_fields`: it's also the request body, so typo'd fields are rejected, not silently dropped.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(deny_unknown_fields)]
 pub struct DatasetSchema {
     tables: BTreeMap<String, TableSchema>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(deny_unknown_fields)]
 pub struct TableSchema {
     pub fields: Vec<String>,

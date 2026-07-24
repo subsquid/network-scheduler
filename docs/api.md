@@ -1,0 +1,254 @@
+# metadata-service — HTTP API
+
+Ingesters report chunk metadata here instead of the scheduler discovering it from S3. A 2xx insert is durably accepted — overlap is decided at insert time, under a per-dataset lock (ADR 0003).
+
+Generated from the `#[utoipa::path]` annotations — do not edit by hand. Regenerate: `UPDATE_API_DOC=1 cargo test -p metadata-service --test api_doc`.
+
+Authentication: `Authorization: Bearer <token>`. Admin endpoints need an admin token; dataset endpoints need a token scoped to that dataset; `/health` and `/metrics` are open.
+
+## `POST /datasets`
+
+Request body: [`CreateDatasetRequest`](#createdatasetrequest)
+
+Responses:
+- `200` Dataset already existed; unchanged — [`CreateDatasetResponse`](#createdatasetresponse)
+- `201` Dataset created — [`CreateDatasetResponse`](#createdatasetresponse)
+- `400` Invalid name, location, or schema — [`ErrorBody`](#errorbody)
+
+## `POST /datasets/{name}/chunks`
+
+Path parameters:
+- `name` (string) — Dataset name
+
+Request body: [`InsertChunksRequest`](#insertchunksrequest)
+
+Responses:
+- `204` All chunks inserted
+- `409` `duplicate_chunks`: listed ids were already present (new ones in the batch WERE committed). `range_overlap`: nothing committed; the batch overlaps a live chunk — [`ErrorBody`](#errorbody)
+- `503` `dataset_busy`: lock wait timed out behind a wedged writer; retry — [`ErrorBody`](#errorbody)
+
+## `GET /datasets/{name}/chunks/{id}/status`
+
+Path parameters:
+- `name` (string) — Dataset name
+- `id` (string) — Chunk id
+
+Responses:
+- `200` pending | admitted | rejected | not_found — [`ChunkStatusResponse`](#chunkstatusresponse)
+
+## `POST /datasets/{name}/corrections`
+
+Path parameters:
+- `name` (string) — Dataset name
+
+Request body: [`CorrectionsRequest`](#correctionsrequest)
+
+Responses:
+- `200` Every correction applied — [`CorrectionsResponse`](#correctionsresponse)
+- `409` Rejected wholesale (unknown old chunk, changed range, duplicate, or unavailable old chunk) — [`ErrorBody`](#errorbody)
+
+## `GET /datasets/{name}/head`
+
+Path parameters:
+- `name` (string) — Dataset name
+
+Responses:
+- `200` The resume point — [`HeadResponse`](#headresponse)
+
+## `GET /datasets/{name}/read-schema`
+
+Path parameters:
+- `name` (string) — Dataset name
+
+Responses:
+- `200` The current read schema — [`CurrentReadSchemaResponse`](#currentreadschemaresponse)
+- `404` Never promoted — [`ErrorBody`](#errorbody)
+
+## `PUT /datasets/{name}/read-schema`
+
+Path parameters:
+- `name` (string) — Dataset name
+
+Request body: [`DatasetSchema`](#datasetschema)
+
+Responses:
+- `200` Promoted (idempotent by content) — [`ReadSchemaResponse`](#readschemaresponse)
+- `409` Concurrent schema change; retry — [`ErrorBody`](#errorbody)
+
+## `GET /datasets/{name}/write-schemas`
+
+Path parameters:
+- `name` (string) — Dataset name
+
+Responses:
+- `200` Every write schema, flagged active when a live chunk pins it — [`SchemaListResponse`](#schemalistresponse)
+
+## `POST /datasets/{name}/write-schemas`
+
+Path parameters:
+- `name` (string) — Dataset name
+
+Request body: [`DatasetSchema`](#datasetschema)
+
+Responses:
+- `200` Registered (idempotent by content) — [`WriteSchemaResponse`](#writeschemaresponse)
+- `400` Invalid schema — [`ErrorBody`](#errorbody)
+
+## `GET /datasets/{name}/write-schemas/{id}`
+
+Path parameters:
+- `name` (string) — Dataset name
+- `id` (integer) — Write schema id
+
+Responses:
+- `200` The schema — [`WriteSchemaViewResponse`](#writeschemaviewresponse)
+- `404` No such schema for this dataset — [`ErrorBody`](#errorbody)
+
+## `GET /health`
+
+Responses:
+- `200` Database reachable
+- `503` Database unreachable
+
+## `GET /metrics`
+
+Responses:
+- `200` Prometheus text exposition
+
+# Schemas
+
+## `ChunkStatusResponse`
+
+| field | type | required | notes |
+|---|---|---|---|
+| `status` | [`ChunkStatusWire`](#chunkstatuswire) | yes |  |
+
+## `ChunkStatusWire`
+
+One of: `"pending"`, `"admitted"`, `"rejected"`, `"not_found"`
+
+## `Correction`
+
+| field | type | required | notes |
+|---|---|---|---|
+| `old_chunk_id` | string | yes |  |
+| `replacement` | [`IngestChunk`](#ingestchunk) | yes |  |
+
+## `CorrectionsRequest`
+
+| field | type | required | notes |
+|---|---|---|---|
+| `corrections` | array of [`Correction`](#correction) | yes |  |
+
+## `CorrectionsResponse`
+
+| field | type | required | notes |
+|---|---|---|---|
+| `corrected` | integer | yes |  |
+
+## `CreateDatasetRequest`
+
+| field | type | required | notes |
+|---|---|---|---|
+| `location` | string | yes |  |
+| `name` | object |  |  |
+| `schema` | [`DatasetSchema`](#datasetschema) | yes |  |
+
+## `CreateDatasetResponse`
+
+| field | type | required | notes |
+|---|---|---|---|
+| `created` | boolean | yes |  |
+| `name` | string | yes |  |
+
+## `CurrentReadSchemaResponse`
+
+| field | type | required | notes |
+|---|---|---|---|
+| `read_schema_id` | integer | yes |  |
+| `schema` | [`DatasetSchema`](#datasetschema) | yes |  |
+
+## `DatasetSchema`
+
+| field | type | required | notes |
+|---|---|---|---|
+| `tables` | map of [`TableSchema`](#tableschema) | yes |  |
+
+## `ErrorBody`
+
+| field | type | required | notes |
+|---|---|---|---|
+| `chunk_id` | object |  |  |
+| `conflicts_with` | array of string |  |  |
+| `dataset` | object |  |  |
+| `detail` | object |  |  |
+| `duplicates` | array of string |  |  |
+| `error` | string | yes |  |
+| `message` | string | yes |  |
+| `schema_id` | object |  |  |
+| `table` | object |  |  |
+
+## `HeadResponse`
+
+| field | type | required | notes |
+|---|---|---|---|
+| `stored_head` | object |  |  |
+
+## `IngestChunk`
+
+| field | type | required | notes |
+|---|---|---|---|
+| `first_block` | integer | yes |  |
+| `id` | string | yes |  |
+| `last_block` | integer | yes |  |
+| `last_block_hash` | object |  |  |
+| `last_block_timestamp` | object |  |  |
+| `schema_id` | integer | yes | Explicit — never COALESCE-stamped. A superseded id is legal. |
+| `size` | integer | yes |  |
+| `tables` | object |  | Table *names* present, resolved against `schema_id`'s tables in sorted-name order (unknown → `UnknownTable`). `None` or a full list = all present (NULL bitmap); `Some([])` = none (all-zero). |
+
+## `InsertChunksRequest`
+
+| field | type | required | notes |
+|---|---|---|---|
+| `chunks` | array of [`IngestChunk`](#ingestchunk) | yes |  |
+
+## `ReadSchemaResponse`
+
+| field | type | required | notes |
+|---|---|---|---|
+| `read_schema_id` | integer | yes |  |
+
+## `SchemaInfoDto`
+
+| field | type | required | notes |
+|---|---|---|---|
+| `active` | boolean | yes |  |
+| `schema` | [`DatasetSchema`](#datasetschema) | yes |  |
+| `schema_id` | integer | yes |  |
+
+## `SchemaListResponse`
+
+| field | type | required | notes |
+|---|---|---|---|
+| `schemas` | array of [`SchemaInfoDto`](#schemainfodto) | yes |  |
+
+## `TableSchema`
+
+| field | type | required | notes |
+|---|---|---|---|
+| `default_fields` | array of string | yes | The implicit projection for callers that omit a column list; a subset of `fields`. |
+| `fields` | array of string | yes |  |
+
+## `WriteSchemaResponse`
+
+| field | type | required | notes |
+|---|---|---|---|
+| `schema_id` | integer | yes |  |
+
+## `WriteSchemaViewResponse`
+
+| field | type | required | notes |
+|---|---|---|---|
+| `schema` | [`DatasetSchema`](#datasetschema) | yes |  |
+| `schema_id` | integer | yes |  |
