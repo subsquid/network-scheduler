@@ -358,8 +358,8 @@ fn schema_bundle_holds_only_in_play_schemas() {
     SchedulerStorage::insert_new_datasets(
         &mut storage,
         vec![
-            (dataset("a"), schema_a.clone()),
-            (dataset("b"), one_table("logs")),
+            NewDataset::with_name(dataset("a"), dataset("a"), schema_a.clone()),
+            NewDataset::with_name(dataset("b"), dataset("b"), one_table("logs")),
         ],
     )
     .unwrap();
@@ -543,4 +543,28 @@ fn as_sets(
             (pk, set)
         })
         .collect()
+}
+
+/// Mirrored by `postgres/tests/registration_tests.rs::marked_chunk_frees_its_range_for_registration`:
+/// in_memory's `live()` and the SQL liveness filter (`LIVE_ADMITTED`) must agree that a chunk
+/// marked for removal stops claiming its block range.
+#[test]
+fn marked_chunk_frees_its_range_for_registration() {
+    let mut storage = storage_with(vec![chunk_with_blocks("ds", 1, 100, 0..=100)]);
+    let admitted = storage.register_new_chunks().unwrap();
+    assert_eq!(admitted.len(), 1);
+    let a_pk = admitted[0];
+
+    // Overlapping B loses to live A.
+    storage
+        .insert_new_chunks(vec![chunk_with_blocks("ds", 2, 100, 50..=150)])
+        .unwrap();
+    assert_eq!(storage.register_new_chunks().unwrap().len(), 0);
+
+    // Marked-for-removal A no longer claims its range; same-range C is admitted.
+    storage.mark_for_removal(a_pk, 1).unwrap();
+    storage
+        .insert_new_chunks(vec![chunk_with_blocks("ds", 3, 100, 50..=150)])
+        .unwrap();
+    assert_eq!(storage.register_new_chunks().unwrap().len(), 1);
 }

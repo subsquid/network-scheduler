@@ -1,10 +1,6 @@
-//! Postgres-native non-overlap enforcement, shared by registration and promotion.
-//!
-//! Both ask the same question — does this chunk's block range overlap one already in the dataset? —
-//! and answer it without loading the dataset's whole set:
-//!
-//! 1. an indexed SQL probe rejects candidates that overlap an existing chunk, then
-//! 2. a small Rust pass settles overlaps *within* the batch (two new chunks covering the same range).
+//! Overlap checks for the registration sweep: a SQL probe rejects candidates overlapping an
+//! existing live chunk, then a Rust pass resolves overlaps *within* the batch. Promotion enforces
+//! the same rule separately — see `visibility.rs` (`portal_overlap_losers`).
 //!
 //! The probe rides the `chunks_dataset_range_gist` GiST index, which covers both range endpoints,
 //! so each candidate touches only the chunks that actually intersect it — not the dataset's whole
@@ -19,7 +15,7 @@ use sqlx::postgres::{PgConnection, PgRow};
 
 use crate::scheduler_storage::{ChunkPk, DatasetPk};
 
-/// A chunk being considered for admission or promotion, with its inclusive block range.
+/// A chunk being considered for admission, with its inclusive block range.
 pub(super) struct Candidate {
     pub pk: ChunkPk,
     pub dataset_id: DatasetPk,
@@ -43,83 +39,18 @@ impl Candidate {
     }
 }
 
-/// The chunks a *new* candidate must not overlap: admitted, not rejected, not leaving. No
-/// `applied_at_worker` gate — a chunk claims its range from admission, so a not-yet-scheduled (or
-/// shortage-stuck) one must still block an overlapping newcomer.
-pub(super) const LIVE_ADMITTED: &str = "NOT s.rejected \
-     AND s.marked_for_removal IS NULL \
-     AND s.dropped_at_portal_assignment_id IS NULL \
-     AND s.dropped_from_worker_assignment_at IS NULL";
+/// The chunks a *new* candidate must not overlap. Single source of truth in the shared crate so the
+/// ingest probe and this sweep can't drift; the literal value is unchanged.
+pub(super) use scheduler_metadata::pg::nonoverlap::{LIVE_ADMITTED, OVERLAP_RANGE_PRED};
 
-/// pks of candidates whose range overlaps a live chunk in the same dataset — to reject at registration.
+/// pks of candidates whose range overlaps a live chunk in the same dataset — to reject at
+/// registration. Counterpart of the ingest probe
+/// ([`scheduler_metadata::pg::nonoverlap::overlapping_incoming`]), different on purpose: only
+/// admitted chunks count (not pending ones), a candidate's own row is not skipped, and every
+/// overlapping candidate is returned instead of stopping at the first.
 pub(super) async fn overlapping_live(
     conn: &mut PgConnection,
     candidates: &[Candidate],
-) -> Result<HashSet<ChunkPk>> {
-    overlapping(conn, candidates, LIVE_ADMITTED).await
-}
-
-/// From candidates that already cleared the existing-chunk probe, keep the ones that don't overlap
-/// *each other*; lower `(first_block, chunk_pk)` wins. Input is batch-sized, so one sorted pass does
-/// it. Returns `(accepted pks, rejected candidates)`.
-pub(super) fn settle_within_batch(mut clear: Vec<Candidate>) -> (Vec<ChunkPk>, Vec<Candidate>) {
-    clear.sort_unstable_by_key(|c| (c.dataset_id, c.first_block, c.pk));
-    let mut accepted = Vec::new();
-    let mut rejected = Vec::new();
-    // Sorted by start within a dataset, accepted ranges are non-overlapping with rising ends, so a
-    // candidate need only be checked against the last accepted chunk in its dataset.
-    let mut last: Option<(DatasetPk, i64)> = None; // (dataset_id, last_block of last accepted)
-    for c in clear {
-        match last {
-            Some((dataset_id, end)) if dataset_id == c.dataset_id && c.first_block <= end => {
-                rejected.push(c);
-            }
-            _ => {
-                last = Some((c.dataset_id, c.last_block));
-                accepted.push(c.pk);
-            }
-        }
-    }
-    (accepted, rejected)
-}
-
-/// Log + count chunks refused at registration. Call every cycle so the gauge resets on a clean one.
-pub(super) fn report_registration_rejected(rejected: &[Candidate]) {
-    report(
-        rejected,
-        "chunks rejected at registration: block range overlaps a live chunk in the dataset",
-        "rejected at registration",
-        crate::metrics::report_registration_rejected,
-    );
-}
-
-fn report(
-    chunks: &[Candidate],
-    summary: &str,
-    per_chunk: &'static str,
-    emit: impl FnOnce(BTreeMap<String, i64>),
-) {
-    if !chunks.is_empty() {
-        tracing::warn!(count = chunks.len(), "{summary}");
-        for c in chunks {
-            tracing::debug!(
-                chunk = c.pk.0,
-                dataset_id = c.dataset_id.0,
-                first_block = c.first_block,
-                last_block = c.last_block,
-                "{per_chunk}"
-            );
-        }
-    }
-    emit(counts_by_dataset(chunks));
-}
-
-/// Returns the pks of the candidates that overlap an existing chunk in their dataset matching
-/// `chunk_state` (those to reject); candidates with no such overlap are absent from the result.
-async fn overlapping(
-    conn: &mut PgConnection,
-    candidates: &[Candidate],
-    chunk_state: &str,
 ) -> Result<HashSet<ChunkPk>> {
     if candidates.is_empty() {
         return Ok(HashSet::new());
@@ -145,7 +76,8 @@ async fn overlapping(
     // join, and a plan that sees the array cardinality picks a merge join sorting every live chunk
     // — minutes at production scale. A LATERAL with LIMIT can't be flattened, so the probe stays on
     // the index regardless of stats or plan-cache state.
-    // `chunk_state` is a trusted in-crate const (LIVE_ADMITTED), never user input.
+    // `OVERLAP_RANGE_PRED`/`LIVE_ADMITTED` are trusted in-crate consts, never user input — hence
+    // `AssertSqlSafe`.
     let sql = format!(
         r#"
         SELECT cand.chunk_pk
@@ -156,9 +88,8 @@ async fn overlapping(
             FROM sched_chunk_metadata s
             JOIN chunks c ON c.chunk_pk = s.chunk_pk
             WHERE c.dataset_id = cand.dataset_id
-              AND int8range(c.first_block, c.first_block + c.last_block_delta, '[]')
-                  && int8range(cand.first_block, cand.last_block, '[]')
-              AND {chunk_state}
+              AND {OVERLAP_RANGE_PRED}
+              AND {LIVE_ADMITTED}
             LIMIT 1
         ) hit
         "#
@@ -179,6 +110,53 @@ async fn overlapping(
         .iter()
         .map(|r| r.get::<ChunkPk, _>("chunk_pk"))
         .collect())
+}
+
+/// From candidates that already cleared the existing-chunk probe, keep the ones that don't overlap
+/// *each other*; lower `(first_block, chunk_pk)` wins. Input is batch-sized, so one sorted pass does
+/// it. Returns `(accepted pks, rejected candidates)`. The ingest API's `reject_intra_batch_overlap`
+/// does the same check but aborts the whole batch on the first overlap; here overlaps span many
+/// datasets and each loser is rejected individually.
+pub(super) fn settle_within_batch(mut clear: Vec<Candidate>) -> (Vec<ChunkPk>, Vec<Candidate>) {
+    clear.sort_unstable_by_key(|c| (c.dataset_id, c.first_block, c.pk));
+    let mut accepted = Vec::new();
+    let mut rejected = Vec::new();
+    // Sorted by start within a dataset, accepted ranges are non-overlapping with rising ends, so a
+    // candidate need only be checked against the last accepted chunk in its dataset.
+    let mut last: Option<(DatasetPk, i64)> = None; // (dataset_id, last_block of last accepted)
+    for c in clear {
+        match last {
+            Some((dataset_id, end)) if dataset_id == c.dataset_id && c.first_block <= end => {
+                rejected.push(c);
+            }
+            _ => {
+                last = Some((c.dataset_id, c.last_block));
+                accepted.push(c.pk);
+            }
+        }
+    }
+    (accepted, rejected)
+}
+
+/// Log + count chunks refused at registration. Call every cycle: emitting also when nothing was
+/// rejected resets the gauge.
+pub(super) fn report_registration_rejected(rejected: &[Candidate]) {
+    if !rejected.is_empty() {
+        tracing::warn!(
+            count = rejected.len(),
+            "chunks rejected at registration: block range overlaps a live chunk in the dataset"
+        );
+        for c in rejected {
+            tracing::debug!(
+                chunk = c.pk.0,
+                dataset_id = c.dataset_id.0,
+                first_block = c.first_block,
+                last_block = c.last_block,
+                "rejected at registration"
+            );
+        }
+    }
+    crate::metrics::report_registration_rejected(counts_by_dataset(rejected));
 }
 
 fn counts_by_dataset(chunks: &[Candidate]) -> BTreeMap<String, i64> {

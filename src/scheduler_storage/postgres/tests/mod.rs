@@ -3,6 +3,7 @@
 
 mod correction_tests;
 mod drain_tests;
+mod ingest_tests;
 mod inspect;
 mod registration_tests;
 mod schema;
@@ -12,7 +13,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::scheduler_storage::postgres::PostgresStorage;
 use crate::scheduler_storage::test_harness::pg_harness::fresh_db;
-use crate::scheduler_storage::test_harness::utils::{chunk, dataset};
+use crate::scheduler_storage::test_harness::utils::{chunk, new_dataset};
 use crate::scheduler_storage::{AssignmentId, ChunkPk, SchedulerStorage, SchemaId, StorageError};
 use crate::types::DatasetSchema;
 
@@ -23,16 +24,18 @@ fn fresh_storage(name: &str) -> PostgresStorage {
     fresh_db(name, TEST_ID.fetch_add(1, Ordering::Relaxed))
 }
 
-/// Insert one chunk (`id_seed`) into the already-registered `dataset_name` and register it.
+/// Insert one chunk (`id_seed`) into the already-registered `dataset_name` and register it. Stamps
+/// the dataset's current schema id (resolved now that `schema_id` is mandatory), so a chunk inserted
+/// after a `set_dataset_schema` pins the new schema while earlier chunks keep the old one.
 fn register_chunk(
     storage: &mut PostgresStorage,
     dataset_name: &str,
     id_seed: u32,
     size: u32,
 ) -> ChunkPk {
-    storage
-        .insert_new_chunks(vec![chunk(dataset_name, id_seed, size)])
-        .expect("insert chunk");
+    let mut c = chunk(dataset_name, id_seed, size);
+    c.schema_id = current_schema_id(storage, (*c.dataset).clone());
+    storage.insert_new_chunks(vec![c]).expect("insert chunk");
     let pks = storage.register_new_chunks().expect("register chunks");
     *pks.last().expect("at least one pk registered")
 }
@@ -45,7 +48,7 @@ fn insert_and_register_chunk(
     size: u32,
 ) -> ChunkPk {
     // Ignore already-exists errors for shared dataset names.
-    let _ = storage.insert_new_datasets(vec![(dataset(dataset_name), DatasetSchema::default())]);
+    let _ = storage.insert_new_datasets(vec![new_dataset(dataset_name, DatasetSchema::default())]);
     register_chunk(storage, dataset_name, id_seed, size)
 }
 
@@ -55,13 +58,13 @@ fn confirm(storage: &mut PostgresStorage, assignment_id: AssignmentId, now: u64)
         .expect("confirm succeeds");
 }
 
-/// The id of `ds`'s current schema (the row with `superseded_at IS NULL`).
+/// The id of `ds`'s latest-registered write schema (write schemas have no "current" pointer).
 fn current_schema_id(storage: &mut PostgresStorage, ds: String) -> SchemaId {
     storage
         .with_conn(async move |conn| {
             let id: SchemaId = sqlx::query_scalar(
-                "SELECT s.id FROM schemas s JOIN datasets d ON d.id = s.dataset_id \
-                 WHERE d.name = $1 AND s.superseded_at IS NULL",
+                "SELECT max(s.id) FROM schemas s JOIN datasets d ON d.id = s.dataset_id \
+                 WHERE d.name = $1",
             )
             .bind(&ds)
             .fetch_one(&mut *conn)

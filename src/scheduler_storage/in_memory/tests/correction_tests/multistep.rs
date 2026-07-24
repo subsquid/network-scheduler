@@ -47,12 +47,12 @@ impl TestStorage for PostgresStorage {
 /// `run_real_cycle`, mirroring the real scheduler loop.
 fn make_storage<S: TestStorage>(chunks: Vec<NewChunk>) -> S {
     let mut storage = S::fresh();
-    let datasets: Vec<(String, DatasetSchema)> = chunks
+    let datasets: Vec<NewDataset> = chunks
         .iter()
         .map(|chunk| (*chunk.dataset).clone())
         .collect::<HashSet<_>>()
         .into_iter()
-        .map(|name| (name, DatasetSchema::default()))
+        .map(|name| NewDataset::with_name(name.clone(), name, DatasetSchema::default()))
         .collect();
     storage.insert_new_datasets(datasets).unwrap();
     storage.insert_new_chunks(chunks).unwrap();

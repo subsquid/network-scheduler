@@ -2,14 +2,19 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-/// A dataset's data schema: its tables, the fields of each table, and the fields returned by
-/// default. Stored once per dataset (see the `schemas` table) rather than per chunk.
+/// A dataset's tables and their fields. The same shape serves as both write schema (`schemas`)
+/// and read schema (`read_schemas`).
+// `deny_unknown_fields`: it's also the request body, so typo'd fields are rejected, not silently dropped.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
 pub struct DatasetSchema {
     tables: BTreeMap<String, TableSchema>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
 pub struct TableSchema {
     pub fields: Vec<String>,
     /// The implicit projection for callers that omit a column list; a subset of `fields`.
@@ -25,9 +30,11 @@ impl DatasetSchema {
         &self.tables
     }
 
+    /// Reject schemas that can't be stored safely: table names must be plain file stems, unique
+    /// case-insensitively, and `default_fields` a subset of `fields`.
     pub fn validate(&self) -> anyhow::Result<()> {
         let mut lowercased: BTreeMap<String, &str> = BTreeMap::new();
-        for (table, ts) in &self.tables {
+        for (table, table_schema) in &self.tables {
             let trimmed = table.trim();
             if trimmed != table
                 || trimmed.is_empty()
@@ -42,8 +49,8 @@ impl DatasetSchema {
                 anyhow::bail!("table names {prev:?} and {table:?} collide case-insensitively");
             }
             let fields: std::collections::BTreeSet<&str> =
-                ts.fields.iter().map(String::as_str).collect();
-            for default in &ts.default_fields {
+                table_schema.fields.iter().map(String::as_str).collect();
+            for default in &table_schema.default_fields {
                 if !fields.contains(default.as_str()) {
                     anyhow::bail!("table {table:?}: default field {default:?} is not in `fields`");
                 }
@@ -52,6 +59,7 @@ impl DatasetSchema {
         Ok(())
     }
 
+    #[must_use]
     pub fn canonicalized(&self) -> Self {
         let mut canon = self.clone();
         for table in canon.tables.values_mut() {

@@ -11,7 +11,7 @@ work. **This page is the single source of truth for what is actually built and w
 | Placement algorithm (capacity-aware reconcile) | `src/multistep_scheduler/mod.rs` |
 | MVCC storage protocol | `src/scheduler_storage/` |
 | In-memory backend | `src/scheduler_storage/in_memory/` |
-| Postgres backend | `src/scheduler_storage/postgres/` + `migrations/0001_sched_tables.sql` |
+| Postgres backend | `src/scheduler_storage/postgres/` + `crates/scheduler-metadata/migrations/0001_sched_tables.sql` |
 | Simulation harness (drives both backends) | `src/multistep_scheduler/sim/` |
 
 ## Reading order
@@ -22,12 +22,15 @@ work. **This page is the single source of truth for what is actually built and w
    visibility model, chunk lifecycle, invariants, and the corrections and deferred-removal
    sub-protocols.
 3. **[mvcc-schema.md](mvcc-schema.md)** — Postgres table and column reference; kept in sync with
-   `migrations/0001_sched_tables.sql`.
+   `crates/scheduler-metadata/migrations/0001_sched_tables.sql`.
 4. **[capacity-aware-scheduling.md](capacity-aware-scheduling.md)** — the placement algorithm:
    how `Reconcile` keeps every published assignment physically feasible.
 5. **[nonoverlap-promotion-gate.md](nonoverlap-promotion-gate.md)** — non-overlap enforcement
    (registration-time rejection + the promotion-time backstop) that keeps a dataset's chunk ranges
    non-overlapping.
+6. **[metadata-service.md](metadata-service.md)** — the ingestion write path: a shared crate owning
+   the ingest SQL, and an HTTP service in front of it, so ~300 ingesters don't each talk to
+   Postgres directly.
 
 ## Status & limitations
 
@@ -54,6 +57,7 @@ built.
 | Production wiring (`controller.rs`) | 📐 | Subsystem is sim-only behind `mvcc-chunks`. |
 | Backpressure / under-replication observability counters | 📐 | `NotEnoughCapacity` error exists; the per-cycle metrics surface does not. |
 | Non-overlap enforcement (no overlapping chunk ranges per dataset) | ✅ | Registration-time rejection + promotion backstop, both backends. See [nonoverlap-promotion-gate.md](nonoverlap-promotion-gate.md). |
+| Ingestion write path (shared crate + metadata service) | 📐 | The storage's ingestion entry points have no production caller. See [metadata-service.md](metadata-service.md). |
 
 ### Known limitations and open questions
 

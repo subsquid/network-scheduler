@@ -1,11 +1,6 @@
-//! The meat of [`PostgresStorage::register_corrections`] (bulk same-range chunk replacement; the
-//! trait's single-swap `register_correction` is a batch of one).
-//!
-//! A correction is a same-range 1-to-1 chunk swap. The schema enforces most invariants on insert;
-//! the guards here cover what no constraint can. Everything is set-based in one transaction —
-//! all corrections of a call land or none do — so a 147K-chunk dataset replacement is a handful of
-//! statements instead of ~900K per-correction round-trips (measured ~9x faster on a local socket;
-//! far more over TCP).
+//! Bulk same-range chunk replacement (single-swap `register_correction` is a batch of one); reorgs
+//! drive this. Schema enforces most invariants on insert; the guards here cover what no constraint
+//! can. One transaction, all-or-nothing.
 
 use std::collections::HashMap;
 
@@ -13,23 +8,33 @@ use anyhow::Context;
 use sqlx::postgres::PgConnection;
 use sqlx::{Connection, Postgres, Transaction};
 
-use crate::scheduler_storage::{ChunkPk, NewChunk, StorageError, Tick};
+use crate::error::StorageError;
+use crate::ids::ChunkPk;
+use crate::metrics::PhaseTimer;
+use crate::new_chunk::NewChunk;
 
-use super::rows::{ChunkInsertArrays, block_range_columns, is_unique_violation, tick_to_i64};
+use super::rows::{
+    ChunkInsertArrays, Tick, bind_chunk_arrays, block_range_columns, is_unique_violation,
+    tick_to_i64,
+};
 
 /// Register corrections in bulk: one transaction, all-or-nothing. Returns the replacement pks in
 /// input order.
-pub(super) async fn register_corrections(
+pub async fn register_corrections(
     conn: &mut PgConnection,
     corrections: &[(ChunkPk, NewChunk)],
     now: Tick,
     batch_size: usize,
 ) -> Result<Vec<ChunkPk>, StorageError> {
-    let mut timer = crate::metrics::PhaseTimer::new("register_corrections");
+    let mut timer = PhaseTimer::new("register_corrections");
     let mut tx = conn.begin().await.context("register_corrections: begin")?;
 
+    // No dataset lock: the chunk UNIQUE/FK, chunk_corrections PK, and admission gate enforce every invariant.
+    // Sort by old-chunk pk so concurrent batches lock chunk_corrections PKs in the same order and can't deadlock.
+    let mut ordered = corrections.to_vec();
+    ordered.sort_unstable_by_key(|(old_pk, _)| old_pk.0);
     let mut new_by_old = HashMap::with_capacity(corrections.len());
-    for batch in corrections.chunks(batch_size) {
+    for batch in ordered.chunks(batch_size) {
         reject_unavailable_olds(&mut tx, batch).await?;
         reject_changed_ranges(&mut tx, batch).await?;
         insert_batch(&mut tx, batch, now, &mut new_by_old).await?;
@@ -50,9 +55,8 @@ pub(super) async fn register_corrections(
         .collect()
 }
 
-/// Reject if any old chunk is on its way out — rejected, or being removed/dropped — so nothing
-/// portal-visible is left for its replacement to supersede. A missing old chunk passes here and is
-/// caught by the link insert's FK instead.
+/// Reject an old chunk already on its way out (rejected/removed/dropped) — nothing left to supersede.
+/// A missing old chunk passes here, caught by the link insert's FK instead.
 async fn reject_unavailable_olds(
     tx: &mut Transaction<'_, Postgres>,
     batch: &[(ChunkPk, NewChunk)],
@@ -81,8 +85,7 @@ async fn reject_unavailable_olds(
     Ok(())
 }
 
-/// Refuse a range-changing replacement before any insert — it would leave a dangling pending
-/// correction or publish an overlap.
+/// Refuse a range-changing replacement — it would leave a dangling correction or publish an overlap.
 async fn reject_changed_ranges(
     tx: &mut Transaction<'_, Postgres>,
     batch: &[(ChunkPk, NewChunk)],
@@ -124,8 +127,7 @@ async fn reject_changed_ranges(
     Ok(())
 }
 
-/// Insert one batch's replacement chunks and correction links in a single statement; fills
-/// `new_by_old`. Fewer correction rows than payload rows means a dataset name didn't resolve.
+/// Insert one batch's replacement chunks and correction links in a single statement; fills `new_by_old`.
 async fn insert_batch(
     tx: &mut Transaction<'_, Postgres>,
     batch: &[(ChunkPk, NewChunk)],
@@ -133,58 +135,55 @@ async fn insert_batch(
     new_by_old: &mut HashMap<ChunkPk, ChunkPk>,
 ) -> Result<(), StorageError> {
     let old_pks: Vec<ChunkPk> = batch.iter().map(|(old_pk, _)| *old_pk).collect();
+    let datasets: Vec<&str> = batch
+        .iter()
+        .map(|(_, chunk)| chunk.dataset.as_str())
+        .collect();
     let p = ChunkInsertArrays::from_chunks(batch.iter().map(|(_, chunk)| chunk));
 
-    // One statement: the ins CTE inserts the chunks; the outer INSERT joins back on the unique
-    // (dataset_id, chunk_id) to pair each fresh pk with its old chunk.
-    let inserted = sqlx::query_as::<_, (ChunkPk, ChunkPk)>(
-        r#"
+    // ins CTE inserts the chunks; the outer INSERT joins back on unique (dataset_id, chunk_id) to pair each fresh pk with its old.
+    let inserted = bind_chunk_arrays!(
+        sqlx::query_as::<_, (ChunkPk, ChunkPk)>(
+            r#"
         WITH payload AS (
             SELECT x.old_pk, d.id AS dataset_id, x.chunk_id, x.size,
-                   COALESCE(x.schema_id, cur.id) AS schema_id, x.tables_present,
-                   x.first_block, x.last_block_delta
+                   x.schema_id, x.tables_present,
+                   x.first_block, x.last_block_delta, x.last_block_hash, x.last_block_timestamp
             FROM UNNEST($1::bigint[], $2::text[], $3::text[], $4::int[],
-                        $5::int[], $6::varbit[], $7::bigint[], $8::int[])
+                        $5::int[], $6::varbit[], $7::bigint[], $8::int[], $9::text[], $10::bigint[])
                  AS x(old_pk, dataset, chunk_id, size,
                       schema_id, tables_present,
-                      first_block, last_block_delta)
+                      first_block, last_block_delta, last_block_hash, last_block_timestamp)
             JOIN datasets d ON d.name = x.dataset
-            -- No explicit pin -> stamp the dataset's current schema.
-            LEFT JOIN schemas cur ON cur.dataset_id = d.id AND cur.superseded_at IS NULL
         ),
         ins AS (
             INSERT INTO chunks (
                 dataset_id, chunk_id, size, schema_id, tables_present,
-                first_block, last_block_delta
+                first_block, last_block_delta, last_block_hash, last_block_timestamp
             )
             SELECT
                 dataset_id, chunk_id, size, schema_id, tables_present,
-                first_block, last_block_delta
+                first_block, last_block_delta, last_block_hash, last_block_timestamp
             FROM payload
             RETURNING chunk_pk, dataset_id, chunk_id
         )
         INSERT INTO chunk_corrections (old_chunk_pk, new_chunk_pk, dataset_id, created_at)
-        SELECT p.old_pk, i.chunk_pk, i.dataset_id, $9
+        SELECT p.old_pk, i.chunk_pk, i.dataset_id, $11
         FROM ins i
         JOIN payload p ON p.dataset_id = i.dataset_id AND p.chunk_id = i.chunk_id
         RETURNING old_chunk_pk, new_chunk_pk
         "#,
+        )
+        .bind(&old_pks)
+        .bind(&datasets),
+        p
     )
-    .bind(&old_pks)
-    .bind(&p.datasets)
-    .bind(&p.chunk_ids)
-    .bind(&p.sizes)
-    .bind(&p.schema_ids)
-    .bind(&p.tables_present)
-    .bind(&p.first_blocks)
-    .bind(&p.last_block_deltas)
     .bind(tick_to_i64(now))
     .fetch_all(&mut **tx)
     .await;
     let rows = match inserted {
         Ok(rows) => rows,
-        // The constraint name tells which uniqueness broke: the replacement chunk's
-        // (dataset_id, chunk_id) or the one-correction-per-old-chunk PK.
+        // Constraint name says which uniqueness broke: replacement (dataset_id, chunk_id) or the one-correction-per-old-chunk PK.
         Err(e) if is_unique_violation(&e) => {
             let reason = match e.as_database_error().and_then(|d| d.constraint()) {
                 Some("chunk_corrections_pkey") => {
@@ -200,17 +199,14 @@ async fn insert_batch(
                 .into());
         }
     };
-    // Fewer rows than inputs: the payload→datasets join dropped a row, i.e. a replacement names a
-    // dataset that was never registered — nothing else shrinks the set (the inserted chunks join
-    // back on their unique (dataset_id, chunk_id)). A caller bug: corrections built from existing
-    // chunks carry known datasets. The single-swap path rejected this the same way.
+    // Fewer rows than inputs: the payload→datasets join dropped a replacement naming an unregistered dataset.
     if rows.len() < batch.len() {
         let unknown = unknown_dataset(tx, batch).await;
         return Err(StorageError::CorrectionRejected {
             reason: format!("replacement chunk dataset {unknown} is unknown"),
         });
     }
-    new_by_old.extend(rows.into_iter());
+    new_by_old.extend(rows);
     Ok(())
 }
 
