@@ -65,7 +65,13 @@ pub fn render_markdown(spec: &utoipa::openapi::OpenApi) -> String {
         "Generated from the `#[utoipa::path]` annotations — do not edit by hand. \
          Regenerate: `UPDATE_API_DOC=1 cargo test -p metadata-service --test api_doc`.\n\n\
          Authentication: `Authorization: Bearer <token>`. Admin endpoints need an admin token; \
-         dataset endpoints need a token scoped to that dataset; `/health` and `/metrics` are open.\n",
+         dataset endpoints need a token scoped to that dataset; `/health` and `/metrics` are open. \
+         Every guarded endpoint can also return `401` (missing/unknown token; carries \
+         `WWW-Authenticate: Bearer`) or `403` (valid token, wrong role or dataset scope — not \
+         retryable), both as [`ErrorBody`](#errorbody).\n\n\
+         Any endpoint can return `503` with an **empty body** when the whole request exceeds the \
+         server-side timeout — distinct from `POST /chunks`'s `dataset_busy` 503, which carries an \
+         `ErrorBody`. Oversized bodies are rejected by a global size limit.\n",
     );
 
     if let Some(paths) = v["paths"].as_object() {

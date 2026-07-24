@@ -66,6 +66,7 @@ pub async fn create_dataset(
     responses(
         (status = 200, description = "Registered (idempotent by content)", body = WriteSchemaResponse),
         (status = 400, description = "Invalid schema", body = ErrorBody),
+        (status = 404, description = "`dataset_not_found`: no such dataset", body = ErrorBody),
     ),
     security(("bearer" = []))
 )]
@@ -114,7 +115,8 @@ pub async fn get_write_schemas(
     ),
     responses(
         (status = 200, description = "The schema", body = WriteSchemaViewResponse),
-        (status = 404, description = "No such schema for this dataset", body = ErrorBody),
+        (status = 400, description = "`schema_not_found`: no such schema for this dataset — deliberately 400, a client-supplied id is a client error", body = ErrorBody),
+        (status = 404, description = "`dataset_not_found`: no such dataset", body = ErrorBody),
     ),
     security(("bearer" = []))
 )]
@@ -144,6 +146,8 @@ pub async fn get_write_schema(
     request_body = DatasetSchema,
     responses(
         (status = 200, description = "Promoted (idempotent by content)", body = ReadSchemaResponse),
+        (status = 400, description = "Invalid schema or malformed body", body = ErrorBody),
+        (status = 404, description = "`dataset_not_found`: no such dataset", body = ErrorBody),
         (status = 409, description = "Concurrent schema change; retry", body = ErrorBody),
     ),
     security(("bearer" = []))
@@ -165,8 +169,8 @@ pub async fn put_read_schema(
 #[utoipa::path(get, path = "/datasets/{name}/read-schema", tag = "schemas",
     params(("name" = String, Path, description = "Dataset name")),
     responses(
-        (status = 200, description = "The current read schema", body = CurrentReadSchemaResponse),
-        (status = 404, description = "Never promoted", body = ErrorBody),
+        (status = 200, description = "The current read schema — every dataset has one, seeded at creation", body = CurrentReadSchemaResponse),
+        (status = 404, description = "`dataset_not_found`: no such dataset", body = ErrorBody),
     ),
     security(("bearer" = []))
 )]
@@ -189,7 +193,9 @@ pub async fn get_read_schema(
     request_body = InsertChunksRequest,
     responses(
         (status = 204, description = "All chunks inserted"),
-        (status = 409, description = "`duplicate_chunks`: listed ids were already present (new ones in the batch WERE committed). `range_overlap`: nothing committed; the batch overlaps a live chunk", body = ErrorBody),
+        (status = 400, description = "Invalid batch: malformed body, unknown schema or table, unstorable range, or a chunk id repeated within the batch (`duplicate_in_batch`)", body = ErrorBody),
+        (status = 404, description = "`dataset_not_found`: no such dataset", body = ErrorBody),
+        (status = 409, description = "`duplicate_chunks`: listed ids were already present (new ones in the batch WERE committed). `range_overlap`: nothing committed — the batch overlaps an existing live chunk (pending or admitted) or two chunks in the batch overlap each other", body = ErrorBody),
         (status = 503, description = "`dataset_busy`: lock wait timed out behind a wedged writer; retry", body = ErrorBody),
     ),
     security(("bearer" = []))
@@ -256,7 +262,10 @@ pub async fn post_corrections(
 /// an empty dataset. The ingester continues from the next block.
 #[utoipa::path(get, path = "/datasets/{name}/head", tag = "chunks",
     params(("name" = String, Path, description = "Dataset name")),
-    responses((status = 200, description = "The resume point", body = HeadResponse)),
+    responses(
+        (status = 200, description = "The resume point", body = HeadResponse),
+        (status = 404, description = "`dataset_not_found`: no such dataset", body = ErrorBody),
+    ),
     security(("bearer" = []))
 )]
 pub async fn get_head(
@@ -271,7 +280,10 @@ pub async fn get_head(
         ("name" = String, Path, description = "Dataset name"),
         ("id" = String, Path, description = "Chunk id"),
     ),
-    responses((status = 200, description = "pending | admitted | rejected | not_found", body = ChunkStatusResponse)),
+    responses(
+        (status = 200, description = "pending | admitted | rejected | not_found — an absent chunk in an existing dataset is 200 `not_found`, not a 404", body = ChunkStatusResponse),
+        (status = 404, description = "`dataset_not_found`: no such dataset", body = ErrorBody),
+    ),
     security(("bearer" = []))
 )]
 pub async fn get_chunk_status(

@@ -3,7 +3,10 @@
 use metadata_service::openapi::{ApiDoc, render_markdown};
 use utoipa::OpenApi;
 
-const DOC_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../docs/metadata-service-api.md");
+const DOC_PATH: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../docs/metadata-service-api.md"
+);
 
 /// `docs/metadata-service-api.md` must match what the annotations render. Bless with
 /// `UPDATE_API_DOC=1 cargo test -p metadata-service --test api_doc`.

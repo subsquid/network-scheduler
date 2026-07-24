@@ -4,7 +4,9 @@ Ingesters report chunk metadata here instead of the scheduler discovering it fro
 
 Generated from the `#[utoipa::path]` annotations — do not edit by hand. Regenerate: `UPDATE_API_DOC=1 cargo test -p metadata-service --test api_doc`.
 
-Authentication: `Authorization: Bearer <token>`. Admin endpoints need an admin token; dataset endpoints need a token scoped to that dataset; `/health` and `/metrics` are open.
+Authentication: `Authorization: Bearer <token>`. Admin endpoints need an admin token; dataset endpoints need a token scoped to that dataset; `/health` and `/metrics` are open. Every guarded endpoint can also return `401` (missing/unknown token; carries `WWW-Authenticate: Bearer`) or `403` (valid token, wrong role or dataset scope — not retryable), both as [`ErrorBody`](#errorbody).
+
+Any endpoint can return `503` with an **empty body** when the whole request exceeds the server-side timeout — distinct from `POST /chunks`'s `dataset_busy` 503, which carries an `ErrorBody`. Oversized bodies are rejected by a global size limit.
 
 ## `POST /datasets`
 
@@ -28,7 +30,9 @@ Request body: [`InsertChunksRequest`](#insertchunksrequest)
 
 Responses:
 - `204` All chunks inserted
-- `409` `duplicate_chunks`: listed ids were already present (new ones in the batch WERE committed). `range_overlap`: nothing committed; the batch overlaps a live chunk — [`ErrorBody`](#errorbody)
+- `400` Invalid batch: malformed body, unknown schema or table, unstorable range, or a chunk id repeated within the batch (`duplicate_in_batch`) — [`ErrorBody`](#errorbody)
+- `404` `dataset_not_found`: no such dataset — [`ErrorBody`](#errorbody)
+- `409` `duplicate_chunks`: listed ids were already present (new ones in the batch WERE committed). `range_overlap`: nothing committed — the batch overlaps an existing live chunk (pending or admitted) or two chunks in the batch overlap each other — [`ErrorBody`](#errorbody)
 - `503` `dataset_busy`: lock wait timed out behind a wedged writer; retry — [`ErrorBody`](#errorbody)
 
 ## `GET /datasets/{name}/chunks/{id}/status`
@@ -38,7 +42,8 @@ Path parameters:
 - `id` (string) — Chunk id
 
 Responses:
-- `200` pending | admitted | rejected | not_found — [`ChunkStatusResponse`](#chunkstatusresponse)
+- `200` pending | admitted | rejected | not_found — an absent chunk in an existing dataset is 200 `not_found`, not a 404 — [`ChunkStatusResponse`](#chunkstatusresponse)
+- `404` `dataset_not_found`: no such dataset — [`ErrorBody`](#errorbody)
 
 ## `POST /datasets/{name}/corrections`
 
@@ -62,6 +67,7 @@ Path parameters:
 
 Responses:
 - `200` The resume point — [`HeadResponse`](#headresponse)
+- `404` `dataset_not_found`: no such dataset — [`ErrorBody`](#errorbody)
 
 ## `GET /datasets/{name}/read-schema`
 
@@ -71,8 +77,8 @@ Path parameters:
 - `name` (string) — Dataset name
 
 Responses:
-- `200` The current read schema — [`CurrentReadSchemaResponse`](#currentreadschemaresponse)
-- `404` Never promoted — [`ErrorBody`](#errorbody)
+- `200` The current read schema — every dataset has one, seeded at creation — [`CurrentReadSchemaResponse`](#currentreadschemaresponse)
+- `404` `dataset_not_found`: no such dataset — [`ErrorBody`](#errorbody)
 
 ## `PUT /datasets/{name}/read-schema`
 
@@ -85,6 +91,8 @@ Request body: [`DatasetSchema`](#datasetschema)
 
 Responses:
 - `200` Promoted (idempotent by content) — [`ReadSchemaResponse`](#readschemaresponse)
+- `400` Invalid schema or malformed body — [`ErrorBody`](#errorbody)
+- `404` `dataset_not_found`: no such dataset — [`ErrorBody`](#errorbody)
 - `409` Concurrent schema change; retry — [`ErrorBody`](#errorbody)
 
 ## `GET /datasets/{name}/write-schemas`
@@ -109,6 +117,7 @@ Request body: [`DatasetSchema`](#datasetschema)
 Responses:
 - `200` Registered (idempotent by content) — [`WriteSchemaResponse`](#writeschemaresponse)
 - `400` Invalid schema — [`ErrorBody`](#errorbody)
+- `404` `dataset_not_found`: no such dataset — [`ErrorBody`](#errorbody)
 
 ## `GET /datasets/{name}/write-schemas/{id}`
 
@@ -120,7 +129,8 @@ Path parameters:
 
 Responses:
 - `200` The schema — [`WriteSchemaViewResponse`](#writeschemaviewresponse)
-- `404` No such schema for this dataset — [`ErrorBody`](#errorbody)
+- `400` `schema_not_found`: no such schema for this dataset — deliberately 400, a client-supplied id is a client error — [`ErrorBody`](#errorbody)
+- `404` `dataset_not_found`: no such dataset — [`ErrorBody`](#errorbody)
 
 ## `GET /health`
 
