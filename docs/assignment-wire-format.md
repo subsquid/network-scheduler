@@ -78,20 +78,28 @@ PortalAssignment { id, chunk_workers, chunks, workers }   // no replication_by_w
 that's already right by construction.
 
 **Schema bundle (PR #52, `src/scheduler_storage/schema_bundle.rs`) materially changes the file-set
-story.** `run_scheduling_cycle` now returns `(WorkerAssignment, SchemaBundle)` as a pair — a
-content-addressed (`BundleId`, SHA-256 over sorted `schema_id`s) snapshot of exactly the schemas the
-assignment's chunks reference. `SchemaBundle::chunk_files(chunk)` resolves a chunk's
-`<table>.parquet` file list from its pinned `schema_id` + `tables_present` bitmap — this is
-production-quality and tested, not the dead code it was earlier in this investigation. Per
-[schema-bundle-lifecycle.md](schema-bundle-lifecycle.md), the bundle is generated and frozen with
-the assignment, and its consistency is checked in simulation, but **delivery to workers alongside
-the assignment is explicitly called out as the still-open follow-up** — this doc is that follow-up.
+story — and the wire format should lean on it, not route around it.** `run_scheduling_cycle` now
+returns `(WorkerAssignment, SchemaBundle)` as a pair — a content-addressed (`BundleId`, SHA-256 over
+sorted `schema_id`s) snapshot of exactly the schemas the assignment's chunks reference.
+`SchemaBundle::chunk_files(chunk)` resolves a chunk's `<table>.parquet` file list from its pinned
+`schema_id` + `tables_present` bitmap — production-quality and tested, not the dead code it was
+earlier in this investigation. But the intent behind `schema_id`/`tables_present` was precisely to
+avoid ever putting a resolved file list on the wire: the worker reads the schema for its chunk,
+determines which tables are present, and downloads accordingly — `chunk_files()` is what the
+*worker* runs, not a scheduler-side precomputation to embed. So the worker-assignment should carry
+`schema_id` (and `tables_present`) per chunk, not a `files` field.
+
+**The bundle is published as a separate artifact, accessible to both worker and portal** — settled,
+not an open question. Per [schema-bundle-lifecycle.md](schema-bundle-lifecycle.md), it's generated
+and frozen with the assignment, and its consistency is checked in simulation; delivery of that
+artifact alongside/adjacent to the assignment is the still-open follow-up this doc scopes.
 
 The same lifecycle doc also flags **"the portal validating incoming queries against the current
-schema"** as planned-but-not-wired. That means portal-assignment likely needs a schema reference
-too — not `tables_present` (a per-chunk file-presence fact the portal has no use for), but the
-dataset's current column/table definitions, for query validation. This is a correction to the
-earlier assumption in this investigation that portal never needs schema information at all.
+schema"** as planned-but-not-wired. Portal-assignment needs a schema reference too — not
+`tables_present` (a per-chunk file-presence fact the portal has no use for), but a `schema_id`
+pointing at the dataset's current column/table definitions in the published bundle, for query
+validation. This is a correction to the earlier assumption in this investigation that portal never
+needs schema information at all.
 
 `DatasetSchema` (`src/types/dataset_schema.rs`) today only carries `tables → { fields,
 default_fields }` — table and column *names* only, no types, no nullable/hidden flags. That's
@@ -102,10 +110,13 @@ extensions that proposal adds.
 
 ## Gaps
 
-1. **File/URL derivation is half-solved.** Filenames are now real (`SchemaBundle::chunk_files`), but
-   nothing calls it from an assignment-serialization path yet, and **URL construction has no
-   equivalent in the new path at all** — `dataset_base_url`/`base_url` (built from
-   `config.storage_domain` + `chunk.bucket()`) exists only in the legacy `types/assignment.rs::encode_fb`.
+1. **File/URL derivation is half-solved.** Filename derivation is real and worker-side by design
+   (`SchemaBundle::chunk_files`, meant to run on the worker once it has the schema, not to be
+   precomputed by the scheduler) — but nothing yet delivers the bundle to the worker, or puts
+   `schema_id`/`tables_present` on the wire at all. And **URL construction has no equivalent in the
+   new path at all** — `dataset_base_url`/`base_url` (built from `config.storage_domain` +
+   `chunk.bucket()`) exists only in the legacy `types/assignment.rs::encode_fb`, and that part
+   *does* stay scheduler-side regardless of the file-list decision.
 2. **Worker version-status is unreachable from Postgres.** `sched_workers.version` is fetched into
    `WorkerRow` and then ignored — `worker_status_from_row` (`postgres/rows.rs:152-158`) only
    branches on `inactive_since`. `DeprecatedVersion`/`UnsupportedVersion` (both consumed by
@@ -137,11 +148,11 @@ overlap except on identity fields.
 | `id`, `dataset_id` | existing |
 | `worker_indexes` | existing (`chunk_workers`) |
 | `dataset_base_url`, `base_url` | **new** — port URL construction out of legacy `encode_fb` |
-| `files` | **new** — wire in `SchemaBundle::chunk_files`, already built and tested |
+| `schema_id`, `tables_present` | existing (`WorkerAssignmentChunk`) — needs to actually reach the wire; the worker resolves files itself via the published bundle's `chunk_files()`, not a precomputed `files` field |
 | worker `peer_id` | existing |
 | worker `status` (version-aware) | **fix** — make `worker_status_from_row` compare `version` against configured thresholds |
 | worker `encrypted_headers` | **new** — port the existing sealing logic; no schema change |
-| the schema bundle itself | **new** — delivery mechanism per schema-bundle-lifecycle.md's open item |
+| bundle reference (`BundleId`) | **new** — points at the separately-published schema artifact (see above) |
 
 Explicitly excludes `last_block_hash`/`last_block_timestamp` — no worker consumer.
 
@@ -153,7 +164,7 @@ Explicitly excludes `last_block_hash`/`last_block_timestamp` — no worker consu
 | `worker_indexes` from **confirmed** routing | existing, already correct |
 | `last_block_hash`, `last_block_timestamp` | **new** — columns already exist, just add to the portal chunk projection/query |
 | worker `peer_id`, version-aware `status` | existing + same status fix as worker-assignment |
-| current dataset schema (table/column names, for query validation) | **new** — not `tables_present`; a dataset-level reference, not per-chunk |
+| current `schema_id` (reference into the published bundle, for query validation) | **new** — a dataset-level reference, not per-chunk, and not the schema content itself |
 
 Explicitly excludes `dataset_base_url`, `base_url`, `files`, `encrypted_headers` — no portal
 consumer, and excluding them shrinks the portal blob meaningfully at scale.
@@ -168,18 +179,6 @@ consumer, and excluding them shrinks the portal blob meaningfully at scale.
 - **"Stale" redefinition** — needs an explicit decision (reinstate a storage-based signal, or
   formally redefine and communicate the change), since both consumers branch on this status.
 - **Confirmation watermark** — not a wire-format field, but portal-assignment publication has no
-  production path without it (gap 6). A prerequisite, not a nice-to-have.
-
-## Open questions for whoever picks this up
-
-1. Does the schema bundle ride inside the worker-assignment flatbuffer, or get published as a
-   separate artifact the assignment merely references by `BundleId`? Lifecycle guarantees
-   (schema present before any portal can name its chunk, retained through the M-tick drain) hold
-   either way; this is purely a delivery/format choice.
-2. Does portal-assignment need the same `SchemaBundle`, or only the dataset's *current* read schema
-   (a single definition, not a per-chunk-pinned set)? The lifecycle doc frames portal's need as
-   query validation against "the current schema," which sounds like the latter — worth confirming
-   before building it as a bundle-shaped artifact by default.
-3. Production `M` (drain window) and `X%` (quorum) values — unset everywhere, referenced but not
-   chosen. Independent of wire format, but relevant to when a portal-assignment is even considered
-   valid to serve.
+  production path without it (gap 6). A prerequisite, not a nice-to-have; picking production `M`/`X%`
+  values is scheduler-lifecycle work, not part of this doc's scope — see `docs/README.md`'s known
+  limitations.
