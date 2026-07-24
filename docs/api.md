@@ -42,7 +42,7 @@ Responses:
 
 ## `POST /datasets/{name}/corrections`
 
-Replace chunks after a reorg: each old chunk is superseded 1:1 by a new chunk covering the same block range. All-or-nothing: on success every listed correction was applied.
+Register chunk replacements after a reorg: each old chunk is superseded 1:1 by a new chunk covering the same block range. Success means all listed corrections are durably REGISTERED (all-or-nothing), not yet applied: the old chunk keeps serving until workers confirm holding the replacement, then the scheduler performs the swap. A registered correction is never rejected later — replacements are exempt from the overlap gate by design.
 
 Path parameters:
 - `name` (string) — Dataset name
@@ -50,7 +50,7 @@ Path parameters:
 Request body: [`CorrectionsRequest`](#correctionsrequest)
 
 Responses:
-- `200` Every correction applied — [`CorrectionsResponse`](#correctionsresponse)
+- `200` All corrections registered; the scheduler swaps each in once workers confirm its replacement — [`CorrectionsResponse`](#correctionsresponse)
 - `409` Rejected wholesale (unknown old chunk, changed range, duplicate, or unavailable old chunk) — [`ErrorBody`](#errorbody)
 
 ## `GET /datasets/{name}/head`
@@ -166,7 +166,7 @@ One of: `"pending"`, `"admitted"`, `"rejected"`, `"not_found"`
 
 | field | type | required | notes |
 |---|---|---|---|
-| `corrected` | integer | yes |  |
+| `corrected` | integer | yes | Count of corrections registered (the swap itself happens later, scheduler-side). |
 
 ## `CreateDatasetRequest`
 

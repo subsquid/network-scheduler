@@ -107,6 +107,7 @@ pub struct CorrectionsRequest {
 }
 #[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct CorrectionsResponse {
+    /// Count of corrections registered (the swap itself happens later, scheduler-side).
     pub corrected: usize,
 }
 

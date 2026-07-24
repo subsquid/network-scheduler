@@ -217,13 +217,16 @@ pub async fn post_chunks(
     }
 }
 
-/// Replace chunks after a reorg: each old chunk is superseded 1:1 by a new chunk covering the
-/// same block range. All-or-nothing: on success every listed correction was applied.
+/// Register chunk replacements after a reorg: each old chunk is superseded 1:1 by a new chunk
+/// covering the same block range. Success means all listed corrections are durably REGISTERED
+/// (all-or-nothing), not yet applied: the old chunk keeps serving until workers confirm holding
+/// the replacement, then the scheduler performs the swap. A registered correction is never
+/// rejected later — replacements are exempt from the overlap gate by design.
 #[utoipa::path(post, path = "/datasets/{name}/corrections", tag = "chunks",
     params(("name" = String, Path, description = "Dataset name")),
     request_body = CorrectionsRequest,
     responses(
-        (status = 200, description = "Every correction applied", body = CorrectionsResponse),
+        (status = 200, description = "All corrections registered; the scheduler swaps each in once workers confirm its replacement", body = CorrectionsResponse),
         (status = 409, description = "Rejected wholesale (unknown old chunk, changed range, duplicate, or unavailable old chunk)", body = ErrorBody),
     ),
     security(("bearer" = []))
