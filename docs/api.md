@@ -8,6 +8,8 @@ Authentication: `Authorization: Bearer <token>`. Admin endpoints need an admin t
 
 ## `POST /datasets`
 
+Create a dataset. Its schema is seeded as both the first write schema and the current read schema. Idempotent by name: re-creating an existing dataset changes nothing and returns 200.
+
 Request body: [`CreateDatasetRequest`](#createdatasetrequest)
 
 Responses:
@@ -16,6 +18,8 @@ Responses:
 - `400` Invalid name, location, or schema — [`ErrorBody`](#errorbody)
 
 ## `POST /datasets/{name}/chunks`
+
+Report chunks the ingester has written to storage. A 2xx means durably accepted: the overlap decision happens in this call (see ADR 0003), so the ingester can safely resume past the reported range. Re-sending a batch is safe — already-present ids come back as duplicates.
 
 Path parameters:
 - `name` (string) — Dataset name
@@ -38,6 +42,8 @@ Responses:
 
 ## `POST /datasets/{name}/corrections`
 
+Replace chunks after a reorg: each old chunk is superseded 1:1 by a new chunk covering the same block range. All-or-nothing: on success every listed correction was applied.
+
 Path parameters:
 - `name` (string) — Dataset name
 
@@ -49,6 +55,8 @@ Responses:
 
 ## `GET /datasets/{name}/head`
 
+Where ingestion should resume: the highest block any non-rejected chunk covers, or null for an empty dataset. The ingester continues from the next block.
+
 Path parameters:
 - `name` (string) — Dataset name
 
@@ -56,6 +64,8 @@ Responses:
 - `200` The resume point — [`HeadResponse`](#headresponse)
 
 ## `GET /datasets/{name}/read-schema`
+
+The dataset's current read schema — what readers should decode under right now.
 
 Path parameters:
 - `name` (string) — Dataset name
@@ -65,6 +75,8 @@ Responses:
 - `404` Never promoted — [`ErrorBody`](#errorbody)
 
 ## `PUT /datasets/{name}/read-schema`
+
+Set the dataset's current read schema: the single superset schema every reader decodes under. Admin-only because it governs all consumers, not one ingester's writes.
 
 Path parameters:
 - `name` (string) — Dataset name
@@ -77,6 +89,8 @@ Responses:
 
 ## `GET /datasets/{name}/write-schemas`
 
+List every schema the dataset's chunks may be pinned to. `active` means a live chunk still pins it — readers must keep being able to decode those.
+
 Path parameters:
 - `name` (string) — Dataset name
 
@@ -84,6 +98,8 @@ Responses:
 - `200` Every write schema, flagged active when a live chunk pins it — [`SchemaListResponse`](#schemalistresponse)
 
 ## `POST /datasets/{name}/write-schemas`
+
+Announce the schema an ingester is about to write chunks under. Returns the schema id the ingester must pin in every inserted chunk; identical content always yields the same id.
 
 Path parameters:
 - `name` (string) — Dataset name
@@ -96,6 +112,8 @@ Responses:
 
 ## `GET /datasets/{name}/write-schemas/{id}`
 
+Fetch one write schema by id — e.g. to decode chunks pinned to it.
+
 Path parameters:
 - `name` (string) — Dataset name
 - `id` (integer) — Write schema id
@@ -106,11 +124,15 @@ Responses:
 
 ## `GET /health`
 
+Liveness probe: verifies the database is reachable.
+
 Responses:
 - `200` Database reachable
 - `503` Database unreachable
 
 ## `GET /metrics`
+
+Prometheus metrics for scraping.
 
 Responses:
 - `200` Prometheus text exposition

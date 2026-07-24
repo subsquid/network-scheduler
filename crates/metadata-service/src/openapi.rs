@@ -75,8 +75,15 @@ pub fn render_markdown(spec: &utoipa::openapi::OpenApi) -> String {
             };
             for (method, op) in methods {
                 out.push_str(&format!("\n## `{} {}`\n\n", method.to_uppercase(), path));
-                if let Some(d) = op["description"].as_str().filter(|d| !d.is_empty()) {
-                    out.push_str(&format!("{}\n\n", d.replace('\n', " ")));
+                // utoipa: doc comment's first line → summary, remainder → description.
+                let blurb = [&op["summary"], &op["description"]]
+                    .iter()
+                    .filter_map(|v| v.as_str())
+                    .map(|s| s.replace('\n', " "))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                if !blurb.is_empty() {
+                    out.push_str(&format!("{blurb}\n\n"));
                 }
                 if let Some(params) = op["parameters"].as_array().filter(|p| !p.is_empty()) {
                     out.push_str("Path parameters:\n");

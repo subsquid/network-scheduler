@@ -22,6 +22,8 @@ fn validate_schema(schema: &DatasetSchema) -> Result<(), ServiceError> {
 // Authorization is enforced by the route's auth layer (see `build_router`): `require_admin` here,
 // `require_dataset_scope` for the `DatasetAuth` handlers below. Mutations emit a best-effort audit
 // event on the `audit` tracing target, attributing the committed change to the caller's actor id.
+/// Create a dataset. Its schema is seeded as both the first write schema and the current read
+/// schema. Idempotent by name: re-creating an existing dataset changes nothing and returns 200.
 #[utoipa::path(post, path = "/datasets", tag = "admin",
     request_body = CreateDatasetRequest,
     responses(
@@ -56,7 +58,8 @@ pub async fn create_dataset(
     Ok((status, Json(CreateDatasetResponse { name, created })))
 }
 
-/// Register a WRITE schema (ingester-scoped). Gated against the dataset's current read schema.
+/// Announce the schema an ingester is about to write chunks under. Returns the schema id the
+/// ingester must pin in every inserted chunk; identical content always yields the same id.
 #[utoipa::path(post, path = "/datasets/{name}/write-schemas", tag = "schemas",
     params(("name" = String, Path, description = "Dataset name")),
     request_body = DatasetSchema,
@@ -82,7 +85,8 @@ pub async fn post_write_schema(
     Ok(Json(id.into()))
 }
 
-/// List the dataset's WRITE schemas with active flags (ingester-scoped).
+/// List every schema the dataset's chunks may be pinned to. `active` means a live chunk still
+/// pins it — readers must keep being able to decode those.
 #[utoipa::path(get, path = "/datasets/{name}/write-schemas", tag = "schemas",
     params(("name" = String, Path, description = "Dataset name")),
     responses((status = 200, description = "Every write schema, flagged active when a live chunk pins it", body = SchemaListResponse)),
@@ -102,7 +106,7 @@ pub async fn get_write_schemas(
     Ok(Json(SchemaListResponse { schemas }))
 }
 
-/// One WRITE schema by id (ingester-scoped).
+/// Fetch one write schema by id — e.g. to decode chunks pinned to it.
 #[utoipa::path(get, path = "/datasets/{name}/write-schemas/{id}", tag = "schemas",
     params(
         ("name" = String, Path, description = "Dataset name"),
@@ -133,7 +137,8 @@ pub async fn get_write_schema(
     }))
 }
 
-/// Promote the dataset's current READ schema (ADMIN only). Gated against every live write schema.
+/// Set the dataset's current read schema: the single superset schema every reader decodes
+/// under. Admin-only because it governs all consumers, not one ingester's writes.
 #[utoipa::path(put, path = "/datasets/{name}/read-schema", tag = "admin",
     params(("name" = String, Path, description = "Dataset name")),
     request_body = DatasetSchema,
@@ -156,7 +161,7 @@ pub async fn put_read_schema(
     Ok(Json(id.into()))
 }
 
-/// The dataset's current READ schema (ingester-scoped).
+/// The dataset's current read schema — what readers should decode under right now.
 #[utoipa::path(get, path = "/datasets/{name}/read-schema", tag = "schemas",
     params(("name" = String, Path, description = "Dataset name")),
     responses(
@@ -176,8 +181,9 @@ pub async fn get_read_schema(
     }))
 }
 
-/// Insert chunks. A 2xx means durably accepted: the overlap decision is made here, under the
-/// dataset's lock, and no later process will un-accept the chunks (see ADR 0003).
+/// Report chunks the ingester has written to storage. A 2xx means durably accepted: the overlap
+/// decision happens in this call (see ADR 0003), so the ingester can safely resume past the
+/// reported range. Re-sending a batch is safe — already-present ids come back as duplicates.
 #[utoipa::path(post, path = "/datasets/{name}/chunks", tag = "chunks",
     params(("name" = String, Path, description = "Dataset name")),
     request_body = InsertChunksRequest,
@@ -211,7 +217,8 @@ pub async fn post_chunks(
     }
 }
 
-/// Replace chunks 1:1 with same-range successors (reorg handling). All-or-nothing.
+/// Replace chunks after a reorg: each old chunk is superseded 1:1 by a new chunk covering the
+/// same block range. All-or-nothing: on success every listed correction was applied.
 #[utoipa::path(post, path = "/datasets/{name}/corrections", tag = "chunks",
     params(("name" = String, Path, description = "Dataset name")),
     request_body = CorrectionsRequest,
@@ -242,7 +249,8 @@ pub async fn post_corrections(
     Ok(Json(CorrectionsResponse { corrected }))
 }
 
-/// The dataset's resume point: highest last_block over chunks not terminally rejected; null when empty.
+/// Where ingestion should resume: the highest block any non-rejected chunk covers, or null for
+/// an empty dataset. The ingester continues from the next block.
 #[utoipa::path(get, path = "/datasets/{name}/head", tag = "chunks",
     params(("name" = String, Path, description = "Dataset name")),
     responses((status = 200, description = "The resume point", body = HeadResponse)),
@@ -275,6 +283,7 @@ pub async fn get_chunk_status(
     }))
 }
 
+/// Liveness probe: verifies the database is reachable.
 #[utoipa::path(get, path = "/health", tag = "ops",
     responses((status = 200, description = "Database reachable"), (status = 503, description = "Database unreachable"))
 )]
@@ -288,6 +297,7 @@ pub async fn health(State(st): State<AppState>) -> StatusCode {
     }
 }
 
+/// Prometheus metrics for scraping.
 #[utoipa::path(get, path = "/metrics", tag = "ops",
     responses((status = 200, description = "Prometheus text exposition", content_type = "text/plain"))
 )]
