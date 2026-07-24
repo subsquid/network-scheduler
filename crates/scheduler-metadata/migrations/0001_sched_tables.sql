@@ -4,34 +4,50 @@
 
 CREATE TABLE IF NOT EXISTS datasets (
     id   SMALLSERIAL PRIMARY KEY,
-    name TEXT        NOT NULL UNIQUE
+    name     TEXT        NOT NULL UNIQUE,
+    -- Storage path ('s3://base-sepolia'), split from the identity `name` ('base-sepolia'). Only
+    -- assignment publication will read it.
+    location TEXT        NOT NULL
 );
 
--- A dataset's schema (tables, fields, default fields) as jsonb, deduped per dataset by content
--- hash. The dataset's current read schema is the row with superseded_at IS NULL; older rows are
--- kept because chunks stay pinned to the schema they were written under.
+-- The WRITE-schema registry: every schema a chunk has ever been written under, as jsonb, deduped
+-- per dataset by content hash. Write schemas are immutable and have NO "current" pointer — a chunk
+-- stays pinned to the exact schema it was written under (the chunks FK below). Which write schemas
+-- are still in play is derived from live chunks, not stored here.
 CREATE TABLE IF NOT EXISTS schemas (
     id            SERIAL      PRIMARY KEY,
     dataset_id    SMALLINT    NOT NULL REFERENCES datasets(id),
     hash          BYTEA       NOT NULL,  -- SHA-256 of the canonical schema json
     schema        JSONB       NOT NULL,
     created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
-    superseded_at TIMESTAMPTZ,           -- NULL = the dataset's current read schema
     UNIQUE (dataset_id, hash),
     UNIQUE (id, dataset_id)  -- FK target for the chunks same-dataset schema pin
 );
 
--- At most one current (non-superseded) schema per dataset.
-CREATE UNIQUE INDEX IF NOT EXISTS schemas_one_current_per_dataset
-    ON schemas (dataset_id) WHERE superseded_at IS NULL;
+-- The READ schema: the single superset schema a reader decodes a dataset under. Its own id space;
+-- nothing FKs to it (the absent read_schemas->chunks edge IS the detachment from write schemas).
+-- The current read schema is the row with superseded_at IS NULL; older rows are kept for audit.
+CREATE TABLE IF NOT EXISTS read_schemas (
+    id            SERIAL      PRIMARY KEY,
+    dataset_id    SMALLINT    NOT NULL REFERENCES datasets(id),
+    hash          BYTEA       NOT NULL,  -- SHA-256 of the canonical schema json
+    schema        JSONB       NOT NULL,
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    superseded_at TIMESTAMPTZ,           -- NULL = the dataset's current read schema
+    UNIQUE (dataset_id, hash)
+);
+
+-- At most one current (non-superseded) read schema per dataset.
+CREATE UNIQUE INDEX IF NOT EXISTS read_schemas_one_current_per_dataset
+    ON read_schemas (dataset_id) WHERE superseded_at IS NULL;
 
 CREATE TABLE IF NOT EXISTS chunks (
     chunk_pk             BIGSERIAL    PRIMARY KEY,
     dataset_id           SMALLINT     NOT NULL REFERENCES datasets(id),
     chunk_id             TEXT         NOT NULL,
     size                 INT          NOT NULL,
-    -- Schema the chunk was written under (the file set derives from its tables). Stamped at
-    -- insert with the dataset's current schema when the writer doesn't supply one.
+    -- Schema the chunk was written under (the file set derives from its tables); the writer pins
+    -- it explicitly at insert.
     schema_id            INTEGER      NOT NULL,
     -- Which of schema_id's tables the chunk carries: bit i = table i in sorted-name order,
     -- 0 = the file is legitimately absent. NULL = unknown → all present.
@@ -64,6 +80,14 @@ CREATE INDEX IF NOT EXISTS chunks_dataset_range_gist ON chunks USING gist (
 -- Drives active_schema_bundle's per-schema "does any live chunk still use this schema?" probe.
 -- chunk_pk is included so the nested-loop scan stays index-only.
 CREATE INDEX IF NOT EXISTS chunks_schema_id ON chunks (schema_id, chunk_pk);
+
+-- Drives head()'s resume-point probe. Within a dataset, admitted chunks are non-overlapping with
+-- rising ends (the nonoverlap gate), so the largest last_block is the last_block of the largest
+-- first_block — head() takes a descending top-1 per liveness filter instead of aggregating every
+-- chunk. chunk_pk (for the sched_chunk_metadata join) and last_block_delta (the value) are INCLUDEd
+-- so the ordered scan is index-only up to the metadata PK lookup.
+CREATE INDEX IF NOT EXISTS chunks_dataset_first_block
+    ON chunks (dataset_id, first_block DESC) INCLUDE (chunk_pk, last_block_delta);
 
 -- One row per scheduling cycle.
 CREATE TABLE IF NOT EXISTS sched_worker_assignments (
@@ -207,7 +231,7 @@ CREATE INDEX IF NOT EXISTS sched_chunk_metadata_unapplied
     WHERE applied_at_worker_assignment_id IS NULL;
 
 -- 1-to-1 chunk swap mechanism; applied_at_portal_assignment_id NULL = pending.
-CREATE TABLE chunk_corrections (
+CREATE TABLE IF NOT EXISTS chunk_corrections (
     old_chunk_pk                    BIGINT   PRIMARY KEY REFERENCES chunks(chunk_pk),
     new_chunk_pk                    BIGINT   NOT NULL    REFERENCES chunks(chunk_pk),
     dataset_id                      SMALLINT NOT NULL    REFERENCES datasets(id),
@@ -217,7 +241,7 @@ CREATE TABLE chunk_corrections (
 );
 
 -- The replacement must share the old chunk's dataset; enforced for every client by this trigger.
-CREATE FUNCTION chunk_corrections_same_dataset() RETURNS trigger AS $$
+CREATE OR REPLACE FUNCTION chunk_corrections_same_dataset() RETURNS trigger AS $$
 BEGIN
     IF EXISTS (SELECT 1 FROM chunks WHERE chunk_pk = NEW.old_chunk_pk AND dataset_id <> NEW.dataset_id)
        OR EXISTS (SELECT 1 FROM chunks WHERE chunk_pk = NEW.new_chunk_pk AND dataset_id <> NEW.dataset_id) THEN
@@ -229,12 +253,12 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
-CREATE TRIGGER chunk_corrections_same_dataset
+CREATE OR REPLACE TRIGGER chunk_corrections_same_dataset
     BEFORE INSERT OR UPDATE OF old_chunk_pk, new_chunk_pk, dataset_id ON chunk_corrections
     FOR EACH ROW EXECUTE FUNCTION chunk_corrections_same_dataset();
 
 -- Serves the pending-set scan and the "is this chunk the new_chunk_pk of a pending correction?"
 -- membership lookup (i.e. is it still being produced by an earlier chain link).
-CREATE INDEX chunk_corrections_pending_by_new_chunk
+CREATE INDEX IF NOT EXISTS chunk_corrections_pending_by_new_chunk
     ON chunk_corrections (new_chunk_pk)
     WHERE applied_at_portal_assignment_id IS NULL;

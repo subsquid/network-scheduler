@@ -21,6 +21,9 @@ jobs:
   test:
     name: Test
     runs-on: ubuntu-latest
+    # Well above the suite's few-minute runtime; a hung test fails fast instead of
+    # wedging the job for the 6-hour default.
+    timeout-minutes: 20
     if: github.event_name == 'push' || !github.event.pull_request.draft
     steps:
       - name: Cache protoc
@@ -48,7 +51,7 @@ jobs:
       - uses: dsherret/rust-toolchain-file@v1
       - uses: Swatinem/rust-cache@v2
       - name: Run tests
-        run: cargo test --all-features
+        run: cargo test --workspace --all-features
         env:
           # Reduced PBT budget for CI: each in-memory sim case is a 100-300-transition
           # walk (default 256 per model), each Postgres case gets a fresh database.
@@ -93,4 +96,4 @@ jobs:
         run: git lfs fetch --all && git lfs checkout
       - uses: dsherret/rust-toolchain-file@v1
       - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy --all-targets --all-features -- -D clippy::correctness -D clippy::suspicious -D perf
+      - run: cargo clippy --workspace --all-targets --all-features -- -D clippy::correctness -D clippy::suspicious -D perf

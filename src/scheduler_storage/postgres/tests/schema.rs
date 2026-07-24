@@ -9,7 +9,9 @@ use super::{current_schema_id, fresh_storage, register_chunk};
 use crate::scheduler_storage::algorithm::IdealMapping;
 use crate::scheduler_storage::postgres::PostgresStorage;
 use crate::scheduler_storage::test_harness::inspect::StorageInspect;
-use crate::scheduler_storage::test_harness::utils::{StaticSchedulingAlgorithm, dataset, worker};
+use crate::scheduler_storage::test_harness::utils::{
+    StaticSchedulingAlgorithm, dataset, new_dataset, worker,
+};
 use crate::scheduler_storage::{
     BundleId, ChunkPk, SchedulerStorage, SchemaBundle, SchemaId, StorageError, WorkerAssignment,
     WorkerPk,
@@ -127,8 +129,8 @@ fn one_worker(storage: &mut PostgresStorage) -> Vec<WorkerPk> {
 fn chunk_tables_present_is_returned_with_schema_id() {
     let mut storage = fresh_storage("tables_present");
     storage
-        .insert_new_datasets(vec![(
-            dataset("ds"),
+        .insert_new_datasets(vec![new_dataset(
+            "ds",
             schema_with_tables(&["blocks", "logs", "transactions"]),
         )])
         .expect("insert dataset");
@@ -158,8 +160,8 @@ fn active_schema_bundle_holds_only_in_play_schemas() {
     let mut storage = fresh_storage("active_bundle");
     storage
         .insert_new_datasets(vec![
-            (dataset("a"), schema_with_tables(&["blocks"])),
-            (dataset("b"), schema_with_tables(&["logs"])),
+            new_dataset("a", schema_with_tables(&["blocks"])),
+            new_dataset("b", schema_with_tables(&["logs"])),
         ])
         .expect("insert datasets");
     let a_pk = register_chunk(&mut storage, "a", 1, 100);
@@ -192,7 +194,7 @@ fn load_schemas_returns_by_id_or_all() {
     let mut storage = fresh_storage("schema_load");
     let schema = schema_with_tables(&["blocks", "transactions"]);
     storage
-        .insert_new_datasets(vec![(dataset("ds"), schema.clone())])
+        .insert_new_datasets(vec![new_dataset("ds", schema.clone())])
         .expect("insert dataset");
     let first_id = current_schema_id(&mut storage, dataset("ds"));
     let second = schema_with_tables(&["blocks"]);
@@ -217,7 +219,7 @@ fn set_dataset_schema_affects_only_future_chunks() {
     // its insert, bitmap NULL -> None.
     let mut storage = fresh_storage("schema_set");
     storage
-        .insert_new_datasets(vec![(dataset("ds"), DatasetSchema::default())])
+        .insert_new_datasets(vec![new_dataset("ds", DatasetSchema::default())])
         .expect("insert dataset");
     let old_pk = register_chunk(&mut storage, "ds", 1, 100);
     let workers = one_worker(&mut storage);
@@ -250,8 +252,8 @@ fn schema_dedup_is_per_dataset() {
     let schema = schema_with_tables(&["blocks", "transactions"]);
     storage
         .insert_new_datasets(vec![
-            (dataset("a"), schema.clone()),
-            (dataset("b"), schema.clone()),
+            new_dataset("a", schema.clone()),
+            new_dataset("b", schema.clone()),
         ])
         .expect("insert datasets");
     // Re-setting "a" with byte-identical content reuses its row (no new row); dedup is per-dataset.
@@ -285,7 +287,7 @@ fn invalid_schema_rejected() {
     let mut storage = fresh_storage("schema_invalid");
     // default_fields references a column not in fields.
     let bad = schema_one_table("blocks", &["a"], &["missing"]);
-    let err = storage.insert_new_datasets(vec![(dataset("ds"), bad)]);
+    let err = storage.insert_new_datasets(vec![new_dataset("ds", bad)]);
     assert!(matches!(err, Err(StorageError::Database(_))));
 }
 
@@ -296,8 +298,8 @@ fn one_cycle_resolves_each_chunk_against_its_own_schema() {
     let mut storage = fresh_storage("schema_multi");
     storage
         .insert_new_datasets(vec![
-            (dataset("a"), schema_with_tables(&["blocks"])),
-            (dataset("b"), schema_with_tables(&["blocks", "logs"])),
+            new_dataset("a", schema_with_tables(&["blocks"])),
+            new_dataset("b", schema_with_tables(&["blocks", "logs"])),
         ])
         .expect("insert datasets");
     let pk_a = register_chunk(&mut storage, "a", 1, 100);
@@ -323,34 +325,6 @@ fn one_cycle_resolves_each_chunk_against_its_own_schema() {
     assert_eq!(
         wa.chunks[&pk_b].schema_id, b_current,
         "B keeps its insert stamp"
-    );
-}
-
-#[test]
-fn one_current_schema_per_dataset_enforced() {
-    let mut storage = fresh_storage("schema_unique");
-    storage
-        .insert_new_datasets(vec![(dataset("ds"), schema_with_tables(&["blocks"]))])
-        .expect("insert dataset");
-    // The dataset already has a current schema; a direct second current (superseded_at NULL) row
-    // must violate the partial unique index, independent of ensure_current_schema's logic.
-    let res = storage.with_conn(async move |conn| -> Result<(), StorageError> {
-        let dataset_id: i16 = sqlx::query_scalar("SELECT id FROM datasets WHERE name = $1")
-            .bind(dataset("ds"))
-            .fetch_one(&mut *conn)
-            .await
-            .map_err(anyhow::Error::new)?;
-        sqlx::query("INSERT INTO schemas (dataset_id, hash, schema) VALUES ($1, $2, '{}'::jsonb)")
-            .bind(dataset_id)
-            .bind(vec![9u8; 32]) // distinct hash, superseded_at defaults NULL
-            .execute(&mut *conn)
-            .await
-            .map_err(anyhow::Error::new)?;
-        Ok(())
-    });
-    assert!(
-        matches!(res, Err(StorageError::Database(_))),
-        "a second current schema for one dataset must violate schemas_one_current_per_dataset"
     );
 }
 
@@ -386,8 +360,8 @@ fn chunk_cannot_pin_another_datasets_schema() {
     let mut storage = fresh_storage("schema_cross_dataset");
     storage
         .insert_new_datasets(vec![
-            (dataset("a"), schema_with_tables(&["blocks"])),
-            (dataset("b"), schema_with_tables(&["blocks", "logs"])),
+            new_dataset("a", schema_with_tables(&["blocks"])),
+            new_dataset("b", schema_with_tables(&["blocks", "logs"])),
         ])
         .expect("insert datasets");
     let pk_a = register_chunk(&mut storage, "a", 1, 100);
@@ -403,43 +377,40 @@ fn chunk_cannot_pin_another_datasets_schema() {
 }
 
 #[test]
-fn reactivating_an_equivalent_schema_serves_the_originally_stored_payload() {
-    // Dedup is by canonical hash but the stored json is first-writer-wins: reverting via a
-    // reordered-but-equivalent schema reactivates the old row, whose payload — not the one just
-    // passed — is what reads then serve.
+fn re_registering_an_equivalent_schema_serves_the_originally_stored_payload() {
+    // Write-registry dedup is by canonical hash but the stored json is first-writer-wins:
+    // re-registering a reordered-but-equivalent schema returns the existing row's id, whose payload
+    // — not the one just passed — is what reads then serve.
     let mut storage = fresh_storage("schema_reactivate_payload");
     storage
-        .insert_new_datasets(vec![(
-            dataset("ds"),
+        .insert_new_datasets(vec![new_dataset(
+            "ds",
             schema_one_table("blocks", &["b", "a"], &[]),
         )])
         .expect("insert dataset");
     let id1 = current_schema_id(&mut storage, dataset("ds"));
     storage
         .set_dataset_schema(&dataset("ds"), schema_with_tables(&["other"]))
-        .expect("advance");
+        .expect("register another write schema");
+    // Re-registering canonically-equal content dedups back to id1 (no new row).
     storage
         .set_dataset_schema(&dataset("ds"), schema_one_table("blocks", &["a", "b"], &[]))
-        .expect("revert via canonically equal schema");
+        .expect("re-register a canonically equal schema");
 
-    assert_eq!(current_schema_id(&mut storage, dataset("ds")), id1);
     assert_eq!(schema_count(&mut storage, dataset("ds")), 2);
     let stored: DatasetSchema = storage
         .with_conn(async move |conn| {
-            let json: String = sqlx::query_scalar(
-                "SELECT s.schema::text FROM schemas s JOIN datasets d ON d.id = s.dataset_id \
-                 WHERE d.name = $1 AND s.superseded_at IS NULL",
-            )
-            .bind(dataset("ds"))
-            .fetch_one(&mut *conn)
-            .await
-            .unwrap();
+            let json: String = sqlx::query_scalar("SELECT schema::text FROM schemas WHERE id = $1")
+                .bind(id1)
+                .fetch_one(&mut *conn)
+                .await
+                .unwrap();
             Ok::<_, StorageError>(serde_json::from_str(&json).unwrap())
         })
         .unwrap();
     assert_eq!(
         stored.tables()["blocks"].fields,
         vec!["b".to_owned(), "a".to_owned()],
-        "the reactivated row keeps its original field order, not the re-applied one"
+        "the deduped row keeps its original field order, not the re-applied one"
     );
 }

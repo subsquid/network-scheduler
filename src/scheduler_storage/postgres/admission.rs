@@ -1,67 +1,15 @@
-//! Helpers for [`PostgresStorage::insert_new_chunks`] and
-//! [`PostgresStorage::register_new_chunks`]: bring new chunk rows in, then admit
-//! or reject them against the non-overlap rule.
+//! Helpers for [`PostgresStorage::register_new_chunks`]: fetch new chunk rows lacking metadata, then
+//! admit or reject them against the non-overlap rule. (Raw chunk insertion lives in the shared
+//! `scheduler-metadata` crate.)
 
 use anyhow::{Context, Result};
+use sqlx::Row;
 use sqlx::postgres::{PgConnection, PgRow};
-use sqlx::{Connection, Row};
 
 use crate::metrics::PhaseTimer;
-use crate::scheduler_storage::{ChunkPk, NewChunk, StorageError};
+use crate::scheduler_storage::ChunkPk;
 
 use super::nonoverlap::Candidate;
-use super::rows::{ChunkInsertArrays, is_unique_violation};
-
-/// Insert raw chunk rows, batched in one transaction; one `UNNEST` statement per batch.
-pub(super) async fn insert_chunks(
-    conn: &mut PgConnection,
-    chunks: &[NewChunk],
-    batch_size: usize,
-) -> Result<(), StorageError> {
-    let mut timer = PhaseTimer::new("insert_new_chunks");
-    if chunks.is_empty() {
-        return Ok(());
-    }
-    let mut tx = conn.begin().await.context("insert_new_chunks: begin")?;
-    for batch in chunks.chunks(batch_size) {
-        let p = ChunkInsertArrays::from_chunks(batch.iter());
-        let inserted = sqlx::query(
-            r#"
-            INSERT INTO chunks (dataset_id, chunk_id, size, schema_id, tables_present, first_block, last_block_delta)
-            SELECT d.id, x.chunk_id, x.size, COALESCE(x.schema_id, cur.id), x.tables_present, x.first_block, x.last_block_delta
-            FROM UNNEST($1::text[], $2::text[], $3::int[], $4::int[], $5::varbit[], $6::bigint[], $7::int[])
-                 AS x(dataset, chunk_id, size, schema_id, tables_present, first_block, last_block_delta)
-            JOIN datasets d ON d.name = x.dataset
-            -- No explicit pin -> stamp the dataset's current schema.
-            LEFT JOIN schemas cur ON cur.dataset_id = d.id AND cur.superseded_at IS NULL
-            RETURNING 1
-            "#,
-        )
-        .bind(&p.datasets)
-        .bind(&p.chunk_ids)
-        .bind(&p.sizes)
-        .bind(&p.schema_ids)
-        .bind(&p.tables_present)
-        .bind(&p.first_blocks)
-        .bind(&p.last_block_deltas)
-        .fetch_all(&mut *tx)
-        .await;
-        match inserted {
-            Ok(rows) => {
-                timer.stmt(rows.len() as u64);
-                if rows.len() < batch.len() {
-                    return Err(anyhow::anyhow!("dataset not found").into());
-                }
-            }
-            Err(e) if is_unique_violation(&e) => {
-                return Err(StorageError::ChunkAlreadyExists);
-            }
-            Err(e) => return Err(anyhow::Error::new(e).context("insert_new_chunks").into()),
-        }
-    }
-    tx.commit().await.context("insert_new_chunks: commit")?;
-    Ok(())
-}
 
 /// New chunks (no metadata row yet) with their range and whether they're a pending correction's
 /// replacement. A replacement overlaps the old chunk it supersedes by design, and the correction

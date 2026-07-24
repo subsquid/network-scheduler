@@ -4,12 +4,30 @@ use crate::scheduler_storage::test_harness::inspect::{
     ChunkMetadataView, ChunkView, CorrectionView, StaleMappingView, StorageInspect,
     WorkerAssignmentDiffView, WorkerView,
 };
-use crate::scheduler_storage::{ChunkPk, Tick, WorkerPk};
+use crate::scheduler_storage::{ChunkPk, SchemaId, Tick, WorkerPk};
 
 use super::super::PostgresStorage;
 use super::super::rows::block_range_from_columns;
 
 impl StorageInspect for PostgresStorage {
+    fn current_schema_id(&self, dataset: &str) -> Option<SchemaId> {
+        let dataset = dataset.to_owned();
+        // Write schemas have no "current" pointer; the latest-registered (max id) is the one a fresh
+        // write pins, which is what callers stamp chunks with.
+        let id: Option<SchemaId> = self
+            .with_conn_ref(async move |conn| {
+                sqlx::query_scalar::<_, Option<SchemaId>>(
+                    "SELECT max(s.id) FROM schemas s JOIN datasets d ON d.id = s.dataset_id \
+                     WHERE d.name = $1",
+                )
+                .bind(&dataset)
+                .fetch_one(conn)
+                .await
+            })
+            .expect("current_schema_id query");
+        id
+    }
+
     fn get_chunks<F>(&self, mut filter: F) -> Vec<ChunkView>
     where
         F: FnMut(&ChunkView) -> bool,

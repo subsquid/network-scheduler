@@ -15,7 +15,8 @@ use anyhow::Context;
 use crate::{
     cli, dataset_data_storage, metrics,
     scheduler_storage::{
-        NewChunk, SchedulerStorage, Tick, algorithm::MultistepAlgorithm, postgres::PostgresStorage,
+        NewChunk, NewDataset, SchedulerStorage, Tick, algorithm::MultistepAlgorithm,
+        discovered_chunk, postgres::PostgresStorage,
     },
     types::{Chunk, Dataset, DatasetSchema, DatasetWatermark, Worker},
 };
@@ -111,8 +112,14 @@ fn bootstrap_datasets(
             .collect()
     };
     for name in missing {
+        // `name` (`s3://{bucket}`) is the dataset identity the watermark logic above compares
+        // against, so keep it as the stored name; location is the same path.
         storage
-            .insert_new_datasets(vec![(name.clone(), DatasetSchema::default())])
+            .insert_new_datasets(vec![NewDataset::with_name(
+                name.clone(),
+                name.clone(),
+                DatasetSchema::default(),
+            )])
             .with_context(|| format!("bootstrap dataset {name}"))?;
         watermarks.push(DatasetWatermark {
             dataset: Dataset {
@@ -132,21 +139,20 @@ fn register_chunks(
     discovered: BTreeMap<Arc<String>, Vec<Chunk>>,
 ) -> anyhow::Result<()> {
     let _timer = metrics::Timer::new("multistep:register_chunks");
+    // The S3 listing carries no schema info, so discovered chunks pin the schema each dataset was
+    // seeded with (`bootstrap_datasets` guarantees the row exists).
+    let schema_ids = storage.seeded_schema_ids().context("seeded schema ids")?;
     for (dataset, chunks) in discovered {
         if chunks.is_empty() {
             continue;
         }
+        let schema_id = *schema_ids
+            .get(dataset.as_str())
+            .with_context(|| format!("no seeded schema for dataset {dataset}"))?;
         // Move fields out instead of cloning; a dataset can hold millions of chunks.
         let new_chunks: Vec<NewChunk> = chunks
             .into_iter()
-            .map(|c| NewChunk {
-                dataset: c.dataset,
-                id: c.id,
-                size: c.size,
-                blocks: c.blocks,
-                schema_id: None,
-                tables_present: None,
-            })
+            .map(|c| discovered_chunk(c, schema_id))
             .collect();
         storage
             .insert_new_chunks(new_chunks)

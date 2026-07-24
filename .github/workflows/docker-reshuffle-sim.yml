@@ -17,6 +17,7 @@ on:
   pull_request:
     paths:
       - "tools/reshuffle_sim/**"
+      - "crates/scheduler-metadata/**"
       - "Cargo.lock"
       - ".github/workflows/docker-reshuffle-sim.yml"
 

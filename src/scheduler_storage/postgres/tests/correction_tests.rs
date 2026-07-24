@@ -12,7 +12,7 @@ use crate::scheduler_storage::postgres::PostgresStorage;
 use crate::scheduler_storage::test_harness::assert_portal_chunks_exact;
 use crate::scheduler_storage::test_harness::inspect::StorageInspect;
 use crate::scheduler_storage::test_harness::utils::{
-    StaticSchedulingAlgorithm, chunk, chunk_with_blocks, dataset, worker,
+    StaticSchedulingAlgorithm, chunk, chunk_with_blocks, dataset, new_dataset, worker,
 };
 use crate::scheduler_storage::{AssignmentId, ChunkPk, SchedulerStorage, StorageError, WorkerPk};
 use crate::types::{DatasetSchema, TableSchema, Worker};
@@ -131,7 +131,7 @@ fn pg_db_error(result: &Result<ChunkPk, StorageError>) -> &dyn sqlx::error::Data
 #[test]
 fn register_correction_rejects_unknown_old_pk() {
     let mut storage = fresh_storage("rc_unknown_old");
-    let _ = storage.insert_new_datasets(vec![(dataset("ds"), DatasetSchema::default())]);
+    let _ = storage.insert_new_datasets(vec![new_dataset("ds", DatasetSchema::default())]);
 
     // An unknown old chunk is rejected by the chunk_corrections FK on old_chunk_pk — a DB error,
     // not an application pre-check.
@@ -167,7 +167,9 @@ fn register_correction_rejects_cross_dataset_replacement() {
     // check — so the guarantee holds for any client writing chunk_corrections.
     // Same-range as the old chunk (id 1 → 2..=3) so the range guard passes and the same-dataset
     // trigger is what rejects the cross-dataset link.
-    let result = storage.register_correction(old_pk, chunk_with_blocks("ds-2", 3, 100, 2..=3), 1);
+    let mut replacement = chunk_with_blocks("ds-2", 3, 100, 2..=3);
+    replacement.schema_id = current_schema_id(&mut storage, "s3://ds-2".to_string());
+    let result = storage.register_correction(old_pk, replacement, 1);
     assert_eq!(pg_db_error(&result).code().as_deref(), Some("P0001"));
 }
 
@@ -195,13 +197,13 @@ fn register_correction_preserves_replacement_schema_metadata() {
         ("logs".to_owned(), TableSchema::default()),
     ]));
     storage
-        .insert_new_datasets(vec![(dataset("ds"), schema)])
+        .insert_new_datasets(vec![new_dataset("ds", schema)])
         .expect("insert dataset");
     let old_pk = insert_and_register_chunk(&mut storage, "ds", 1, 100);
     let schema_id = current_schema_id(&mut storage, dataset("ds"));
 
     let mut replacement = chunk_with_blocks("ds", 2, 100, 2..=3);
-    replacement.schema_id = Some(schema_id);
+    replacement.schema_id = schema_id;
     replacement.tables_present = Some(bit_vec::BitVec::from_fn(2, |i| i == 0));
 
     let new_pk = storage
@@ -260,7 +262,7 @@ fn register_correction_rejects_old_pk_tombstoned() {
 #[test]
 fn register_correction_rejects_rejected_old_chunk() {
     let mut storage = fresh_storage("rc_old_rejected");
-    let _ = storage.insert_new_datasets(vec![(dataset("ds"), DatasetSchema::default())]);
+    let _ = storage.insert_new_datasets(vec![new_dataset("ds", DatasetSchema::default())]);
     // Two overlapping chunks registered together: the higher (first_block, pk) one is rejected.
     storage
         .insert_new_chunks(vec![

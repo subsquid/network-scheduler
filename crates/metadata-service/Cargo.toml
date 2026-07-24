@@ -1,0 +1,38 @@
+[package]
+name = "metadata-service"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "metadata_service"
+path = "src/lib.rs"
+
+[[bin]]
+name = "metadata-service"
+path = "src/main.rs"
+
+[dependencies]
+scheduler-metadata = { path = "../scheduler-metadata" }
+axum = "0.8"
+tokio = { version = "1", features = ["full"] }
+sqlx = { workspace = true }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+clap = { version = "4", features = ["derive", "env"] }
+bytesize = "2.3.1"
+humantime = "2.1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+prometheus-client = { workspace = true }
+anyhow = "1"
+thiserror = "2"
+secrecy = { version = "0.10.3", features = ["serde"] }
+subtle = "2"
+sha2 = "0.10"
+tower-http = { version = "0.6", features = ["timeout"] }
+
+[dev-dependencies]
+testcontainers = { version = "0.27.2", features = ["watchdog"] }
+testcontainers-modules = { version = "0.15", features = ["postgres"] }
+tower = { version = "0.5", features = ["util"] }   # ServiceExt::oneshot

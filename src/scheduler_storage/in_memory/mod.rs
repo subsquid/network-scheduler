@@ -4,7 +4,7 @@
 
 use crate::scheduler_storage::algorithm::{CurrentPlacement, ScheduleOutput, SchedulingAlgorithm};
 use crate::scheduler_storage::{
-    AlgoChunk, AssignmentId, AssignmentWorker, ChunkPk, NewChunk, PortalAssignment,
+    AlgoChunk, AssignmentId, AssignmentWorker, ChunkPk, NewChunk, NewDataset, PortalAssignment,
     SchedulerStorage, SchemaBundle, SchemaId, StorageError, Tick, WorkerAssignment,
     WorkerAssignmentChunk, WorkerPk,
 };
@@ -229,13 +229,14 @@ struct Counters {
 #[derive(Default)]
 pub(crate) struct InMemoryStorage {
     datasets: HashSet<Dataset>,
-    /// Per-dataset current read schema id (mirrors the `schemas` row with `superseded_at IS NULL`)
-    dataset_schemas: HashMap<Dataset, SchemaId>,
-    /// Schema payloads by id, first-seen content kept (mirrors the `schemas` table)
+    /// Write-schema payloads by id, first-seen content kept (mirrors the `schemas` write registry)
     schemas: HashMap<SchemaId, DatasetSchema>,
-    /// `(dataset, canonical json)` → id: re-applying a seen schema reuses its id (mirrors
-    /// `UNIQUE (dataset_id, hash)` + reactivation)
+    /// `(dataset, canonical json)` → id: re-registering seen content reuses its id (mirrors
+    /// `UNIQUE (dataset_id, hash)`)
     schema_ids: HashMap<(Dataset, String), SchemaId>,
+    /// Each dataset's latest-registered write schema id, so the sim can stamp inserts with the id a
+    /// fresh write would pin. Earlier ids stay in `schemas` (write schemas are immutable).
+    current_schema: HashMap<Dataset, SchemaId>,
     chunks: BTreeMap<ChunkPk, WorkerAssignmentChunk>,
     /// Natural identity → surrogate pk; a duplicate `(dataset, id)` insert is rejected
     /// (mirrors Postgres `UNIQUE (dataset_id, chunk_id)`). Never pruned — chunks
@@ -311,7 +312,11 @@ impl InMemoryStorage {
     }
 
     /// Used by the ingester or operator to include datasets in the system. Every dataset gets a
-    /// current schema (the default one), matching Postgres — chunk inserts stamp against it.
+    /// current schema (the default one), matching Postgres.
+    ///
+    /// Inherent name-only convenience: on a concrete `InMemoryStorage` this shadows the
+    /// `SchedulerStorage::insert_new_datasets(Vec<NewDataset>)` trait method, so name-only callers
+    /// (`Vec<String>`) resolve here and trait-dispatch callers get the `NewDataset` version.
     pub fn insert_new_datasets(
         &mut self,
         datasets: Vec<Dataset>,
@@ -349,18 +354,12 @@ impl InMemoryStorage {
     /// `(dataset, id)`.
     fn insert_one_chunk(&mut self, chunk: NewChunk) -> Option<ChunkPk> {
         use std::collections::hash_map::Entry;
-        // Mirror the Postgres insert: no explicit pin -> stamp the dataset's current schema
-        // (registered datasets always have one, like the NOT NULL column).
-        let schema_id = chunk
-            .schema_id
-            .or_else(|| self.dataset_schemas.get(&*chunk.dataset).copied())
-            .expect("registered dataset has a current schema");
         let chunk = WorkerAssignmentChunk {
             dataset: chunk.dataset,
             id: chunk.id,
             size: chunk.size,
             blocks: chunk.blocks,
-            schema_id,
+            schema_id: chunk.schema_id,
             tables_present: chunk.tables_present,
         };
         match self
@@ -666,8 +665,9 @@ impl InMemoryStorage {
             .collect();
     }
 
-    /// Set `dataset`'s current read schema and return its id, reusing the id of previously seen
-    /// identical content — mirrors Postgres' `ensure_current_schema`.
+    /// Register `dataset`'s write schema and return its id, reusing the id of previously seen
+    /// identical content — mirrors Postgres' `insert_write_schema`. Records it as the dataset's
+    /// latest write schema (the id a fresh write pins).
     fn ensure_current_schema(&mut self, dataset: &str, schema: DatasetSchema) -> SchemaId {
         use std::collections::hash_map::Entry;
         let canon = serde_json::to_string(&schema.canonicalized()).expect("schema serializes");
@@ -679,7 +679,7 @@ impl InMemoryStorage {
                 *vac.insert(id)
             }
         };
-        self.dataset_schemas.insert(dataset.to_owned(), id);
+        self.current_schema.insert(dataset.to_owned(), id);
         id
     }
 
@@ -735,19 +735,18 @@ impl InMemoryStorage {
 }
 
 impl SchedulerStorage for InMemoryStorage {
-    fn insert_new_datasets(
-        &mut self,
-        datasets: Vec<(String, DatasetSchema)>,
-    ) -> Result<(), StorageError> {
-        for (name, schema) in &datasets {
+    fn insert_new_datasets(&mut self, datasets: Vec<NewDataset>) -> Result<(), StorageError> {
+        for NewDataset { name, schema, .. } in &datasets {
             schema
                 .validate()
                 .with_context(|| format!("invalid schema for dataset {name}"))?;
         }
         // All-or-nothing like the Postgres transaction: reject the whole batch up front, so a
-        // duplicate mid-batch can't leave earlier names registered without a schema.
+        // duplicate mid-batch can't leave earlier names registered without a schema. `location` is
+        // ignored: the in-memory model keys on name, and every sim/tool sets location == name, so
+        // PG's UNIQUE(location) can't diverge from UNIQUE(name) here.
         let mut incoming = HashSet::new();
-        for (name, _) in &datasets {
+        for NewDataset { name, .. } in &datasets {
             if self.datasets.contains(name) || !incoming.insert(name.as_str()) {
                 return Err(
                     anyhow::Error::from(InsertDatasetError::UniqueConstraintViolation {
@@ -757,7 +756,7 @@ impl SchedulerStorage for InMemoryStorage {
                 );
             }
         }
-        for (name, schema) in datasets {
+        for NewDataset { name, schema, .. } in datasets {
             self.datasets.insert(name.clone());
             self.ensure_current_schema(&name, schema);
         }
