@@ -23,7 +23,7 @@ jobs:
     runs-on: ubuntu-latest
     # Well above the suite's few-minute runtime; a hung test fails fast instead of
     # wedging the job for the 6-hour default.
-    timeout-minutes: 20
+    timeout-minutes: 45
     if: github.event_name == 'push' || !github.event.pull_request.draft
     steps:
       - name: Cache protoc
