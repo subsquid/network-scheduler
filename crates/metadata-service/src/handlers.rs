@@ -11,7 +11,7 @@ use scheduler_metadata::{DatasetSchema, NewDataset, SchemaId};
 use crate::AppState;
 use crate::auth::{Actor, DatasetAuth};
 use crate::dto::*;
-use crate::error::{ApiJson, ServiceError};
+use crate::error::{ApiJson, ErrorBody, ServiceError};
 
 fn validate_schema(schema: &DatasetSchema) -> Result<(), ServiceError> {
     schema
@@ -22,6 +22,17 @@ fn validate_schema(schema: &DatasetSchema) -> Result<(), ServiceError> {
 // Authorization is enforced by the route's auth layer (see `build_router`): `require_admin` here,
 // `require_dataset_scope` for the `DatasetAuth` handlers below. Mutations emit a best-effort audit
 // event on the `audit` tracing target, attributing the committed change to the caller's actor id.
+/// Create a dataset. Its schema is seeded as both the first write schema and the current read
+/// schema. Idempotent by name: re-creating an existing dataset changes nothing and returns 200.
+#[utoipa::path(post, path = "/datasets", tag = "admin",
+    request_body = CreateDatasetRequest,
+    responses(
+        (status = 201, description = "Dataset created", body = CreateDatasetResponse),
+        (status = 200, description = "Dataset already existed; unchanged", body = CreateDatasetResponse),
+        (status = 400, description = "Invalid name, location, or schema", body = ErrorBody),
+    ),
+    security(("bearer" = []))
+)]
 pub async fn create_dataset(
     Extension(actor): Extension<Actor>,
     State(st): State<AppState>,
@@ -47,7 +58,18 @@ pub async fn create_dataset(
     Ok((status, Json(CreateDatasetResponse { name, created })))
 }
 
-/// Register a WRITE schema (ingester-scoped). Gated against the dataset's current read schema.
+/// Announce the schema an ingester is about to write chunks under. Returns the schema id the
+/// ingester must pin in every inserted chunk; identical content always yields the same id.
+#[utoipa::path(post, path = "/datasets/{name}/write-schemas", tag = "schemas",
+    params(("name" = String, Path, description = "Dataset name")),
+    request_body = DatasetSchema,
+    responses(
+        (status = 200, description = "Registered (idempotent by content)", body = WriteSchemaResponse),
+        (status = 400, description = "Invalid schema", body = ErrorBody),
+        (status = 404, description = "`dataset_not_found`: no such dataset", body = ErrorBody),
+    ),
+    security(("bearer" = []))
+)]
 pub async fn post_write_schema(
     ing: DatasetAuth,
     Extension(actor): Extension<Actor>,
@@ -64,7 +86,13 @@ pub async fn post_write_schema(
     Ok(Json(id.into()))
 }
 
-/// List the dataset's WRITE schemas with active flags (ingester-scoped).
+/// List every schema the dataset's chunks may be pinned to. `active` means a live chunk still
+/// pins it — readers must keep being able to decode those.
+#[utoipa::path(get, path = "/datasets/{name}/write-schemas", tag = "schemas",
+    params(("name" = String, Path, description = "Dataset name")),
+    responses((status = 200, description = "Every write schema, flagged active when a live chunk pins it", body = SchemaListResponse)),
+    security(("bearer" = []))
+)]
 pub async fn get_write_schemas(
     ing: DatasetAuth,
     State(st): State<AppState>,
@@ -79,7 +107,19 @@ pub async fn get_write_schemas(
     Ok(Json(SchemaListResponse { schemas }))
 }
 
-/// One WRITE schema by id (ingester-scoped).
+/// Fetch one write schema by id — e.g. to decode chunks pinned to it.
+#[utoipa::path(get, path = "/datasets/{name}/write-schemas/{id}", tag = "schemas",
+    params(
+        ("name" = String, Path, description = "Dataset name"),
+        ("id" = i32, Path, description = "Write schema id"),
+    ),
+    responses(
+        (status = 200, description = "The schema", body = WriteSchemaViewResponse),
+        (status = 400, description = "`schema_not_found`: no such schema for this dataset — deliberately 400, a client-supplied id is a client error", body = ErrorBody),
+        (status = 404, description = "`dataset_not_found`: no such dataset", body = ErrorBody),
+    ),
+    security(("bearer" = []))
+)]
 pub async fn get_write_schema(
     ing: DatasetAuth,
     State(st): State<AppState>,
@@ -99,7 +139,19 @@ pub async fn get_write_schema(
     }))
 }
 
-/// Promote the dataset's current READ schema (ADMIN only). Gated against every live write schema.
+/// Set the dataset's current read schema: the single superset schema every reader decodes
+/// under. Admin-only because it governs all consumers, not one ingester's writes.
+#[utoipa::path(put, path = "/datasets/{name}/read-schema", tag = "admin",
+    params(("name" = String, Path, description = "Dataset name")),
+    request_body = DatasetSchema,
+    responses(
+        (status = 200, description = "Promoted (idempotent by content)", body = ReadSchemaResponse),
+        (status = 400, description = "Invalid schema or malformed body", body = ErrorBody),
+        (status = 404, description = "`dataset_not_found`: no such dataset", body = ErrorBody),
+        (status = 409, description = "Concurrent schema change; retry", body = ErrorBody),
+    ),
+    security(("bearer" = []))
+)]
 pub async fn put_read_schema(
     Extension(actor): Extension<Actor>,
     State(st): State<AppState>,
@@ -113,7 +165,15 @@ pub async fn put_read_schema(
     Ok(Json(id.into()))
 }
 
-/// The dataset's current READ schema (ingester-scoped).
+/// The dataset's current read schema — what readers should decode under right now.
+#[utoipa::path(get, path = "/datasets/{name}/read-schema", tag = "schemas",
+    params(("name" = String, Path, description = "Dataset name")),
+    responses(
+        (status = 200, description = "The current read schema — every dataset has one, seeded at creation", body = CurrentReadSchemaResponse),
+        (status = 404, description = "`dataset_not_found`: no such dataset", body = ErrorBody),
+    ),
+    security(("bearer" = []))
+)]
 pub async fn get_read_schema(
     ing: DatasetAuth,
     State(st): State<AppState>,
@@ -125,6 +185,21 @@ pub async fn get_read_schema(
     }))
 }
 
+/// Report chunks the ingester has written to storage. A 2xx means durably accepted: the overlap
+/// decision happens in this call (see ADR 0003), so the ingester can safely resume past the
+/// reported range. Re-sending a batch is safe — already-present ids come back as duplicates.
+#[utoipa::path(post, path = "/datasets/{name}/chunks", tag = "chunks",
+    params(("name" = String, Path, description = "Dataset name")),
+    request_body = InsertChunksRequest,
+    responses(
+        (status = 204, description = "All chunks inserted"),
+        (status = 400, description = "Invalid batch: malformed body, unknown schema or table, unstorable range, or a chunk id repeated within the batch (`duplicate_in_batch`)", body = ErrorBody),
+        (status = 404, description = "`dataset_not_found`: no such dataset", body = ErrorBody),
+        (status = 409, description = "`duplicate_chunks`: listed ids were already present (new ones in the batch WERE committed). `range_overlap`: nothing committed — the batch overlaps an existing live chunk (pending or admitted) or two chunks in the batch overlap each other", body = ErrorBody),
+        (status = 503, description = "`dataset_busy`: lock wait timed out behind a wedged writer; retry", body = ErrorBody),
+    ),
+    security(("bearer" = []))
+)]
 pub async fn post_chunks(
     ing: DatasetAuth,
     Extension(actor): Extension<Actor>,
@@ -148,6 +223,20 @@ pub async fn post_chunks(
     }
 }
 
+/// Register chunk replacements after a reorg: each old chunk is superseded 1:1 by a new chunk
+/// covering the same block range. Success means all listed corrections are durably REGISTERED
+/// (all-or-nothing), not yet applied: the old chunk keeps serving until workers confirm holding
+/// the replacement, then the scheduler performs the swap. A registered correction is never
+/// rejected later — replacements are exempt from the overlap gate by design.
+#[utoipa::path(post, path = "/datasets/{name}/corrections", tag = "chunks",
+    params(("name" = String, Path, description = "Dataset name")),
+    request_body = CorrectionsRequest,
+    responses(
+        (status = 200, description = "All corrections registered; the scheduler swaps each in once workers confirm its replacement", body = CorrectionsResponse),
+        (status = 409, description = "Rejected wholesale (unknown old chunk, changed range, duplicate, or unavailable old chunk)", body = ErrorBody),
+    ),
+    security(("bearer" = []))
+)]
 pub async fn post_corrections(
     ing: DatasetAuth,
     Extension(actor): Extension<Actor>,
@@ -169,6 +258,16 @@ pub async fn post_corrections(
     Ok(Json(CorrectionsResponse { corrected }))
 }
 
+/// Where ingestion should resume: the highest block any non-rejected chunk covers, or null for
+/// an empty dataset. The ingester continues from the next block.
+#[utoipa::path(get, path = "/datasets/{name}/head", tag = "chunks",
+    params(("name" = String, Path, description = "Dataset name")),
+    responses(
+        (status = 200, description = "The resume point", body = HeadResponse),
+        (status = 404, description = "`dataset_not_found`: no such dataset", body = ErrorBody),
+    ),
+    security(("bearer" = []))
+)]
 pub async fn get_head(
     ing: DatasetAuth,
     State(st): State<AppState>,
@@ -176,6 +275,17 @@ pub async fn get_head(
     Ok(Json(st.ingest.head(&ing.dataset).await?.into()))
 }
 
+#[utoipa::path(get, path = "/datasets/{name}/chunks/{id}/status", tag = "chunks",
+    params(
+        ("name" = String, Path, description = "Dataset name"),
+        ("id" = String, Path, description = "Chunk id"),
+    ),
+    responses(
+        (status = 200, description = "pending | admitted | rejected | not_found — an absent chunk in an existing dataset is 200 `not_found`, not a 404", body = ChunkStatusResponse),
+        (status = 404, description = "`dataset_not_found`: no such dataset", body = ErrorBody),
+    ),
+    security(("bearer" = []))
+)]
 pub async fn get_chunk_status(
     ing: DatasetAuth,
     State(st): State<AppState>,
@@ -188,6 +298,10 @@ pub async fn get_chunk_status(
     }))
 }
 
+/// Liveness probe: verifies the database is reachable.
+#[utoipa::path(get, path = "/health", tag = "ops",
+    responses((status = 200, description = "Database reachable"), (status = 503, description = "Database unreachable"))
+)]
 pub async fn health(State(st): State<AppState>) -> StatusCode {
     match st.ingest.ping().await {
         Ok(()) => StatusCode::OK,
@@ -198,6 +312,10 @@ pub async fn health(State(st): State<AppState>) -> StatusCode {
     }
 }
 
+/// Prometheus metrics for scraping.
+#[utoipa::path(get, path = "/metrics", tag = "ops",
+    responses((status = 200, description = "Prometheus text exposition", content_type = "text/plain"))
+)]
 pub async fn metrics(State(st): State<AppState>) -> Response {
     let mut buf = String::new();
     match prometheus_client::encoding::text::encode(&mut buf, &st.metrics.registry) {

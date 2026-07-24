@@ -8,6 +8,7 @@ use crate::ids::SchemaId;
 /// names → the positional bitmap. Distinct from [`NewChunk`](crate::NewChunk), the lowered row with
 /// the bitmap resolved.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(deny_unknown_fields)]
 pub struct IngestChunk {
     pub id: String,
@@ -15,6 +16,7 @@ pub struct IngestChunk {
     pub last_block: u64,
     pub size: u32,
     /// Explicit — never COALESCE-stamped. A superseded id is legal.
+    #[cfg_attr(feature = "openapi", schema(value_type = i32))]
     pub schema_id: SchemaId,
     /// Table *names* present, resolved against `schema_id`'s tables in sorted-name order (unknown →
     /// `UnknownTable`). `None` or a full list = all present (NULL bitmap); `Some([])` = none (all-zero).
@@ -28,6 +30,7 @@ pub struct IngestChunk {
 
 /// One same-range 1:1 replacement; names the old chunk by `id` (resolved to a `ChunkPk` in-tx).
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(deny_unknown_fields)]
 pub struct Correction {
     pub old_chunk_id: String,

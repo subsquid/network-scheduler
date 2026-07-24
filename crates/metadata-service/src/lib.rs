@@ -9,6 +9,7 @@ mod dto;
 mod error;
 mod handlers;
 mod metrics;
+pub mod openapi;
 
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
@@ -83,6 +84,21 @@ impl AppState {
             }
         })
     }
+}
+
+/// Router over a lazy (never-connected) pool and a throwaway token — for route-existence tests
+/// that must not touch a database. Not part of the service API.
+#[doc(hidden)]
+pub fn test_router_without_db() -> Router {
+    let pool =
+        sqlx::PgPool::connect_lazy("postgres://unused@localhost:1/unused").expect("lazy pool");
+    let tokens = auth::TokenStore::from_config(config::TokensConfig {
+        admins: vec!["test-admin-token".into()],
+        ingesters: Vec::new(),
+    })
+    .expect("test token store");
+    let state = AppState::new(PgIngest::new(pool), tokens);
+    build_router(state, 1024 * 1024, Duration::from_secs(5))
 }
 
 /// Routes + auth + metrics. Each auth layer guards its whole subtree, so a new route under it is
