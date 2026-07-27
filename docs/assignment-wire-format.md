@@ -73,6 +73,8 @@ WorkerAssignment { id, chunk_workers, chunks, workers, replication_by_weight }
 PortalAssignment { id, chunk_workers, chunks, workers }   // no replication_by_weight
 ```
 
+(Both use `BTreeMap` under the hood — possibly overkill; worth revisiting, not load-bearing here.)
+
 `PortalAssignment.chunk_workers` is already sourced from confirmed routing
 (`sched_confirmed_chunk_workers`), not the raw ideal — the one piece of MVCC-specific correctness
 that's already right by construction.
@@ -92,7 +94,10 @@ determines which tables are present, and downloads accordingly — `chunk_files(
 **The bundle is published as a separate artifact, accessible to both worker and portal** — settled,
 not an open question. Per [schema-bundle-lifecycle.md](schema-bundle-lifecycle.md), it's generated
 and frozen with the assignment, and its consistency is checked in simulation; delivery of that
-artifact alongside/adjacent to the assignment is the still-open follow-up this doc scopes.
+artifact alongside/adjacent to the assignment is the still-open follow-up this doc scopes. That
+delivery needs its own `NetworkState` pointer (`sqd-network/crates/assignments/src/common.rs`),
+mirroring the existing `NetworkAssignment{id, fb_url_v1, effective_from}` shape, so both worker and
+portal can discover where to fetch the current bundle from.
 
 The same lifecycle doc also flags **"the portal validating incoming queries against the current
 schema"** as planned-but-not-wired. Portal-assignment needs a schema reference too — not
@@ -114,9 +119,10 @@ extensions that proposal adds.
    (`SchemaBundle::chunk_files`, meant to run on the worker once it has the schema, not to be
    precomputed by the scheduler) — but nothing yet delivers the bundle to the worker, or puts
    `schema_id`/`tables_present` on the wire at all. And **URL construction has no equivalent in the
-   new path at all** — `dataset_base_url`/`base_url` (built from `config.storage_domain` +
-   `chunk.bucket()`) exists only in the legacy `types/assignment.rs::encode_fb`, and that part
-   *does* stay scheduler-side regardless of the file-list decision.
+   new path at all** — `dataset_base_url` (built from `config.storage_domain` + `chunk.bucket()`)
+   exists only in the legacy `types/assignment.rs::encode_fb`, and that part *does* stay
+   scheduler-side regardless of the file-list decision (per-chunk `base_url` itself is redundant
+   with `chunk.id` — see the Recommendation section — so it doesn't need porting at all).
 2. **Worker version-status is unreachable from Postgres.** `sched_workers.version` is fetched into
    `WorkerRow` and then ignored — `worker_status_from_row` (`postgres/rows.rs:152-158`) only
    branches on `inactive_since`. `DeprecatedVersion`/`UnsupportedVersion` (both consumed by
@@ -147,7 +153,7 @@ overlap except on identity fields.
 |---|---|
 | `id`, `dataset_id` | existing |
 | `worker_indexes` | existing (`chunk_workers`) |
-| `dataset_base_url`, `base_url` | **new** — port URL construction out of legacy `encode_fb` |
+| `dataset_base_url` (per-dataset only) | **new** — port URL construction out of legacy `encode_fb`; drop `base_url` — `sqd-network/crates/assignments/src/builder.rs:342-343` sets it to `self.id`, i.e. it's just `chunk.id` restated, so the worker can build the download prefix as `dataset_base_url + chunk.id` without a separate field |
 | `schema_id`, `tables_present` | existing (`WorkerAssignmentChunk`) — needs to actually reach the wire; the worker resolves files itself via the published bundle's `chunk_files()`, not a precomputed `files` field |
 | worker `peer_id` | existing |
 | worker `status` (version-aware) | **fix** — make `worker_status_from_row` compare `version` against configured thresholds |
@@ -166,8 +172,8 @@ Explicitly excludes `last_block_hash`/`last_block_timestamp` — no worker consu
 | worker `peer_id`, version-aware `status` | existing + same status fix as worker-assignment |
 | current `schema_id` (reference into the published bundle, for query validation) | **new** — a dataset-level reference, not per-chunk, and not the schema content itself |
 
-Explicitly excludes `dataset_base_url`, `base_url`, `files`, `encrypted_headers` — no portal
-consumer, and excluding them shrinks the portal blob meaningfully at scale.
+Explicitly excludes `dataset_base_url`, `schema_id`/`tables_present`, `encrypted_headers` — no
+portal consumer, and excluding them shrinks the portal blob meaningfully at scale.
 
 ### Cross-cutting, not fields
 
@@ -179,6 +185,4 @@ consumer, and excluding them shrinks the portal blob meaningfully at scale.
 - **"Stale" redefinition** — needs an explicit decision (reinstate a storage-based signal, or
   formally redefine and communicate the change), since both consumers branch on this status.
 - **Confirmation watermark** — not a wire-format field, but portal-assignment publication has no
-  production path without it (gap 6). A prerequisite, not a nice-to-have; picking production `M`/`X%`
-  values is scheduler-lifecycle work, not part of this doc's scope — see `docs/README.md`'s known
-  limitations.
+  production path without it (gap 6). A prerequisite, not a nice-to-have.
