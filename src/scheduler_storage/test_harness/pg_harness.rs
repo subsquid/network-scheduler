@@ -172,17 +172,30 @@ pub(crate) fn fresh_db(prefix: &str, id: u64) -> PostgresStorage {
     fresh_db_with(TEST_PGDATA, prefix, id)
 }
 
-/// [`fresh_db`] with an explicit container backing, for callers whose DB won't fit the test tmpfs —
-/// the mainnet-scale reshuffle-sim passes [`PgData::Disk`]. The first call in a process fixes the
-/// backing for the shared container; later calls reuse it.
-pub fn fresh_db_with(pgdata: PgData, prefix: &str, id: u64) -> PostgresStorage {
+/// Create a fresh migrated database on `pgdata` (cloned from the template) and return its URL,
+/// without connecting. The one place the `CREATE DATABASE … TEMPLATE` step lives.
+fn fresh_db_url_with(pgdata: PgData, prefix: &str, id: u64) -> String {
     let s = shared(pgdata);
     let name = format!("{prefix}_{id}");
     s.rt.block_on(admin_exec(
         &s.admin_url,
         &format!("CREATE DATABASE {name} TEMPLATE {}", s.template),
     ));
-    PostgresStorage::connect(&url_with_db(&s.admin_url, &name)).expect("connect fresh db")
+    url_with_db(&s.admin_url, &name)
+}
+
+/// URL of a fresh migrated database on the default test backing, without connecting or taking the
+/// scheduler session lock — for tests that need several raw connections to one database.
+#[cfg(test)]
+pub(crate) fn fresh_db_url(prefix: &str, id: u64) -> String {
+    fresh_db_url_with(TEST_PGDATA, prefix, id)
+}
+
+/// [`fresh_db`] with an explicit container backing, for callers whose DB won't fit the test tmpfs —
+/// the mainnet-scale reshuffle-sim passes [`PgData::Disk`]. The first call in a process fixes the
+/// backing for the shared container; later calls reuse it.
+pub fn fresh_db_with(pgdata: PgData, prefix: &str, id: u64) -> PostgresStorage {
+    PostgresStorage::connect(&fresh_db_url_with(pgdata, prefix, id)).expect("connect fresh db")
 }
 
 #[cfg(test)]

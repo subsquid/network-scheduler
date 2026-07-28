@@ -10,6 +10,7 @@ WORKDIR /app
 
 FROM chef AS planner
 COPY Cargo.toml Cargo.lock ./
+COPY crates ./crates
 COPY src ./src
 COPY tools ./tools
 RUN cargo chef prepare --recipe-path recipe.json
@@ -25,9 +26,9 @@ COPY --from=planner /app/recipe.json recipe.json
 RUN cargo chef cook --release --recipe-path recipe.json -p reshuffle-sim
 
 COPY Cargo.toml Cargo.lock ./
+COPY crates ./crates
 COPY src ./src
 COPY tools ./tools
-COPY migrations ./migrations
 RUN cargo build --release -p reshuffle-sim
 
 FROM debian:bookworm-slim AS runtime

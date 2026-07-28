@@ -12,8 +12,8 @@ use semver::Version;
 use crate::scheduler_storage::algorithm::{
     CurrentPlacement, IdealMapping, ScheduleOutput, SchedulingAlgorithm,
 };
-use crate::scheduler_storage::{AlgoChunk, ChunkPk, NewChunk, WorkerPk};
-use crate::types::{Worker, WorkerStatus};
+use crate::scheduler_storage::{AlgoChunk, ChunkPk, NewChunk, NewDataset, SchemaId, WorkerPk};
+use crate::types::{DatasetSchema, Worker, WorkerStatus};
 
 /// Deterministic peer id derived from a small seed.
 pub fn peer(seed: u8) -> PeerId {
@@ -35,6 +35,12 @@ pub fn dataset(name: &str) -> String {
     format!("s3://{name}")
 }
 
+/// A [`NewDataset`] for the trait's `insert_new_datasets`. These fixtures keep `location == name`
+/// (both the `s3://`-prefixed string), matching how [`chunk`] references its dataset.
+pub fn new_dataset(name: &str, schema: DatasetSchema) -> NewDataset {
+    NewDataset::with_name(dataset(name), dataset(name), schema)
+}
+
 /// Build a `Chunk` without `Chunk::new`, so tests don't depend on `DataChunk` id parsing. `id_seed`
 /// sets the id and a two-block range `[2·seed, 2·seed+1]`, so distinct seeds give distinct,
 /// non-overlapping chunks.
@@ -50,8 +56,10 @@ pub fn chunk(dataset_name: &str, id_seed: u32, size: u32) -> NewChunk {
         )),
         size,
         blocks: first..=first + 1,
-        schema_id: None,
+        schema_id: SchemaId(1),
         tables_present: None,
+        last_block_hash: None,
+        last_block_timestamp: None,
     }
 }
 

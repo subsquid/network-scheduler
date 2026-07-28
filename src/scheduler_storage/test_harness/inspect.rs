@@ -5,7 +5,7 @@
 //! named queries.
 
 use crate::scheduler_storage::NewChunk;
-use crate::scheduler_storage::{ChunkPk, Tick, WorkerPk};
+use crate::scheduler_storage::{ChunkPk, SchemaId, Tick, WorkerPk};
 use crate::types::Worker;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
@@ -118,6 +118,10 @@ pub trait StorageInspect {
     fn get_datasets<F>(&self, filter: F) -> Vec<String>
     where
         F: FnMut(&str) -> bool;
+
+    /// The id of `dataset`'s current write schema (the one a fresh chunk pins), or `None` if the
+    /// dataset isn't registered.
+    fn current_schema_id(&self, dataset: &str) -> Option<SchemaId>;
 
     /// The storage pk of an inserted chunk, looked up by its `(dataset, id)`. Test convenience
     /// over [`get_chunks`](Self::get_chunks).

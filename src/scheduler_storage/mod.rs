@@ -6,6 +6,28 @@ use std::sync::Arc;
 use crate::types::{BlockNumber, ChunkId, DatasetId, DatasetSchema, Worker};
 use crate::weight::SchedulingChunk;
 
+/// The id newtypes, ingest input types, and the error enum now live in `scheduler-metadata`; the
+/// scheduler keeps its historical `scheduler_storage::{…}` surface via this re-export.
+pub use scheduler_metadata::{
+    ChunkPk, DatasetPk, NewChunk, NewDataset, SchemaId, StorageError, WorkerPk,
+};
+
+/// Lower a discovered [`Chunk`](crate::types::Chunk) to a [`NewChunk`] pinned to `schema_id`.
+/// Discovery (the S3 listing) carries no schema, bitmap, or block-hash metadata, so the caller
+/// resolves the dataset's seeded schema id; the metadata fields stay `None`.
+pub fn discovered_chunk(c: crate::types::Chunk, schema_id: SchemaId) -> NewChunk {
+    NewChunk {
+        dataset: c.dataset,
+        id: c.id,
+        size: c.size,
+        blocks: c.blocks,
+        schema_id,
+        tables_present: None,
+        last_block_hash: None,
+        last_block_timestamp: None,
+    }
+}
+
 /// Logical integer timestamp; the caller supplies the clock (test ticks, or a monotonic clock
 /// such as wall-clock seconds in production).
 pub type Tick = u64;
@@ -13,41 +35,7 @@ pub type Tick = u64;
 /// Monotonic assignment version (matches sched_worker_assignments.id / sched_portal_assignments.id).
 pub type AssignmentId = i32;
 
-/// Errors returned across the [`SchedulerStorage`] boundary.
-#[derive(Debug, thiserror::Error)]
-pub enum StorageError {
-    /// Capacity is too tight to place every chunk at its replication floor. Nothing is mutated;
-    /// adding workers or removing chunks clears it next cycle.
-    #[error("scheduling shortage: current worker capacity cannot satisfy all replication floors")]
-    Shortage,
-
-    /// Another scheduler instance already holds the database advisory lock (raised by `connect`).
-    #[error("another scheduler instance is already running for this database")]
-    AlreadyRunning,
-
-    #[error("database error: {0:#}")]
-    Database(anyhow::Error),
-
-    /// `register_correction` rejected invalid inputs or chunks in an incompatible state.
-    #[error("correction rejected: {reason}")]
-    CorrectionRejected { reason: String },
-
-    /// `insert_new_chunks` refused a chunk whose `(dataset, id)` already exists. Distinct from
-    /// `Database` so callers can treat a re-insert as a no-op. Carries no identity: the batched
-    /// Postgres insert can't isolate which chunk collided.
-    #[error("chunk already exists")]
-    ChunkAlreadyExists,
-}
-
-impl From<anyhow::Error> for StorageError {
-    fn from(err: anyhow::Error) -> Self {
-        StorageError::Database(err)
-    }
-}
-
 pub mod algorithm;
-pub mod ids;
-pub use ids::{ChunkPk, DatasetPk, SchemaId, WorkerPk};
 #[cfg(test)]
 pub(crate) mod in_memory;
 pub mod postgres;
@@ -80,19 +68,6 @@ impl SchedulingChunk for AlgoChunk {
     fn size(&self) -> u32 {
         self.size
     }
-}
-
-/// A chunk to insert ([`SchedulerStorage::insert_new_chunks`] / corrections).
-#[derive(Debug, Clone, PartialEq)]
-pub struct NewChunk {
-    pub dataset: DatasetId,
-    pub id: ChunkId,
-    pub size: u32,
-    pub blocks: RangeInclusive<BlockNumber>,
-    /// `None` = stamp with the dataset's current schema.
-    pub schema_id: Option<SchemaId>,
-    /// Table-presence bitmap over `schema_id`'s tables in sorted-name order; `None` = all present.
-    pub tables_present: Option<bit_vec::BitVec>,
 }
 
 /// A chunk as published in an assignment; its file set derives from the schema
@@ -206,15 +181,15 @@ pub trait SchedulerStorage {
     fn mark_for_removal(&mut self, chunk_pk: ChunkPk, now: Tick) -> Result<(), StorageError>;
 
     // Seeding/ingestion entry points (production ingestion and the offline tools). Each dataset
-    // carries its read schema; use `DatasetSchema::default()` when unknown.
-    fn insert_new_datasets(
-        &mut self,
-        datasets: Vec<(String, DatasetSchema)>,
-    ) -> Result<(), StorageError>;
+    // carries its identity and storage location plus an initial WRITE schema (the read schema is a
+    // PG/ingest-only concern — see PgIngest); `NewDataset::new` derives the name from the location
+    // (scheme stripped), or `with_name` sets an explicit one.
+    fn insert_new_datasets(&mut self, datasets: Vec<NewDataset>) -> Result<(), StorageError>;
     fn insert_new_chunks(&mut self, chunks: Vec<NewChunk>) -> Result<(), StorageError>;
 
-    /// Make `schema` the dataset's current read schema (idempotent for identical content).
-    /// Affects chunks inserted afterwards; existing chunks keep the schema they were stamped with.
+    /// Register `schema` in the dataset's WRITE registry (idempotent for identical content); no read
+    /// pointer and no compatibility gate — those are ingest-service concerns. New chunks may pin it;
+    /// existing chunks keep the schema they were stamped with.
     fn set_dataset_schema(
         &mut self,
         dataset: &str,
@@ -233,9 +208,8 @@ pub trait SchedulerStorage {
     /// `PortalAssignment`, which can lag or fail on their own.
     fn active_schema_bundle(&self) -> Result<BTreeMap<SchemaId, DatasetSchema>, StorageError>;
 
-    /// Register a new chunk replacement for an old chunk. New chunk must have the same block range as
-    /// the old chunk. Also enabled by `pg-testkit` for offline tools (reshuffle-sim).
-    #[cfg(any(test, feature = "pg-testkit"))]
+    /// Register a new chunk replacement for an old chunk. New chunk must have the same block range
+    /// as the old chunk. A production path now — reorgs drive it.
     fn register_correction(
         &mut self,
         old_pk: ChunkPk,

@@ -1,7 +1,7 @@
 //! Read-only [`StorageInspect`] view over [`InMemoryStorage`] internals. Test-support only,
 //! consumed by the storage tests and the multistep simulation harness.
 
-use super::super::{ChunkPk, InMemoryStorage, WorkerPk};
+use super::super::{ChunkPk, InMemoryStorage, SchemaId, WorkerPk};
 use crate::scheduler_storage::Tick;
 use crate::scheduler_storage::test_harness::inspect::{
     ChunkMetadataView, ChunkView, CorrectionView, StaleMappingView, StorageInspect,
@@ -9,6 +9,10 @@ use crate::scheduler_storage::test_harness::inspect::{
 };
 
 impl StorageInspect for InMemoryStorage {
+    fn current_schema_id(&self, dataset: &str) -> Option<SchemaId> {
+        self.current_schema.get(dataset).copied()
+    }
+
     fn get_chunks_metadata<F>(&self, mut filter: F) -> Vec<ChunkMetadataView>
     where
         F: FnMut(&ChunkMetadataView) -> bool,

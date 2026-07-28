@@ -1,5 +1,10 @@
 [workspace]
-members = ["tools/compare_fb", "tools/clear_block_hash", "tools/reshuffle_sim"]
+members = ["crates/scheduler-metadata", "crates/metadata-service", "tools/compare_fb", "tools/clear_block_hash", "tools/reshuffle_sim"]
+
+[workspace.dependencies]
+bit-vec = "0.8"
+prometheus-client = "0.23.1"
+sqlx = { version = "0.9", features = ["runtime-tokio", "postgres", "migrate", "chrono", "derive", "tls-native-tls", "bit-vec", "json"] }
 
 [package]
 name = "network-scheduler"
@@ -9,7 +14,7 @@ edition = "2024"
 [features]
 default = []
 # The MVCC chunk-lifecycle storage / multi-step scheduler (Postgres backend + sim tests).
-mvcc-chunks = ["dep:sqlx", "dep:bit-vec", "dep:humantime", "sqd-assignments/mvcc-chunks"]
+mvcc-chunks = ["dep:sqlx", "dep:bit-vec", "dep:humantime", "dep:scheduler-metadata", "sqd-assignments/mvcc-chunks"]
 # Exposes the Postgres testcontainer harness (`scheduler_storage::test_harness::pg_harness`) to other
 # crates — e.g. reshuffle-sim. Implies the Postgres backend. The crate's own tests get the harness via
 # `cfg(test)` + dev-dependencies, so they don't need this feature.
@@ -19,7 +24,7 @@ pg-testkit = ["mvcc-chunks", "dep:dtor", "dep:testcontainers", "dep:testcontaine
 anyhow = "1.0.98"
 aws-config = { version = "1.6.2", features = ["behavior-version-latest"] }
 aws-sdk-s3 = "1.85.0"
-bit-vec = { version = "0.8", optional = true }
+bit-vec = { workspace = true, optional = true }
 bytesize = "2.3.1"
 chrono = "0.4.41"
 clap = { version = "4.5.38", features = ["derive", "env"] }
@@ -35,7 +40,8 @@ libp2p-identity = { version = "0.2.10", features = ["peerid", "rand", "serde"] }
 multihash = "0.19.3"
 parking_lot = "0.12.3"
 parquet = "54.2"
-prometheus-client = "0.23.1"
+prometheus-client = { workspace = true }
+scheduler-metadata = { path = "crates/scheduler-metadata", optional = true }
 rand = "0.9.1"
 rayon = "1.10.0"
 seahash = "4.1.0"
@@ -53,7 +59,7 @@ tokio = { version = "1.45.0", features = ["full"] }
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.19", features = ["env-filter", "parking_lot"] }
 secrecy = { version = "0.10.3", features = ["serde"] }
-sqlx = { version = "0.9", features = ["runtime-tokio", "postgres", "migrate", "chrono", "derive", "tls-native-tls", "bit-vec", "json"], optional = true }
+sqlx = { workspace = true, optional = true }
 # Also dev-dependencies (for the crate's own tests); optional here so the `pg-testkit` feature can hand
 # the harness to downstream crates without forcing testcontainers into a plain build.
 dtor = { version = "1.0.5", optional = true }

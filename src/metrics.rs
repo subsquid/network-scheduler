@@ -8,6 +8,13 @@ use prometheus_client::{
 
 use crate::types::Worker;
 
+/// `PhaseTimer` and the `EXEC_TIMES` family it feeds are defined in `scheduler-metadata` (the ingest
+/// SQL uses them); re-exported here so the mvcc storage code shares the *same* family. `Timer` and
+/// `register_metrics` below then hit that one family — otherwise the scheduler would register a
+/// second, empty `exec_times` while PhaseTimer fed the crate's unregistered one (lost telemetry).
+#[cfg(feature = "mvcc-chunks")]
+pub use scheduler_metadata::metrics::{EXEC_TIMES, PhaseTimer};
+
 type Labels = Vec<(&'static str, String)>;
 
 lazy_static::lazy_static! {
@@ -33,8 +40,39 @@ lazy_static::lazy_static! {
     pub static ref REGISTRATION_REJECTED: Family<Labels, Gauge> = Default::default();
 
     pub static ref FAILURE: Family<Labels, Gauge> = Default::default();
-    pub static ref EXEC_TIMES: Family<Labels, Gauge<f64, AtomicU64>> = Default::default();
     pub static ref ASSIGNMENT_TIMESTAMP: Gauge = Default::default();
+}
+
+// Without the `mvcc-chunks` crate there is no `PhaseTimer`, so `exec_times` is a root-local family
+// fed only by `Timer`. (With the feature it's the crate's, re-exported above.)
+#[cfg(not(feature = "mvcc-chunks"))]
+lazy_static::lazy_static! {
+    pub static ref EXEC_TIMES: Family<Labels, Gauge<f64, AtomicU64>> = Default::default();
+}
+
+/// Times a named operation; on drop it adds the elapsed seconds to the `exec_times` family.
+pub struct Timer {
+    start: std::time::Instant,
+    name: &'static str,
+}
+
+impl Timer {
+    pub fn new(name: &'static str) -> Self {
+        Self {
+            start: std::time::Instant::now(),
+            name,
+        }
+    }
+}
+
+impl Drop for Timer {
+    fn drop(&mut self) {
+        let elapsed = self.start.elapsed();
+        EXEC_TIMES
+            .get_or_create(&vec![("name", self.name.to_string())])
+            .inc_by(elapsed.as_secs_f64());
+        tracing::debug!("{} finished in {:?}", self.name, elapsed);
+    }
 }
 
 pub fn report_workers(workers: &[Worker]) {
@@ -258,77 +296,20 @@ pub fn encode_metrics(registry: &Registry) -> anyhow::Result<String> {
     Ok(buffer)
 }
 
-pub struct Timer {
-    start: std::time::Instant,
-    name: &'static str,
-}
+#[cfg(all(test, feature = "mvcc-chunks"))]
+mod tests {
+    use super::*;
 
-impl Timer {
-    pub fn new(name: &'static str) -> Self {
-        Self {
-            start: std::time::Instant::now(),
-            name,
-        }
-    }
-}
-
-impl Drop for Timer {
-    fn drop(&mut self) {
-        let elapsed = self.start.elapsed();
-        EXEC_TIMES
-            .get_or_create(&vec![("name", self.name.to_string())])
-            .inc_by(elapsed.as_secs_f64());
-        tracing::debug!("{} finished in {:?}", self.name, elapsed);
-    }
-}
-
-/// Times a Postgres storage phase, counting the SQL statements it issues and rows they touch. On
-/// drop it emits one `debug` line on the `pg_timing` target (select with
-/// `RUST_LOG=error,pg_timing=debug`) plus an `EXEC_TIMES` sample. The statement count distinguishes
-/// an N+1 storm (statements ≈ rows) from a single slow query.
-pub struct PhaseTimer {
-    start: std::time::Instant,
-    name: &'static str,
-    statements: u64,
-    rows: u64,
-}
-
-impl PhaseTimer {
-    pub fn new(name: &'static str) -> Self {
-        Self {
-            start: std::time::Instant::now(),
-            name,
-            statements: 0,
-            rows: 0,
-        }
-    }
-
-    /// Record one executed statement that touched `rows` rows. Call once per round-trip — inside a
-    /// per-row loop this is what surfaces the round-trip count.
-    pub fn stmt(&mut self, rows: u64) {
-        self.statements += 1;
-        self.rows += rows;
-    }
-
-    /// Add to the row count without counting a statement, so a CPU phase reports `statements = 0`.
-    pub fn items(&mut self, rows: u64) {
-        self.rows += rows;
-    }
-}
-
-impl Drop for PhaseTimer {
-    fn drop(&mut self) {
-        let elapsed = self.start.elapsed();
-        EXEC_TIMES
-            .get_or_create(&vec![("name", self.name.to_string())])
-            .inc_by(elapsed.as_secs_f64());
-        tracing::debug!(
-            target: "pg_timing",
-            phase = self.name,
-            statements = self.statements,
-            rows = self.rows,
-            elapsed_ms = elapsed.as_millis() as u64,
-            "pg phase complete"
+    // Regression guard for the crate-extraction split: the ingest SQL's `PhaseTimer` feeds the
+    // crate's `EXEC_TIMES`, so `register_metrics` must register *that* family — otherwise the
+    // scheduler's insert_new_chunks / register_corrections samples silently vanish from /metrics.
+    #[test]
+    fn phase_timer_samples_reach_registered_exec_times() {
+        drop(PhaseTimer::new("insert_new_chunks"));
+        let out = encode_metrics(&register_metrics("testnet".to_string())).unwrap();
+        assert!(
+            out.contains("insert_new_chunks"),
+            "PhaseTimer sample missing from the registered exec_times family:\n{out}"
         );
     }
 }

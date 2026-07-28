@@ -16,7 +16,7 @@ use crate::scheduler_storage::Tick;
 use crate::scheduler_storage::in_memory::InMemoryStorage;
 use crate::scheduler_storage::postgres::PostgresStorage;
 use crate::scheduler_storage::test_harness::inspect::ChunkView;
-use crate::scheduler_storage::{AlgoChunk, NewChunk as StorageNewChunk};
+use crate::scheduler_storage::{AlgoChunk, NewChunk as StorageNewChunk, SchemaId};
 use crate::types::{ChunkWeight, DatasetSchema, TableSchema};
 use crate::weight::{SchedulingChunk, WeightStrategy};
 
@@ -572,14 +572,16 @@ impl WeightStrategy for WeightTable {
 
 /// Build the storage insert input for a model chunk. Weight is *not* recorded here — call
 /// [`record_weights`] separately.
-pub(super) fn storage_chunk(chunk: &NewChunk) -> StorageNewChunk {
+pub(super) fn storage_chunk(chunk: &NewChunk, schema_id: SchemaId) -> StorageNewChunk {
     StorageNewChunk {
         dataset: Arc::new(chunk.dataset.clone()),
         id: Arc::new(chunk.key.clone()),
         size: chunk.size,
         blocks: chunk.blocks.clone(),
-        schema_id: None,
+        schema_id,
         tables_present: None,
+        last_block_hash: None,
+        last_block_timestamp: None,
     }
 }
 

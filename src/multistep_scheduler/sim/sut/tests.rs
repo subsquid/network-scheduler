@@ -1,9 +1,16 @@
 //! Deterministic unit tests driving `SimUnderTest` directly (no runner), plus the
 //! `convergence_under_shortage` drain proptest.
 
-use super::super::utils::new_chunk;
+use super::super::utils::{DATASETS, new_chunk};
 use super::*;
-use crate::scheduler_storage::NewChunk as StorageNewChunk;
+use crate::scheduler_storage::test_harness::inspect::StorageInspect;
+use crate::scheduler_storage::{NewChunk as StorageNewChunk, SchemaId};
+use crate::weight::WeightStrategy;
+
+/// A chunk's storage primary key, `(dataset, key)`; weight lives in the table, not the key.
+fn chunk_pk(chunk: &NewChunk) -> (String, String) {
+    (chunk.dataset.clone(), chunk.key.clone())
+}
 
 /// `count` uniform chunks keyed from `base`; shared with the Postgres parity tests.
 pub(super) fn uniform_chunks(base: u64, count: u64) -> Vec<NewChunk> {
@@ -17,6 +24,43 @@ pub(super) fn uniform_chunks(base: u64, count: u64) -> Vec<NewChunk> {
             ))
         })
         .collect()
+}
+
+/// All [`WEIGHTS`] values coexist in one dataset: `prepare` hands every chunk back with its
+/// recorded weight, nothing dropped.
+#[test]
+fn multiple_weights_coexist_in_one_dataset() {
+    let weights = WeightTable::default();
+    let chunks: Vec<NewChunk> = (0u64..3)
+        .flat_map(|rep| {
+            WEIGHTS.iter().map(move |&weight| {
+                new_chunk((
+                    mint_key(rep * 100 + u64::from(weight)),
+                    CHUNK_SIZE,
+                    weight,
+                    DATASETS[0].to_string(),
+                ))
+            })
+        })
+        .collect();
+    let expected: HashMap<(String, String), u16> =
+        chunks.iter().map(|c| (chunk_pk(c), c.weight)).collect();
+
+    // pk sort order mirrors a real cycle.
+    record_weights(&weights, &chunks);
+    // Pure WeightTable round-trip — never inserted, so any schema id compiles.
+    let mut storage_chunks: Vec<StorageNewChunk> = chunks
+        .iter()
+        .map(|c| storage_chunk(c, SchemaId(1)))
+        .collect();
+    storage_chunks.sort_by_key(|c| ((*c.dataset).clone(), (*c.id).clone()));
+    let prepared = weights.prepare(storage_chunks);
+
+    assert_eq!(prepared.len(), chunks.len(), "a chunk lost its weight");
+    for (chunk, weight, _) in prepared {
+        let pk = ((*chunk.dataset).clone(), (*chunk.id).clone());
+        assert_eq!(weight, expected[&pk], "wrong weight for {pk:?}");
+    }
 }
 
 /// With stale accumulated and never cleared, repeated frozen-clock rescheduling must reach a
@@ -157,7 +201,12 @@ fn over_subscription_yields_typed_storage_error_shortage() {
     // `InMemoryStorage` has inherent methods of the same name, so drive the trait explicitly.
     let burst = uniform_chunks(base, 255);
     record_weights(&sim.weights, &burst); // the scheduler reads each chunk's weight back
-    let storage_chunks: Vec<StorageNewChunk> = burst.iter().map(storage_chunk).collect();
+    let schema_id = sim
+        .storage
+        .current_schema_id(DATASETS[0])
+        .expect("DATASETS[0] is registered by SimUnderTest::new");
+    let storage_chunks: Vec<StorageNewChunk> =
+        burst.iter().map(|c| storage_chunk(c, schema_id)).collect();
     SchedulerStorage::insert_new_chunks(&mut sim.storage, storage_chunks)
         .expect("chunks name registered datasets");
     SchedulerStorage::register_new_chunks(&mut sim.storage)

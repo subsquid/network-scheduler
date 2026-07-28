@@ -22,8 +22,8 @@ use crate::scheduler_storage::algorithm::{CurrentPlacement, SchedulingAlgorithm}
 use crate::scheduler_storage::in_memory::InMemoryStorage;
 use crate::scheduler_storage::test_harness::inspect::{Snapshot as RawSnapshot, StorageInspect};
 use crate::scheduler_storage::{
-    AlgoChunk, AssignmentId, ChunkPk, PortalAssignment, SchedulerStorage, SchemaBundle,
-    StorageError, Tick, WorkerAssignment, WorkerPk,
+    AlgoChunk, AssignmentId, ChunkPk, NewDataset, PortalAssignment, SchedulerStorage, SchemaBundle,
+    SchemaId, StorageError, Tick, WorkerAssignment, WorkerPk,
 };
 use crate::types::{DatasetSchema, Worker, WorkerStatus};
 use proptest::statistics;
@@ -419,10 +419,18 @@ impl<D: SimStorage> SimUnderTest<D> {
         record_weights(&self.weights, std::slice::from_ref(&replacement));
         let outcome = match self.pk_of(old_dataset, old_key) {
             Some(old_pk) => {
+                // A same-dataset replacement stamps that dataset's current schema; a deliberately
+                // "foreign" (unregistered) replacement is dropped by register_correction's dataset
+                // join / DatasetMismatch check before schema_id is examined, so the placeholder is
+                // inert there.
+                let schema_id = self
+                    .storage
+                    .current_schema_id(&replacement.dataset)
+                    .unwrap_or(SchemaId(1));
                 match SchedulerStorage::register_correction(
                     &mut self.storage,
                     old_pk,
-                    storage_chunk(&replacement),
+                    storage_chunk(&replacement, schema_id),
                     self.now,
                 ) {
                     Ok(_new_pk) => {
@@ -548,7 +556,14 @@ impl<D: SimStorage> SimUnderTest<D> {
         // per-chunk so one duplicate doesn't drop the rest of the batch. The generator only names
         // registered datasets, so any other insert error is a contract break → fail loud.
         for chunk in new_chunks {
-            match self.storage.insert_new_chunks(vec![storage_chunk(chunk)]) {
+            let schema_id = self
+                .storage
+                .current_schema_id(&chunk.dataset)
+                .expect("the sim only inserts into registered datasets");
+            match self
+                .storage
+                .insert_new_chunks(vec![storage_chunk(chunk, schema_id)])
+            {
                 Ok(()) | Err(StorageError::ChunkAlreadyExists) => {}
                 Err(err) => panic!("insert_new_chunks failed for a non-duplicate reason: {err}"),
             }
@@ -1748,7 +1763,9 @@ impl<D: SimStorage> SimUnderTest<D> {
                 config
                     .datasets
                     .iter()
-                    .map(|name| (name.clone(), DatasetSchema::default()))
+                    .map(|name| {
+                        NewDataset::with_name(name.clone(), name.clone(), DatasetSchema::default())
+                    })
                     .collect(),
             )
             .expect("datasets are fresh");

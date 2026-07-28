@@ -1,6 +1,6 @@
 # MVCC storage — schema reference
 
-Table definitions live in `migrations/0001_sched_tables.sql`. The protocol these tables serve is
+Table definitions live in `crates/scheduler-metadata/migrations/0001_sched_tables.sql`. The protocol these tables serve is
 described in [mvcc-storage.md](mvcc-storage.md).
 
 **Time is logical ticks, not wall-clock.** Every `created_at` / `marked_for_removal` /
@@ -45,9 +45,15 @@ Dataset registry; created by the ingester before any of its chunks are inserted.
 ```sql
 CREATE TABLE datasets (
     id   SMALLSERIAL PRIMARY KEY,
-    name TEXT        NOT NULL UNIQUE
+    name     TEXT        NOT NULL UNIQUE,
+    location TEXT        NOT NULL UNIQUE
 );
 ```
+
+`name` is the dataset's **identity** (`base-sepolia`); `location` is its **storage path**
+(`s3://base-sepolia`). The split lets a dataset move buckets without rewriting a chunk row. Every
+storage internal keys on `name`/`id`; only assignment publication will read `location`, and that
+code isn't written yet — today writers set `location = name`.
 
 ### schemas
 
@@ -94,8 +100,8 @@ CREATE TABLE chunks (
 );
 ```
 
-A chunk's file set is **not** stored. Every chunk carries a schema pin: the insert stamps the
-dataset's current schema unless the writer supplies one, so `set_dataset_schema` affects only
+A chunk's file set is **not** stored. Every chunk carries a schema pin the writer supplies
+explicitly at insert (`chunks.schema_id` is NOT NULL), so `set_dataset_schema` affects only
 chunks inserted afterwards. The published/portal reads return the pin plus `tables_present`;
 turning those into the actual `<table>.parquet` list (`schema_files`, fed by the trait's
 `load_schemas`) happens at assignment construction, not in storage (wire format is a follow-up).
@@ -113,8 +119,9 @@ chunk's span fits in `INT`. It is a scheduling input: the weight strategy maps e
 published/portal reads decode `chunk_pk, dataset_id (via name), chunk_id, size, first_block,
 last_block_delta` plus `schema_id` and `tables_present` into `WorkerAssignmentChunk` (`ChunkRow`
 in `postgres/rows.rs`); the cycle read decodes the same columns minus the schema pair into
-`AlgoChunk` (`AlgoChunkRow`). `last_block_hash`, `last_block_timestamp`, and `registered_at`
-are not read by the scheduler.
+`AlgoChunk` (`AlgoChunkRow`). `last_block_hash` and `last_block_timestamp` are now **written by the
+ingest path** (`insert_chunks`/`register_corrections`) but still read by nobody — recorded so a
+future MVCC assignment builder needn't recover them from S3. `registered_at` is not read either.
 
 ### chunk_corrections
 

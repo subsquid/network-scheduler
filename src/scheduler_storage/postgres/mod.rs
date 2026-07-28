@@ -6,12 +6,11 @@
 //!
 //! `Tick` values are logical integer timestamps stored in `BIGINT` columns;
 //! `m_ticks`/`gc_ticks` are raw tick counts used in integer arithmetic.
-#[cfg(any(test, feature = "pg-testkit"))]
-mod correction;
+
+mod admission;
 mod debug;
 pub mod explain;
 mod nonoverlap;
-mod registration;
 mod rows;
 mod scheduling_cycle;
 mod schema;
@@ -32,8 +31,8 @@ use sqlx::postgres::PgConnection;
 use crate::metrics::{PhaseTimer, Timer};
 use crate::scheduler_storage::algorithm::{CurrentPlacement, ScheduleOutput, SchedulingAlgorithm};
 use crate::scheduler_storage::{
-    AssignmentId, ChunkPk, DatasetPk, NewChunk, PortalAssignment, SchedulerStorage, SchemaBundle,
-    SchemaId, StorageError, Tick, WorkerAssignment,
+    AssignmentId, ChunkPk, DatasetPk, NewChunk, NewDataset, PortalAssignment, SchedulerStorage,
+    SchemaBundle, SchemaId, StorageError, Tick, WorkerAssignment,
 };
 use crate::types::{Dataset, DatasetSchema, DatasetWatermark, Worker};
 
@@ -104,7 +103,7 @@ impl PostgresStorage {
     /// Run pending sqlx migrations. Call once on startup before the scheduling loop.
     pub fn migrate(&mut self) -> Result<(), StorageError> {
         self.with_conn(async move |conn| {
-            sqlx::migrate!("./migrations")
+            scheduler_metadata::pg::MIGRATOR
                 .run(&mut *conn)
                 .await
                 .context("migration failed")?;
@@ -145,6 +144,14 @@ impl PostgresStorage {
         })
     }
 
+    /// Each dataset's seeded write schema id (the one created with the dataset), by name.
+    /// The S3-discovery path stamps these on discovered chunks, which carry no schema info.
+    pub fn seeded_schema_ids(&self) -> Result<BTreeMap<String, SchemaId>, StorageError> {
+        self.with_conn_ref(async move |conn| {
+            scheduler_metadata::pg::schema::seeded_schema_ids(conn).await
+        })
+    }
+
     /// Run an async query closure on the owned runtime with exclusive
     /// connection access. The `AsyncFnOnce` bound lets the future borrow the
     /// `&mut PgConnection` argument, which `FnOnce(_) -> Fut` cannot express.
@@ -164,7 +171,6 @@ impl PostgresStorage {
 
     /// Register same-range corrections in bulk: one transaction, all-or-nothing. Returns the
     /// replacement pks in input order. The trait's `register_correction` is a batch of one.
-    #[cfg(any(test, feature = "pg-testkit"))]
     pub fn register_corrections(
         &mut self,
         corrections: Vec<(ChunkPk, NewChunk)>,
@@ -175,7 +181,13 @@ impl PostgresStorage {
         }
         let batch_size = self.batch_size;
         self.with_conn(async move |conn| {
-            correction::register_corrections(conn, &corrections, now, batch_size).await
+            scheduler_metadata::pg::correction::register_corrections(
+                conn,
+                &corrections,
+                now,
+                batch_size,
+            )
+            .await
         })
     }
 
@@ -188,22 +200,29 @@ impl PostgresStorage {
 }
 
 impl SchedulerStorage for PostgresStorage {
-    fn insert_new_datasets(
-        &mut self,
-        datasets: Vec<(String, DatasetSchema)>,
-    ) -> Result<(), StorageError> {
+    fn insert_new_datasets(&mut self, datasets: Vec<NewDataset>) -> Result<(), StorageError> {
         self.with_conn(async move |conn| -> Result<(), StorageError> {
             let mut timer = PhaseTimer::new("insert_new_datasets");
             let mut tx = conn.begin().await.context("insert_new_datasets: begin")?;
-            for (name, dataset_schema) in &datasets {
-                let dataset_id: DatasetPk =
-                    sqlx::query_scalar("INSERT INTO datasets (name) VALUES ($1) RETURNING id")
-                        .bind(name)
-                        .fetch_one(&mut *tx)
-                        .await
-                        .context("insert_new_datasets")?;
-                schema::ensure_current_schema(&mut tx, dataset_id, dataset_schema).await?;
-                timer.stmt(3); // dataset insert + schema supersede + activate
+            for NewDataset {
+                name,
+                location,
+                schema,
+            } in &datasets
+            {
+                let dataset_id: DatasetPk = sqlx::query_scalar(
+                    "INSERT INTO datasets (name, location) VALUES ($1, $2) RETURNING id",
+                )
+                .bind(name)
+                .bind(location)
+                .fetch_one(&mut *tx)
+                .await
+                .context("insert_new_datasets")?;
+                // The scheduler seeds only the WRITE registry; the read pointer is an
+                // ingest-service concern (PgIngest), not a scheduler one.
+                scheduler_metadata::pg::schema::insert_write_schema(&mut tx, dataset_id, schema)
+                    .await?;
+                timer.stmt(2); // dataset insert + write-schema insert
             }
             tx.commit().await.context("insert_new_datasets: commit")?;
             Ok(())
@@ -228,7 +247,14 @@ impl SchedulerStorage for PostgresStorage {
                     anyhow::anyhow!("set_dataset_schema: dataset {dataset} not found").into(),
                 );
             };
-            schema::ensure_current_schema(&mut tx, dataset_id, &dataset_schema).await?;
+            // "Register the dataset's WRITE schema": add it to the (immutable, deduped) write
+            // registry. No read pointer, no compatibility gate — those live in PgIngest.
+            scheduler_metadata::pg::schema::insert_write_schema(
+                &mut tx,
+                dataset_id,
+                &dataset_schema,
+            )
+            .await?;
             tx.commit().await.context("set_dataset_schema: commit")?;
             Ok(())
         })
@@ -239,9 +265,7 @@ impl SchedulerStorage for PostgresStorage {
         schema_ids: Option<&[crate::scheduler_storage::SchemaId]>,
     ) -> Result<BTreeMap<crate::scheduler_storage::SchemaId, DatasetSchema>, StorageError> {
         self.with_conn_ref(async move |conn| {
-            schema::load_schemas(conn, schema_ids)
-                .await
-                .map_err(StorageError::from)
+            scheduler_metadata::pg::schema::load_schemas(conn, schema_ids).await
         })
     }
 
@@ -258,7 +282,7 @@ impl SchedulerStorage for PostgresStorage {
     fn insert_new_chunks(&mut self, chunks: Vec<NewChunk>) -> Result<(), StorageError> {
         let batch_size = self.batch_size;
         self.with_conn(async move |conn| {
-            registration::insert_chunks(conn, &chunks, batch_size).await
+            scheduler_metadata::pg::registration::insert_chunks(conn, &chunks, batch_size).await
         })
     }
 
@@ -266,12 +290,12 @@ impl SchedulerStorage for PostgresStorage {
         self.with_conn(async move |conn| {
             let _timer = Timer::new("register_new_chunks");
 
-            let candidate_rows = registration::fetch_candidates(conn).await?;
-            let registration::Classified {
+            let candidate_rows = admission::fetch_candidates(conn).await?;
+            let admission::Classified {
                 exempt,
                 candidates,
                 range_rejected,
-            } = registration::classify(&candidate_rows);
+            } = admission::classify(&candidate_rows);
 
             // Reject candidates overlapping a live chunk in their dataset (indexed SQL probe), then
             // settle overlaps within the batch (two new chunks covering the same range).
@@ -282,17 +306,17 @@ impl SchedulerStorage for PostgresStorage {
             let (accepted, batch_rejected) = nonoverlap::settle_within_batch(clear);
             rejected.extend(batch_rejected);
             nonoverlap::report_registration_rejected(&rejected);
-            registration::warn_range_rejected(&range_rejected);
+            admission::warn_range_rejected(&range_rejected);
 
             let mut admitted = exempt;
             admitted.extend(&accepted);
-            registration::persist_admitted(conn, &admitted).await?;
+            admission::persist_admitted(conn, &admitted).await?;
             let rejected_pks: Vec<ChunkPk> = rejected
                 .iter()
                 .chain(&range_rejected)
                 .map(|c| c.pk)
                 .collect();
-            registration::persist_rejected(conn, &rejected_pks).await?;
+            admission::persist_rejected(conn, &rejected_pks).await?;
 
             Ok::<_, StorageError>(admitted)
         })
@@ -427,8 +451,9 @@ impl SchedulerStorage for PostgresStorage {
             let mut schema_ids: BTreeSet<SchemaId> = wa.schema_ids();
             schema_ids.extend(bundle_schema_ids);
             let schema_ids: Vec<SchemaId> = schema_ids.into_iter().collect();
-            let bundle =
-                SchemaBundle::from_schemas(schema::load_schemas(conn, Some(&schema_ids)).await?);
+            let bundle = SchemaBundle::from_schemas(
+                scheduler_metadata::pg::schema::load_schemas(conn, Some(&schema_ids)).await?,
+            );
             Ok::<_, StorageError>((wa, bundle))
         })
     }
@@ -518,7 +543,6 @@ impl SchedulerStorage for PostgresStorage {
         })
     }
 
-    #[cfg(any(test, feature = "pg-testkit"))]
     fn register_correction(
         &mut self,
         old_pk: ChunkPk,

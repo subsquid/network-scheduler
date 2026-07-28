@@ -14,9 +14,10 @@ use network_scheduler::{
     cli::{Config, DatasetsConfig},
     multistep_scheduler::SchedulingConfig as MultistepConfig,
     scheduler_storage::{
-        AssignmentId, ChunkPk, NewChunk, SchedulerStorage, StorageError, WorkerAssignment,
-        WorkerAssignmentChunk, WorkerPk,
+        AssignmentId, ChunkPk, NewChunk, NewDataset, SchedulerStorage, SchemaId, StorageError,
+        WorkerAssignment, WorkerAssignmentChunk, WorkerPk,
         algorithm::MultistepAlgorithm,
+        discovered_chunk,
         postgres::PostgresStorage,
         test_harness::pg_harness::{self, PgData},
     },
@@ -290,8 +291,10 @@ impl MultistepScheduler {
                     id: Arc::new(format!("{}{REPLACE_SUFFIX}", chunk.id)),
                     size: chunk.size,
                     blocks: chunk.blocks.clone(),
-                    schema_id: Some(chunk.schema_id),
+                    schema_id: chunk.schema_id,
                     tables_present: chunk.tables_present.clone(),
+                    last_block_hash: None,
+                    last_block_timestamp: None,
                 };
                 (*pk, new_chunk)
             })
@@ -322,7 +325,11 @@ impl MultistepScheduler {
         // Destination isn't seeded at build (no baseline chunks), so register it before its clones.
         self.backend
             .storage
-            .insert_new_datasets(vec![(dst.clone(), DatasetSchema::default())])?;
+            .insert_new_datasets(vec![NewDataset::with_name(
+                dst.clone(),
+                dst.clone(),
+                DatasetSchema::default(),
+            )])?;
         let count = self.backend.storage.copy_dataset_chunks(&src, &dst)?;
         anyhow::ensure!(
             count > 0,
@@ -399,12 +406,14 @@ impl StepScheduler for MultistepScheduler {
             copied_or_replaced_chunks += self.copy_dataset(plan)?;
         }
 
+        // Re-fetched each step: `copy_dataset` above can create datasets mid-run.
+        let schema_ids = self.backend.storage.seeded_schema_ids()?;
         let new_chunks: Vec<NewChunk> = ctx
             .new_chunks_this_step
             .iter()
             .cloned()
-            .map(to_storage_chunk)
-            .collect();
+            .map(|c| to_storage_chunk(c, &schema_ids))
+            .collect::<anyhow::Result<_>>()?;
         self.ingested_chunks += new_chunks.len();
         self.backend.storage.insert_new_chunks(new_chunks)?;
         self.backend.storage.register_new_chunks()?;
@@ -489,7 +498,7 @@ fn seed_baseline(
     backend.storage.insert_new_datasets(
         dataset_names
             .into_iter()
-            .map(|name| (name, DatasetSchema::default()))
+            .map(|name| NewDataset::with_name(name.clone(), name, DatasetSchema::default()))
             .collect(),
     )?;
     backend
@@ -501,10 +510,11 @@ fn seed_baseline(
     );
 
     tracing::info!("Inserting {total_chunks} baseline chunks...");
+    let schema_ids = backend.storage.seeded_schema_ids()?;
     let storage_chunks: Vec<NewChunk> = std::mem::take(&mut baseline.chunks)
         .into_iter()
-        .map(to_storage_chunk)
-        .collect();
+        .map(|c| to_storage_chunk(c, &schema_ids))
+        .collect::<anyhow::Result<_>>()?;
     backend.storage.insert_new_chunks(storage_chunks)?;
     let registered = backend.storage.register_new_chunks()?;
     tracing::info!(
@@ -602,16 +612,16 @@ fn stale_holders(
 }
 
 /// Storage-boundary conversion: the sim models chunks as the legacy `types::Chunk`; the MVCC
-/// storage takes `NewChunk` (no files; the sim carries no schema metadata).
-fn to_storage_chunk(chunk: Chunk) -> NewChunk {
-    NewChunk {
-        dataset: chunk.dataset,
-        id: chunk.id,
-        size: chunk.size,
-        blocks: chunk.blocks,
-        schema_id: None,
-        tables_present: None,
-    }
+/// storage takes `NewChunk` (no files; the sim carries no schema metadata, so it pins the single
+/// schema every dataset is created with, looked up in `seeded_schema_ids`).
+fn to_storage_chunk(
+    chunk: Chunk,
+    schema_ids: &BTreeMap<String, SchemaId>,
+) -> anyhow::Result<NewChunk> {
+    let schema_id = *schema_ids
+        .get(chunk.dataset.as_str())
+        .with_context(|| format!("no seeded schema for dataset {}", chunk.dataset))?;
+    Ok(discovered_chunk(chunk, schema_id))
 }
 
 #[cfg(test)]
