@@ -28,6 +28,9 @@ work. **This page is the single source of truth for what is actually built and w
 5. **[nonoverlap-promotion-gate.md](nonoverlap-promotion-gate.md)** — non-overlap enforcement
    (registration-time rejection + the promotion-time backstop) that keeps a dataset's chunk ranges
    non-overlapping.
+6. **[assignment-wire-format.md](assignment-wire-format.md)** — what the split worker/portal
+   assignments should actually carry on the wire, traced against real consumers in worker-rs and
+   sqd-portal.
 
 ## Status & limitations
 
@@ -52,6 +55,7 @@ built.
 | Replica-sufficiency **drain gate** (capacity-aware "rule 2") | 📐 | Drains expire on the M-tick timer only. |
 | Replica-sufficiency **promotion gate** (capacity-aware "rule 3") | 📐 | Promotion is gated on assignment confirmation, not on a confirmed-copy count. |
 | Production wiring (`controller.rs`) | 📐 | Subsystem is sim-only behind `mvcc-chunks`. |
+| Worker/portal assignment content divergence | 📐 | Both wire formats still encode the identical legacy blob. See [assignment-wire-format.md](assignment-wire-format.md). |
 | Backpressure / under-replication observability counters | 📐 | `NotEnoughCapacity` error exists; the per-cycle metrics surface does not. |
 | Non-overlap enforcement (no overlapping chunk ranges per dataset) | ✅ | Registration-time rejection + promotion backstop, both backends. See [nonoverlap-promotion-gate.md](nonoverlap-promotion-gate.md). |
 
