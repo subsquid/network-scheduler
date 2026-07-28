@@ -159,6 +159,12 @@ pub struct Config {
     #[serde(default = "default_min_worker_version")]
     pub min_recommended_worker_version: Version,
 
+    /// Epochs a worker's reported on-chain epoch may lag the network's before its contract reads
+    /// count as broken. The fleet doesn't roll over simultaneously, so one epoch of lag is routine.
+    /// `null` disables the check.
+    #[serde(default = "default_max_worker_epoch_lag")]
+    pub max_worker_epoch_lag: Option<u32>,
+
     #[serde_as(as = "DurationSeconds")]
     #[serde(rename = "assignment_delay_sec", default = "default_assignment_delay")]
     pub assignment_delay: Duration,
@@ -249,6 +255,10 @@ fn default_true() -> bool {
 
 fn default_min_worker_version() -> Version {
     "2.0.0".parse().unwrap()
+}
+
+fn default_max_worker_epoch_lag() -> Option<u32> {
+    Some(2)
 }
 
 fn default_assignment_ttl() -> Duration {

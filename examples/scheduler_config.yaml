@@ -8,6 +8,8 @@ network_state_url: "https://fake-metadata.sqd-datasets.io"
 scheduler_state_bucket: network-scheduler-state
 min_supported_worker_version: "2.6.0-rc1"
 min_recommended_worker_version: "2.6.0"
+# Epochs of lag before a worker is marked stale_rpc; `null` disables the check. Default: 2
+max_worker_epoch_lag: 2
 cloudflare_storage_secret: ""
 strict_continuity_check: true
 datasets:
