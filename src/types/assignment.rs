@@ -161,7 +161,9 @@ impl Assignment {
                 WorkerStatus::UnsupportedVersion => {
                     sqd_assignments::WorkerStatus::UnsupportedVersion
                 }
-                WorkerStatus::Stale => sqd_assignments::WorkerStatus::Unreliable,
+                WorkerStatus::Stale | WorkerStatus::StaleRpc => {
+                    sqd_assignments::WorkerStatus::Unreliable
+                }
             };
             tracing::trace!("Serializing worker {}", worker.id);
             let indexes = match version {
@@ -227,6 +229,7 @@ mod tests {
             cloudflare_storage_secret: "secret".to_owned().into(),
             min_supported_worker_version: "2.0.0".parse().unwrap(),
             min_recommended_worker_version: "3.0.0".parse().unwrap(),
+            max_worker_epoch_lag: Some(2),
             assignment_delay: Duration::from_secs(60),
             assignment_ttl: Duration::from_secs(86400),
             concurrent_dataset_downloads: 1,

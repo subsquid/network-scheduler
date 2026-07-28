@@ -6,6 +6,9 @@ use semver::Version;
 pub enum WorkerStatus {
     Online,
     Stale,
+    /// Otherwise healthy, but its contract reads have been failing, so its compute-unit
+    /// allocations are stale. See [`crate::cli::Config::max_worker_epoch_lag`].
+    StaleRpc,
     UnsupportedVersion,
     Offline,
 }
@@ -15,6 +18,7 @@ impl std::fmt::Display for WorkerStatus {
         match self {
             WorkerStatus::Online => write!(f, "online"),
             WorkerStatus::Stale => write!(f, "stale"),
+            WorkerStatus::StaleRpc => write!(f, "stale_rpc"),
             WorkerStatus::UnsupportedVersion => write!(f, "unsupported_version"),
             WorkerStatus::Offline => write!(f, "offline"),
         }
