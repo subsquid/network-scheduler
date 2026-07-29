@@ -146,6 +146,10 @@ pub(super) struct ActiveChunks {
     pub(super) published: FxHashMap<ChunkPk, WorkerAssignmentChunk>,
     /// schema_ids of every chunk that has entered a worker assignment and is not yet tombstoned (ADR 0002)
     pub(super) bundle_schema_ids: BTreeSet<SchemaId>,
+    /// Datasets of those same chunks — the routable window at dataset granularity. Collected here,
+    /// in the scan the cycle already performs, so the bundle's read section costs a keyed lookup
+    /// instead of a per-dataset existence proof over `chunks`.
+    pub(super) bundle_datasets: BTreeSet<crate::types::DatasetId>,
 }
 
 /// Reads every active chunk — registered, and neither `rejected` nor removed (tombstoned) — spanning
@@ -185,6 +189,7 @@ pub(super) async fn fetch_active_chunks_with_placement(
         committed_placement: CurrentPlacement::default(),
         published: FxHashMap::default(),
         bundle_schema_ids: BTreeSet::new(),
+        bundle_datasets: BTreeSet::new(),
     };
     let mut count = 0u64;
     while let Some(mut row) = stream
@@ -205,6 +210,7 @@ pub(super) async fn fetch_active_chunks_with_placement(
             .push((pk, AlgoChunk::new(&chunk, row.is_portal_visible)));
         if row.entered_worker_assignment {
             out.bundle_schema_ids.insert(chunk.schema_id);
+            out.bundle_datasets.insert(chunk.dataset.clone());
         }
         out.published.insert(pk, chunk);
         count += 1;

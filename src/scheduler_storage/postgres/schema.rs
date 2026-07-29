@@ -73,28 +73,65 @@ pub(super) async fn portal_read_schema_refs(
         .collect())
 }
 
-/// The current read schema of every dataset with a chunk in the same routable window
-/// [`active_schema_bundle`] uses. Scoping to that window (rather than to every row in `datasets`)
-/// is what lets the read section shrink: a decommissioned dataset drops out once its last chunk is
-/// tombstoned, on the same clock as its write schemas.
+/// The current read schema of each named dataset, id and content together — the bundle's read
+/// section. The caller passes the datasets of the routable window it already scanned, so this is a
+/// keyed lookup over a handful of rows.
+///
+/// Deliberately NOT a per-dataset `EXISTS` over `chunks`. A read schema is a dataset-level pointer
+/// that no chunk need be written under, so the natural predicate is "does this dataset have a live
+/// chunk" — and proving that *negative* for a retired dataset means walking every one of its chunk
+/// rows, every cycle, forever: nothing deletes `datasets` or `chunks` rows, and no index matches
+/// the routable predicate. (Contrast [`active_schema_bundle`], whose probe is per-*schema* and
+/// rides the purpose-built `chunks_schema_id` index.) Taking the answer from the cycle's own scan
+/// costs nothing and cannot drift from it.
 ///
 /// Id and content come from one statement, so there is no resolve-then-load gap a concurrent
 /// promote could open. A promote landing either side of it costs one cycle of freshness, never
 /// resolvability.
+pub(super) async fn read_schemas_for_datasets(
+    conn: &mut PgConnection,
+    datasets: &[&str],
+) -> Result<BTreeMap<ReadSchemaId, DatasetSchema>> {
+    let mut timer = crate::metrics::PhaseTimer::new("read_schemas_for_datasets");
+    if datasets.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    let rows: Vec<(ReadSchemaId, sqlx::types::Json<DatasetSchema>)> = sqlx::query_as(
+        "SELECT r.id, r.schema FROM read_schemas r \
+         JOIN datasets d ON d.id = r.dataset_id \
+         WHERE r.superseded_at IS NULL AND d.name = ANY($1)",
+    )
+    .bind(datasets)
+    .fetch_all(conn)
+    .await
+    .context("read_schemas_for_datasets")?;
+    timer.stmt(rows.len() as u64);
+    Ok(rows.into_iter().map(|(id, json)| (id, json.0)).collect())
+}
+
+/// [`read_schemas_for_datasets`] over the whole routable window, for callers that have not already
+/// scanned it — the `SchedulerStorage` trait method, used by tests and by
+/// [`SchemaBundle::generate`](crate::scheduler_storage::SchemaBundle). The scheduling cycle uses
+/// the keyed form; both must select the same window.
+///
+/// Enumerating forward (metadata → chunks → read_schemas) rather than proving a per-dataset
+/// negative reads better, but measured on 50K tombstoned rows it is **not** cheaper: no index
+/// matches `applied_at_worker_assignment_id IS NOT NULL AND dropped_from_worker_assignment_at IS
+/// NULL`, so either shape seq-scans `sched_chunk_metadata` (~358 vs ~350 buffers). That is fine
+/// here because no production path calls this — the cycle passes its own dataset set and reads 2
+/// buffers — but do not reach for this form expecting it to scale. The same missing index is why
+/// `fetch_portal_visible_chunks` already scans that table every visibility cycle.
 pub(super) async fn active_read_schemas(
     conn: &mut PgConnection,
 ) -> Result<BTreeMap<ReadSchemaId, DatasetSchema>> {
     let mut timer = crate::metrics::PhaseTimer::new("active_read_schemas");
     let rows: Vec<(ReadSchemaId, sqlx::types::Json<DatasetSchema>)> = sqlx::query_as(
-        "SELECT r.id, r.schema FROM read_schemas r \
-         WHERE r.superseded_at IS NULL \
-           AND EXISTS ( \
-               SELECT 1 FROM chunks c \
-               JOIN sched_chunk_metadata m ON m.chunk_pk = c.chunk_pk \
-               WHERE c.dataset_id = r.dataset_id \
-                 AND m.applied_at_worker_assignment_id IS NOT NULL \
-                 AND m.dropped_from_worker_assignment_at IS NULL \
-           )",
+        "SELECT DISTINCT r.id, r.schema \
+         FROM sched_chunk_metadata m \
+         JOIN chunks c ON c.chunk_pk = m.chunk_pk \
+         JOIN read_schemas r ON r.dataset_id = c.dataset_id AND r.superseded_at IS NULL \
+         WHERE m.applied_at_worker_assignment_id IS NOT NULL \
+           AND m.dropped_from_worker_assignment_at IS NULL",
     )
     .fetch_all(conn)
     .await

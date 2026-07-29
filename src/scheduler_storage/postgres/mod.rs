@@ -424,6 +424,7 @@ impl SchedulerStorage for PostgresStorage {
                 committed_placement,
                 published: published_chunks,
                 bundle_schema_ids,
+                bundle_datasets,
             } = phase::fetch_active_chunks_with_placement(&mut tx).await?;
 
             // Confirmed routing for the eviction victim-ordering hint (best-effort). Read in the same
@@ -488,11 +489,20 @@ impl SchedulerStorage for PostgresStorage {
             let mut schema_ids: BTreeSet<SchemaId> = wa.schema_ids();
             schema_ids.extend(bundle_schema_ids);
             let schema_ids: Vec<SchemaId> = schema_ids.into_iter().collect();
+            // Datasets from the same in-transaction scan the write ids came from, so the read
+            // section covers the routable window without a second pass over `chunks` — unioned with
+            // the assignment's own datasets for the same reason `schema_ids` starts from
+            // `wa.schema_ids()`: the scan runs before `apply_deltas_and_swap` stamps
+            // `applied_at_worker_assignment_id`, so a chunk placed for the FIRST time this cycle is
+            // named by the assignment while its row still reads as never-entered.
+            let mut routable: BTreeSet<&str> = bundle_datasets.iter().map(|d| d.as_str()).collect();
+            routable.extend(wa.chunks.values().map(|chunk| chunk.dataset.as_str()));
+            let routable_datasets: Vec<&str> = routable.into_iter().collect();
             // The read section carries content, not just ids: the portal validates queries against
             // it, and it moves the BundleId so a caching client notices a promote.
             let bundle = SchemaBundle::from_sections(
                 scheduler_metadata::pg::schema::load_schemas(conn, Some(&schema_ids)).await?,
-                schema::active_read_schemas(conn).await?,
+                schema::read_schemas_for_datasets(conn, &routable_datasets).await?,
             );
             Ok::<_, StorageError>((wa, bundle))
         })
