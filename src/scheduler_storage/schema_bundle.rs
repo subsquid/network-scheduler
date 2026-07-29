@@ -154,17 +154,87 @@ impl SchemaBundle {
         self.read_schemas.contains_key(&id)
     }
 
-    /// The chunk's `<table>.parquet` files from its pinned schema and `tables_present` bitmap.
-    /// `None` if the schema is absent from the bundle (an invariant violation the caller surfaces).
-    pub fn chunk_files(&self, chunk: &WorkerAssignmentChunk) -> Option<Vec<String>> {
-        self.schemas
-            .get(&chunk.schema_id)
-            .map(|schema| chunk_files(schema, chunk.tables_present.as_ref()))
+    /// The chunk's `<table>.parquet` files, from its pinned schema and `tables_present` bitmap.
+    ///
+    /// The bitmap is positional over the pinned schema's tables in sorted-name order, so it is only
+    /// meaningful against the exact schema it was resolved under. A length disagreement proves it
+    /// is being read against a different table list and is refused — see
+    /// [`ChunkFilesError::BitmapArity`].
+    pub fn chunk_files(
+        &self,
+        chunk: &WorkerAssignmentChunk,
+    ) -> Result<Vec<String>, ChunkFilesError> {
+        let schema_id = chunk.schema_id;
+        let schema = self
+            .schemas
+            .get(&schema_id)
+            .ok_or(ChunkFilesError::SchemaMissing { schema_id })?;
+        let tables = schema.tables().len();
+        if let Some(bitmap) = chunk.tables_present.as_ref()
+            && bitmap.len() != tables
+        {
+            return Err(ChunkFilesError::BitmapArity {
+                schema_id,
+                bitmap_len: bitmap.len(),
+                tables,
+            });
+        }
+        Ok(chunk_files(schema, chunk.tables_present.as_ref()))
     }
 }
 
-/// A schema's `<table>.parquet` files, filtered by a chunk's table-presence bitmap (`None` = all
-/// tables).
+/// Why a chunk's file set could not be derived. Both variants are invariant violations the caller
+/// surfaces rather than papers over: a wrong file list is worse than none, because the worker acts
+/// on it — a missing file reads as legitimate absence rather than as an error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChunkFilesError {
+    /// The chunk's pinned schema is absent from the bundle, so its file set cannot be described at
+    /// all (the condition ADR 0002 exists to prevent).
+    SchemaMissing { schema_id: SchemaId },
+    /// The presence bitmap's length disagrees with the pinned schema's table count, so its bits
+    /// index a different table list than the one being applied. Reached by re-pinning a chunk to a
+    /// schema with a different table set without recomputing the bitmap: bits would silently shift
+    /// onto the wrong tables, and positions past the end would read as "legitimately absent".
+    BitmapArity {
+        schema_id: SchemaId,
+        bitmap_len: usize,
+        tables: usize,
+    },
+}
+
+impl std::fmt::Display for ChunkFilesError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SchemaMissing { schema_id } => write!(
+                f,
+                "chunk pins schema {schema_id}, which is absent from the bundle — its file set \
+                 cannot be derived"
+            ),
+            Self::BitmapArity {
+                schema_id,
+                bitmap_len,
+                tables,
+            } => write!(
+                f,
+                "chunk's tables_present has {bitmap_len} bits but pinned schema {schema_id} has \
+                 {tables} tables — the bitmap was resolved against a different schema, so its bits \
+                 index the wrong tables"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ChunkFilesError {}
+
+/// A schema's `<table>.parquet` files, filtered by a chunk's table-presence bitmap.
+///
+/// `None` = every table present. That sentinel carries no record of which schema produced it, so
+/// unlike an explicit bitmap it cannot be arity-checked: re-pinning a NULL-bitmap chunk to a
+/// *superset* schema silently claims files the chunk does not have. Anything that re-pins must
+/// therefore materialise NULL into an explicit bitmap first.
+///
+/// Precondition: an explicit bitmap's length equals `schema.tables().len()` — checked by
+/// [`SchemaBundle::chunk_files`], the only caller.
 fn chunk_files(schema: &DatasetSchema, bitmap: Option<&bit_vec::BitVec>) -> Vec<String> {
     schema
         .tables()
@@ -236,16 +306,61 @@ mod tests {
         let mask = bit_vec::BitVec::from_fn(3, |i| i != 1);
         assert_eq!(
             b.chunk_files(&chunk(1, Some(mask))),
-            Some(vec![
+            Ok(vec![
                 "blocks.parquet".to_owned(),
                 "transactions.parquet".to_owned(),
             ])
         );
         assert_eq!(
             b.chunk_files(&chunk(99, None)),
-            None,
-            "unknown schema → None"
+            Err(ChunkFilesError::SchemaMissing {
+                schema_id: SchemaId(99)
+            }),
         );
+    }
+
+    /// A bitmap is positional over one exact schema. If its length disagrees with the pinned
+    /// schema's table count it was resolved against a different table list, and applying it anyway
+    /// yields a plausible-but-wrong file set with no error — the failure mode that makes re-pinning
+    /// a chunk to a different table set unsafe. Both directions must be refused.
+    #[test]
+    fn chunk_files_rejects_a_bitmap_of_the_wrong_arity() {
+        let b = bundle(&[(1, schema(&["blocks", "logs", "transactions"]))]);
+
+        // Too short — as if the chunk were written under a 2-table schema and re-pinned to this
+        // one. Previously `transactions` silently read as "legitimately absent".
+        assert_eq!(
+            b.chunk_files(&chunk(1, Some(bit_vec::BitVec::from_elem(2, true)))),
+            Err(ChunkFilesError::BitmapArity {
+                schema_id: SchemaId(1),
+                bitmap_len: 2,
+                tables: 3,
+            }),
+        );
+        // Too long — the extra bits were silently ignored, so a table the chunk does carry could be
+        // dropped and every position after the divergence means the wrong table.
+        assert_eq!(
+            b.chunk_files(&chunk(1, Some(bit_vec::BitVec::from_elem(4, true)))),
+            Err(ChunkFilesError::BitmapArity {
+                schema_id: SchemaId(1),
+                bitmap_len: 4,
+                tables: 3,
+            }),
+        );
+        // Exact arity is the only accepted explicit bitmap.
+        assert_eq!(
+            b.chunk_files(&chunk(1, Some(bit_vec::BitVec::from_elem(3, true))))
+                .map(|files| files.len()),
+            Ok(3),
+        );
+    }
+
+    /// The NULL sentinel has no arity to check, so it is accepted against any schema — the residual
+    /// hazard a re-pin has to close by materialising it into an explicit bitmap first.
+    #[test]
+    fn chunk_files_accepts_the_null_bitmap_against_any_schema() {
+        let b = bundle(&[(1, schema(&["blocks", "logs"]))]);
+        assert_eq!(b.chunk_files(&chunk(1, None)).map(|f| f.len()), Ok(2));
     }
 
     fn write_only(ids: &[i32]) -> BundleId {
