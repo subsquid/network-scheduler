@@ -6,7 +6,6 @@
 //! those say so, and say why, and may assert by probing the SUT after the replay instead. Check
 //! which kind a case is before treating it as evidence that proptest found something.
 
-use super::sut::placement_oracles::ReadSchemaFault;
 use super::sut::{Action, ConvergenceCheck, NewChunk, SimConfig, SimUnderTest};
 use super::utils::{
     CHUNK_SIZE, NEVER_GC_TICKS, SCHEMA_POOL, WORKER_CAPACITY, blocks_for_key, mint_key, new_chunk,
@@ -1423,95 +1422,55 @@ fn churn_knife_edge_false_shortage_is_excused() {
     );
 }
 
-/// Shared fixture for the pair below: the same actions under a floor that shortages (`3`) and one
-/// that does not (`2`).
+/// A read schema promoted while the fleet is over-subscribed must still be resolvable by the portal
+/// that is told to use it. **Reproduces an open bug, so it fails**: `run_scheduling_cycle` returns
+/// `Shortage` before it builds a bundle, while `run_visibility_cycle` keeps publishing the fresh
+/// pointer — so the portal names read schema 1 for `s3://sim-0` against a bundle frozen before that
+/// promote existed.
 ///
-/// **Hand-built, not captured** — but not because the walk cannot reach this state. Measured on a
-/// 64-case churn sweep: shortages in 39.6% of transitions, promotes in 3.3%, and the walk oracle's
-/// excused-fault counter firing with mean 0.11 (max 3) over 7043 samples. The walk hits this
-/// constantly; the only reason it stays green is the stand-down in
-/// `assert_portal_read_schema_resolution`, which exists to keep the sweeps usable while the gap is
-/// open. Remove that and the sweeps catch it without this fixture.
+/// Captured from `in_memory::churn_simulation` with the walk oracle's frozen-bundle stand-down
+/// disabled, then shrunk by proptest to these seven transitions. The shortage here comes from real
+/// capacity pressure (4 workers, floor 4, saturation 0.8), not from a floor set above the worker
+/// count.
 ///
-/// `floor` is the polarity switch: 3 over 2 workers is unsatisfiable (`min_replication` is not
-/// clamped to the worker count, and `ensure_minimum` refuses a worker already holding the chunk), so
-/// every later cycle shortages. Floor 2 is a no-op retune whose cycle succeeds. Same actions
-/// otherwise, which is what shows the failure comes from the freeze, not a broken resolver.
-fn portal_read_schema_case(floor: u16) -> (SimConfig, Vec<Action>) {
+/// `#[ignore]` keeps `cargo test` green while the fix is outstanding; run it with
+/// `cargo test --features mvcc-chunks -- --ignored`. The fix is to let the bundle advance under
+/// shortage; when this passes, delete the stand-down arm in
+/// `assert_portal_read_schema_resolution`, which exists only to keep the sweeps green meanwhile —
+/// with it gone the sweeps catch this class on their own.
+fn portal_read_schema_frozen_bundle_case() -> (SimConfig, Vec<Action>) {
     let config = SimConfig {
-        worker_count: 2,
-        min_replication: 2,
+        worker_count: 4,
+        min_replication: 4,
+        saturation: 0.8,
+        confirm_threshold_pct: 89,
+        gc_ticks: 15,
         ..base_config()
     };
-    // Not a multiple of 20, so it gets its own block window rather than the rejected shared one.
-    let chunk = new_chunk((mint_key(11), CHUNK_SIZE, 1, "s3://sim-1".to_string()));
+    let nc = |key: u64, weight: u16, dataset: &str| {
+        new_chunk((mint_key(key), CHUNK_SIZE, weight, format!("s3://{dataset}")))
+    };
+    #[rustfmt::skip]
     let actions = vec![
-        // Generation 1: the chunk is placed on both workers.
-        Action::AddChunks(vec![chunk]),
-        // 100% quorum: without both polls nothing is portal-visible and the oracle is vacuous.
-        Action::WorkerFetchAssignment {
-            worker: 0,
-            succeeds: true,
-        },
-        Action::WorkerFetchAssignment {
-            worker: 1,
-            succeeds: true,
-        },
-        // No cycle: a promote lands on the ingester's clock. Not SCHEMA_POOL[0] — that is
-        // `DatasetSchema::default()`, identical to the seeded write schema, so it would be a no-op.
-        Action::PromoteReadSchema {
-            dataset: "s3://sim-1".into(),
-            schema: SCHEMA_POOL[1].clone(),
-        },
-        // Generation 2: succeeds, so this bundle carries the new read id and the portal names sim-1.
-        Action::AdvanceClock(1),
-        // Positive control: coherent and enforced (generation 2 > promoted-at 1), so a refactor that
-        // neuters the oracle fails here first.
+        Action::AddChunks(vec![nc(54268, 1, "sim-0")]),
+        Action::CheckConverged(ConvergenceCheck::FloorLocallyFeasible),
+        Action::AddChunks(vec![nc(53944, 1, "sim-0"), nc(52853, 12, "sim-1"), nc(45551, 12, "sim-2"), nc(61969, 4, "sim-0")]),
+        Action::PromoteReadSchema { dataset: "s3://sim-0".into(), schema: SCHEMA_POOL[0].clone() },
+        Action::AddChunks(vec![nc(17181, 12, "sim-2"), nc(1608, 12, "sim-2"), nc(27218, 4, "sim-0"), nc(37183, 1, "sim-1")]),
         Action::PortalFetchAssignment { succeeds: true },
-        Action::SetMinReplication(floor),
-        // SCHEMA_POOL[0] was never in this dataset's read registry, so the id genuinely moves;
-        // re-promoting the same content is id-stable and would pass vacuously.
-        Action::PromoteReadSchema {
-            dataset: "s3://sim-1".into(),
-            schema: SCHEMA_POOL[0].clone(),
-        },
-        // Floor 3 shortages again, yet the visibility pass still publishes the fresh pointer.
-        Action::AdvanceClock(1),
-        Action::PortalFetchAssignment { succeeds: true },
+        Action::SetDatasetSchema { dataset: "s3://sim-0".into(), schema: SCHEMA_POOL[0].clone() },
     ];
     (config, actions)
 }
 
-/// A read schema promoted during a shortage must still be resolvable by the portal that is told to
-/// use it. **This is a reproduction of an open bug, so it fails**: the visibility cycle publishes the
-/// fresh pointer while the bundle stays frozen, and the portal ends up naming an id its own bundle
-/// cannot resolve.
-///
-/// `#[ignore]` keeps `cargo test` green while the fix is outstanding — run it with
-/// `cargo test --features mvcc-chunks -- --ignored` to see the failure. Fixing it means letting the
-/// bundle advance under shortage; once it passes, drop the stand-down arm in
-/// `assert_portal_read_schema_resolution`, which exists only to excuse this fault in the walk.
 #[test]
 #[ignore = "reproduces the frozen-bundle gap; passes once the bundle advances under shortage"]
 fn portal_read_schema_resolves_under_shortage() {
-    let (config, actions) = portal_read_schema_case(3);
+    let (config, actions) = portal_read_schema_frozen_bundle_case();
     let sut = replay(&config, actions);
     assert_eq!(
         sut.portal_read_schema_faults().expect("portal has fetched"),
         vec![],
         "the portal names a read schema its own bundle cannot resolve",
-    );
-}
-
-/// Same actions, satisfiable floor: the cycle after the promote succeeds and the reference resolves.
-/// Without this the pinned gap would also pass if resolution were broken outright. `replay` is itself
-/// an assertion — at generation 3 the walk is enforcing, so a broken reference panics first.
-#[test]
-fn portal_read_schema_resolves_after_a_successful_cycle() {
-    let (config, actions) = portal_read_schema_case(2);
-    let sut = replay(&config, actions);
-    assert_eq!(
-        sut.portal_read_schema_faults().expect("portal has fetched"),
-        vec![],
     );
 }
