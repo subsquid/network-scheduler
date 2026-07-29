@@ -29,6 +29,7 @@ use crate::scheduler_storage::test_harness::inspect::Snapshot;
 use crate::scheduler_storage::{
     ChunkPk, PortalAssignment, SchemaBundle, Tick, WorkerAssignment, WorkerPk,
 };
+use crate::types::DatasetSchema;
 
 /// Routing coverage by physical possession: within the M window, a routed chunk must be physically
 /// held (`holds` — not the published listing, which is [`published_coverage`]'s job) by one of its
@@ -223,6 +224,60 @@ pub(super) fn schema_bundle_consistency(
                     chunk.schema_id,
                 ));
             }
+        }
+    }
+    Ok(())
+}
+
+/// Every dataset the worker assignment names must have its promoted READ schema carried in the
+/// bundle frozen with that assignment — otherwise a portal validating a query against that dataset
+/// has nothing to resolve.
+///
+/// The reference is `promoted`, the sim's own log of what it handed to `promote_read_schema`, and
+/// the subject is the published bundle. Neither is derived from the other through storage, so this
+/// cannot pass by both sides reading the same query — the failure mode of a containment check
+/// written against a storage-derived expectation.
+///
+/// Scoped to datasets the assignment actually names: a promote for a dataset with no placed chunk
+/// is correctly absent (nothing routes to it, so nothing needs to describe it).
+///
+/// A promote propagates on the next successful scheduling cycle, never instantly, so each entry
+/// carries the bundle generation current when it was issued and is only enforced once
+/// `bundle_generation` has moved past it. That is not a loophole for the frozen-shortage case — it
+/// encodes it: while placement is in shortage no bundle is frozen, the generation never advances,
+/// and a promote genuinely cannot reach a portal. If bundle generation is ever decoupled from
+/// placement, this check tightens on its own with no edit.
+pub(super) fn bundle_covers_promoted_read_schemas(
+    bundle: &SchemaBundle,
+    worker_assignment: Option<&WorkerAssignment>,
+    promoted: &BTreeMap<String, (DatasetSchema, u64)>,
+    bundle_generation: u64,
+) -> Result<(), String> {
+    let Some(assignment) = worker_assignment else {
+        return Ok(());
+    };
+    // Compared by content, not by id: `DatasetSchema` is not `Ord`, and content is also the only
+    // thing the sim knows independently of storage — an id would have to be read back from the
+    // backend that assigned it. The read section holds one schema per in-play dataset, so the
+    // linear scan is trivial.
+    for chunk in assignment.chunks.values() {
+        let Some((expected, promoted_at)) = promoted.get(chunk.dataset.as_str()) else {
+            continue;
+        };
+        // Not yet due: no bundle has been frozen since this promote.
+        if bundle_generation <= *promoted_at {
+            continue;
+        }
+        if !bundle.read_schemas().values().any(|s| s == expected) {
+            return Err(format!(
+                "dataset {} is named by the worker assignment and had a read schema promoted at \
+                 bundle generation {promoted_at} ({} bundles frozen since), but that schema is \
+                 absent from the bundle frozen with the assignment — a portal could not resolve \
+                 it. bundle read section holds {} schema(s)",
+                chunk.dataset,
+                bundle_generation - promoted_at,
+                bundle.read_schemas().len(),
+            ));
         }
     }
     Ok(())

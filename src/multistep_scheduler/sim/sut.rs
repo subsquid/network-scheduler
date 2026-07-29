@@ -207,6 +207,14 @@ pub(super) enum Action {
         dataset: String,
         schema: DatasetSchema,
     },
+    /// Promote `dataset`'s current READ schema — the metadata service's admin path, which in
+    /// production runs on the ingester's clock with no scheduler coordination. Unlike
+    /// [`Action::SetDatasetSchema`] (the write registry) this affects no chunk: it changes what
+    /// the bundle must carry for readers.
+    PromoteReadSchema {
+        dataset: String,
+        schema: DatasetSchema,
+    },
     /// Do nothing — the idle tail after the run completes.
     NoOp,
 }
@@ -225,6 +233,7 @@ fn action_kind(action: &Action) -> &'static str {
         Action::RegisterCorrection { .. } => "action: register-correction",
         Action::SetMinReplication(_) => "action: set-min-replication",
         Action::SetDatasetSchema { .. } => "action: set-dataset-schema",
+        Action::PromoteReadSchema { .. } => "action: promote-read-schema",
         Action::NoOp => "action: no-op (idle tail)",
     }
 }
@@ -334,6 +343,17 @@ pub(super) struct SimUnderTest<D: SimStorage> {
     /// Bundle frozen with `latest_worker_assignment`; both stay frozen together across a shortage
     /// streak, so the oracle checks the assignment against the bundle it shipped with.
     latest_worker_bundle: Option<SchemaBundle>,
+    /// Read schemas as the SIM issued them: dataset → (content handed to `promote_read_schema`,
+    /// [`bundle_generation`](Self::bundle_generation) at the moment of the promote). Written only
+    /// from the sim's own action, never read back from a backend — it is the read-schema oracle's
+    /// independent reference, so subject (the published bundle) and reference (this map) cannot
+    /// agree by construction the way a storage-derived expectation would.
+    model_read_schemas: BTreeMap<String, (DatasetSchema, u64)>,
+    /// Bumped every time a bundle is frozen. A promote reaches the bundle on the next successful
+    /// scheduling cycle, never instantly, so the oracle waits for a generation strictly newer than
+    /// the promote's before demanding coverage. Under a sustained shortage this never advances —
+    /// which is exactly today's contract: a frozen bundle carries no new read schema.
+    bundle_generation: u64,
     /// Latest published portal assignment (what a `PortalFetch` samples).
     latest_portal_assignment: Option<PortalAssignment>,
     /// Confirmation watermark at the latest portal assignment's publication — the consistency
@@ -542,6 +562,20 @@ impl<D: SimStorage> SimUnderTest<D> {
         self.run_cycle();
         statistics::label("schema: dataset schema changed");
         self.trace_step(&format!("SetDatasetSchema({dataset})"));
+    }
+
+    /// Promote `dataset`'s current read schema, recording the content in `model_read_schemas` as
+    /// the oracle's reference. Deliberately does NOT run a cycle: a promote lands on the
+    /// ingester's clock, so the interleaving worth testing is one that falls between cycles — and,
+    /// during a shortage streak, one whose bundle never advances at all.
+    pub(super) fn do_promote_read_schema(&mut self, dataset: &str, schema: DatasetSchema) {
+        self.storage
+            .promote_read_schema(dataset, schema.clone())
+            .expect("dataset is pre-registered by the sim config");
+        self.model_read_schemas
+            .insert(dataset.to_owned(), (schema, self.bundle_generation));
+        statistics::label("schema: read schema promoted");
+        self.trace_step(&format!("PromoteReadSchema({dataset})"));
     }
 
     /// Standard addition flow (record weights → insert → register), shared by adds and test
@@ -1088,6 +1122,7 @@ impl<D: SimStorage> SimUnderTest<D> {
                 self.latest_worker_assignment = Some(assignment);
                 // Freeze with the assignment; on a shortage (below) neither is reassigned.
                 self.latest_worker_bundle = Some(bundle);
+                self.bundle_generation += 1;
                 Some(id)
             }
             Err(StorageError::Shortage) => {
@@ -1325,6 +1360,14 @@ impl<D: SimStorage> SimUnderTest<D> {
             bundle,
             self.latest_worker_assignment.as_ref(),
             self.latest_portal_assignment.as_ref(),
+        ) {
+            panic!("{message}");
+        }
+        if let Err(message) = placement_oracles::bundle_covers_promoted_read_schemas(
+            bundle,
+            self.latest_worker_assignment.as_ref(),
+            &self.model_read_schemas,
+            self.bundle_generation,
         ) {
             panic!("{message}");
         }
@@ -1640,6 +1683,9 @@ impl<D: SimStorage> SimUnderTest<D> {
             Action::SetDatasetSchema { dataset, schema } => {
                 self.do_set_dataset_schema(&dataset, schema);
             }
+            Action::PromoteReadSchema { dataset, schema } => {
+                self.do_promote_read_schema(&dataset, schema);
+            }
             Action::NoOp => {}
         }
         self.assert_physical_retention();
@@ -1783,6 +1829,8 @@ impl<D: SimStorage> SimUnderTest<D> {
             portal_state: Portal::default(),
             latest_worker_assignment: None,
             latest_worker_bundle: None,
+            model_read_schemas: BTreeMap::new(),
+            bundle_generation: 0,
             latest_portal_assignment: None,
             latest_portal_watermark: 0,
             placed_until_departure: BTreeMap::new(),

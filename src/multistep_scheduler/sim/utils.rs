@@ -507,6 +507,18 @@ pub(super) fn set_dataset_schema(datasets: &[String]) -> BoxedStrategy<Action> {
         .boxed()
 }
 
+/// A `PromoteReadSchema` for a random dataset, drawing from the same canned [`SCHEMA_POOL`].
+/// Like `set_dataset_schema` it needs no precondition — the ingester promotes at arbitrary times,
+/// which is exactly the interleaving under test.
+pub(super) fn promote_read_schema(datasets: &[String]) -> BoxedStrategy<Action> {
+    (
+        prop::sample::select(datasets.to_vec()),
+        prop::sample::select(SCHEMA_POOL.to_vec()),
+    )
+        .prop_map(|(dataset, schema)| Action::PromoteReadSchema { dataset, schema })
+        .boxed()
+}
+
 // ===========================================================================
 // Model chunk ⇄ storage chunk, and the sim's weight strategy.
 //
