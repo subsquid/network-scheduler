@@ -2,10 +2,9 @@
 //! key/size/weight/dataset, so a sequence replays with no seed.
 //!
 //! Most cases are **captured**: shrunk (or delta-debugged) from a walk that actually failed, and the
-//! replay *is* the assertion — it panics iff the property is violated. A few are **hand-built**,
-//! for states the walk cannot realistically reach; those say so, and may assert by probing the SUT
-//! after the replay rather than by the replay panicking. Check which kind a case is before treating
-//! it as evidence that proptest found something.
+//! replay *is* the assertion — it panics iff the property is violated. A few are **hand-built**;
+//! those say so, and say why, and may assert by probing the SUT after the replay instead. Check
+//! which kind a case is before treating it as evidence that proptest found something.
 
 use super::sut::placement_oracles::ReadSchemaFault;
 use super::sut::{Action, ConvergenceCheck, NewChunk, SimConfig, SimUnderTest};
@@ -1427,12 +1426,12 @@ fn churn_knife_edge_false_shortage_is_excused() {
 /// Shared fixture for the pair below: the same actions under a floor that shortages (`3`) and one
 /// that does not (`2`).
 ///
-/// **Hand-built, not captured** — the walk did not find this and realistically cannot: it needs a
-/// `PromoteReadSchema` (weight 1 against ~20 competing choices), a sustained shortage, and a portal
-/// fetch to coincide. It also pins a gap that is deliberately still open rather than guarding a
-/// fixed bug, so `replay` PASSES here — the walk oracle stands the case down — and the assertion is
-/// a probe of the unexcused verdict afterwards. Both differences are why it does not follow this
-/// file's usual "the replay is the assertion" shape.
+/// **Hand-built, not captured** — but not because the walk cannot reach this state. Measured on a
+/// 64-case churn sweep: shortages in 39.6% of transitions, promotes in 3.3%, and the walk oracle's
+/// excused-fault counter firing with mean 0.11 (max 3) over 7043 samples. The walk hits this
+/// constantly; the only reason it stays green is the stand-down in
+/// `assert_portal_read_schema_resolution`, which exists to keep the sweeps usable while the gap is
+/// open. Remove that and the sweeps catch it without this fixture.
 ///
 /// `floor` is the polarity switch: 3 over 2 workers is unsatisfiable (`min_replication` is not
 /// clamped to the worker count, and `ensure_minimum` refuses a worker already holding the chunk), so
