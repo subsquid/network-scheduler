@@ -1389,7 +1389,7 @@ impl<D: SimStorage> SimUnderTest<D> {
     /// **Known gap, excused:** an `Unresolvable` promoted at or after the bundle's generation is the
     /// frozen-bundle window — `run_scheduling_cycle` returns `Shortage` before building a bundle
     /// while the visibility cycle keeps publishing a fresh pointer, and nothing records which read
-    /// ids a published bundle carried. Pinned by `portal_read_schema_outruns_the_frozen_bundle`;
+    /// ids a published bundle carried. Reproduced by `portal_read_schema_resolves_under_shortage`;
     /// letting the bundle advance under shortage removes both.
     ///
     /// Everything else is fatal. The excused count is measured, so an excuse that starts firing

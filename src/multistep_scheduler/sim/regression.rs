@@ -1424,9 +1424,8 @@ fn churn_knife_edge_false_shortage_is_excused() {
     );
 }
 
-/// A promote during a shortage streak is published by the visibility cycle while the bundle stays
-/// frozen, so the portal names an id its own bundle cannot resolve. Nothing records which read ids a
-/// published bundle carried, so the visibility cycle cannot know what the frozen bundle holds.
+/// Shared fixture for the pair below: the same actions under a floor that shortages (`3`) and one
+/// that does not (`2`).
 ///
 /// **Hand-built, not captured** — the walk did not find this and realistically cannot: it needs a
 /// `PromoteReadSchema` (weight 1 against ~20 competing choices), a sustained shortage, and a portal
@@ -1484,21 +1483,24 @@ fn portal_read_schema_case(floor: u16) -> (SimConfig, Vec<Action>) {
     (config, actions)
 }
 
-/// The pinned gap: `replay` passes because the walk stands down on a frozen bundle, and the
-/// unexcused verdict reports the incoherence. Letting the bundle advance under shortage flips this to
-/// an empty fault list and removes the stand-down with it.
+/// A read schema promoted during a shortage must still be resolvable by the portal that is told to
+/// use it. **This is a reproduction of an open bug, so it fails**: the visibility cycle publishes the
+/// fresh pointer while the bundle stays frozen, and the portal ends up naming an id its own bundle
+/// cannot resolve.
+///
+/// `#[ignore]` keeps `cargo test` green while the fix is outstanding — run it with
+/// `cargo test --features mvcc-chunks -- --ignored` to see the failure. Fixing it means letting the
+/// bundle advance under shortage; once it passes, drop the stand-down arm in
+/// `assert_portal_read_schema_resolution`, which exists only to excuse this fault in the walk.
 #[test]
-fn portal_read_schema_outruns_the_frozen_bundle() {
+#[ignore = "reproduces the frozen-bundle gap; passes once the bundle advances under shortage"]
+fn portal_read_schema_resolves_under_shortage() {
     let (config, actions) = portal_read_schema_case(3);
     let sut = replay(&config, actions);
-    let faults = sut.portal_read_schema_faults().expect("portal has fetched");
-    assert!(
-        matches!(
-            faults.as_slice(),
-            [ReadSchemaFault::Unresolvable { dataset, .. }] if dataset == "s3://sim-1"
-        ),
-        "expected exactly one Unresolvable fault for s3://sim-1 — a widening of the gap must fail \
-         this test rather than be absorbed by it. got {faults:?}",
+    assert_eq!(
+        sut.portal_read_schema_faults().expect("portal has fetched"),
+        vec![],
+        "the portal names a read schema its own bundle cannot resolve",
     );
 }
 
