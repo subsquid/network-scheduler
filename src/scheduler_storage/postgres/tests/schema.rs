@@ -279,6 +279,40 @@ fn schema_bundle_carries_the_current_read_schema() {
     );
 }
 
+/// A dataset placed for the FIRST time in this cycle must still get its read schema into the
+/// bundle. The cycle's chunk scan runs before `apply_deltas_and_swap` stamps
+/// `applied_at_worker_assignment_id`, so a first-placement chunk still reads as never-entered and
+/// the routable-window scan alone misses its dataset — exactly as it misses its write schema, which
+/// is why the write side starts from `wa.schema_ids()` rather than from the scan.
+///
+/// [`schema_bundle_carries_the_current_read_schema`] cannot catch this: it promotes after a cycle
+/// has already stamped the chunk. The order here — promote, THEN place for the first time — is the
+/// whole point. Found by the Postgres sims (empty read section on the first-placement cycle);
+/// pinned deterministically here.
+#[test]
+fn first_placement_cycle_carries_the_read_schema() {
+    let mut storage = fresh_storage("bundle_first_placement");
+    storage
+        .insert_new_datasets(vec![new_dataset("ds", schema_with_tables(&["blocks"]))])
+        .expect("insert dataset");
+    let pk = register_chunk(&mut storage, "ds", 1, 100);
+    let read_schema = schema_with_tables(&["blocks", "logs"]);
+    promote_read_schema(&mut storage, dataset("ds"), read_schema.clone());
+    let workers = one_worker(&mut storage);
+
+    // The very first cycle to place this chunk: nothing has stamped it as entered yet.
+    let (wa, bundle) = schedule_with_bundle(&mut storage, &[pk], &workers, 100);
+    assert!(
+        wa.chunks.contains_key(&pk),
+        "precondition: the assignment names the chunk on this very cycle",
+    );
+    assert_eq!(
+        bundle.read_schemas().values().collect::<Vec<_>>(),
+        vec![&read_schema],
+        "the dataset is named by this assignment, so its read schema must be in the paired bundle",
+    );
+}
+
 #[test]
 fn load_schemas_returns_by_id_or_all() {
     let mut storage = fresh_storage("schema_load");
