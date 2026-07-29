@@ -263,6 +263,9 @@ fn schema_bundle_carries_the_current_read_schema() {
 ///
 /// The order is the whole point: [`schema_bundle_carries_the_current_read_schema`] promotes after a
 /// cycle has already stamped the chunk, so it cannot catch this.
+///
+/// The bug was found by the Postgres sim sweeps, which failed with an empty read section; this is the
+/// deterministic case written afterwards to pin it.
 #[test]
 fn first_placement_cycle_carries_the_read_schema() {
     let mut storage = fresh_storage("bundle_first_placement");
