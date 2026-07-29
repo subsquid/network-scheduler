@@ -5,8 +5,6 @@
 
 use std::collections::BTreeMap;
 
-use sqlx::Connection;
-
 use super::{current_schema_id, fresh_storage, register_chunk};
 use crate::scheduler_storage::algorithm::IdealMapping;
 use crate::scheduler_storage::postgres::PostgresStorage;
@@ -15,8 +13,8 @@ use crate::scheduler_storage::test_harness::utils::{
     StaticSchedulingAlgorithm, dataset, new_dataset, schema_with_tables, worker,
 };
 use crate::scheduler_storage::{
-    BundleId, ChunkPk, DatasetPk, SchedulerStorage, SchemaBundle, SchemaId, StorageError,
-    WorkerAssignment, WorkerPk,
+    BundleId, ChunkPk, SchedulerStorage, SchemaBundle, SchemaId, StorageError, WorkerAssignment,
+    WorkerPk,
 };
 use crate::types::{DatasetSchema, TableSchema};
 
@@ -85,26 +83,6 @@ fn set_chunk_tables_present(
             .execute(&mut *conn)
             .await
             .unwrap();
-            Ok::<_, StorageError>(())
-        })
-        .unwrap();
-}
-
-/// Promote a read schema, as `PUT /datasets/{name}/read-schema` does.
-fn promote_read_schema(storage: &mut PostgresStorage, ds: String, schema: DatasetSchema) {
-    storage
-        .with_conn(async move |conn| {
-            let dataset_id: DatasetPk =
-                sqlx::query_scalar("SELECT id FROM datasets WHERE name = $1")
-                    .bind(&ds)
-                    .fetch_one(&mut *conn)
-                    .await
-                    .unwrap();
-            let mut tx = conn.begin().await.unwrap();
-            scheduler_metadata::pg::schema::promote_read_schema(&mut tx, dataset_id, &schema)
-                .await
-                .unwrap();
-            tx.commit().await.unwrap();
             Ok::<_, StorageError>(())
         })
         .unwrap();
@@ -251,7 +229,9 @@ fn schema_bundle_carries_the_current_read_schema() {
 
     // A table set no write schema has, so its presence is unambiguous.
     let read_schema = schema_with_tables(&["blocks", "logs"]);
-    promote_read_schema(&mut storage, dataset("ds"), read_schema.clone());
+    storage
+        .promote_read_schema(&dataset("ds"), read_schema.clone())
+        .expect("promote read schema");
     assert_eq!(
         current_read_schema(&mut storage, dataset("ds")).as_ref(),
         Some(&read_schema),
@@ -291,7 +271,9 @@ fn first_placement_cycle_carries_the_read_schema() {
         .expect("insert dataset");
     let pk = register_chunk(&mut storage, "ds", 1, 100);
     let read_schema = schema_with_tables(&["blocks", "logs"]);
-    promote_read_schema(&mut storage, dataset("ds"), read_schema.clone());
+    storage
+        .promote_read_schema(&dataset("ds"), read_schema.clone())
+        .expect("promote read schema");
     let workers = one_worker(&mut storage);
 
     // Nothing has stamped this chunk as entered yet.
