@@ -5,7 +5,7 @@
 use crate::scheduler_storage::algorithm::{CurrentPlacement, ScheduleOutput, SchedulingAlgorithm};
 use crate::scheduler_storage::{
     AlgoChunk, AssignmentId, AssignmentWorker, ChunkPk, NewChunk, NewDataset, PortalAssignment,
-    SchedulerStorage, SchemaBundle, SchemaId, StorageError, Tick, WorkerAssignment,
+    ReadSchemaId, SchedulerStorage, SchemaBundle, SchemaId, StorageError, Tick, WorkerAssignment,
     WorkerAssignmentChunk, WorkerPk,
 };
 use crate::types::{BlockNumber, DatasetSchema, Worker, WorkerStatus};
@@ -224,6 +224,7 @@ struct Counters {
     worker_assignment_id: Counter,
     portal_assignment_id: Counter,
     schema_id: Counter,
+    read_schema_id: Counter,
 }
 
 #[derive(Default)]
@@ -237,6 +238,16 @@ pub(crate) struct InMemoryStorage {
     /// Each dataset's latest-registered write schema id, so the sim can stamp inserts with the id a
     /// fresh write would pin. Earlier ids stay in `schemas` (write schemas are immutable).
     current_schema: HashMap<Dataset, SchemaId>,
+    /// Read-schema payloads by id (mirrors `read_schemas`). Never pruned — the pg table has no
+    /// delete path today, and ids are never reused, so a superseded id keeps resolving.
+    read_schemas: HashMap<ReadSchemaId, DatasetSchema>,
+    /// `(dataset, canonical json)` → id, mirroring `UNIQUE (dataset_id, hash)`: re-promoting
+    /// previously superseded content revives that same id, exactly as
+    /// `ON CONFLICT ... DO UPDATE SET superseded_at = NULL` does.
+    read_schema_ids: HashMap<(Dataset, String), ReadSchemaId>,
+    /// The dataset's current read schema — the `superseded_at IS NULL` row. Supersession is just
+    /// this pointer moving, so no per-row stamp is needed.
+    current_read_schema: HashMap<Dataset, ReadSchemaId>,
     chunks: BTreeMap<ChunkPk, WorkerAssignmentChunk>,
     /// Natural identity → surrogate pk; a duplicate `(dataset, id)` insert is rejected
     /// (mirrors Postgres `UNIQUE (dataset_id, chunk_id)`). Never pruned — chunks
@@ -665,6 +676,18 @@ impl InMemoryStorage {
             .collect();
     }
 
+    /// Datasets with a chunk in the routable window (entered a worker assignment, not yet
+    /// tombstoned) — the scoping `active_schema_bundle` applies to write schemas, so the read
+    /// section shrinks on the same clock.
+    fn datasets_in_routable_window(&self) -> BTreeSet<Dataset> {
+        self.sched_chunk_metadata
+            .iter()
+            .filter(|(_, meta)| meta.entered_worker_assignment() && !meta.tombstoned())
+            .filter_map(|(pk, _)| self.chunks.get(pk))
+            .map(|chunk| (*chunk.dataset).clone())
+            .collect()
+    }
+
     /// Register `dataset`'s write schema and return its id, reusing the id of previously seen
     /// identical content — mirrors Postgres' `insert_write_schema`. Records it as the dataset's
     /// latest write schema (the id a fresh write pins).
@@ -810,6 +833,38 @@ impl SchedulerStorage for InMemoryStorage {
             .into_iter()
             .filter_map(|id| self.schemas.get(&id).map(|s| (id, s.clone())))
             .collect())
+    }
+
+    fn active_read_schemas(&self) -> Result<BTreeMap<ReadSchemaId, DatasetSchema>, StorageError> {
+        Ok(self
+            .datasets_in_routable_window()
+            .into_iter()
+            .filter_map(|dataset| self.current_read_schema.get(&dataset).copied())
+            .filter_map(|id| self.read_schemas.get(&id).map(|s| (id, s.clone())))
+            .collect())
+    }
+
+    fn promote_read_schema(
+        &mut self,
+        dataset: &str,
+        schema: DatasetSchema,
+    ) -> Result<ReadSchemaId, StorageError> {
+        if !self.datasets.contains(dataset) {
+            return Err(anyhow::anyhow!("promote_read_schema: dataset {dataset} not found").into());
+        }
+        schema.validate().context("invalid dataset schema")?;
+        use std::collections::hash_map::Entry;
+        let canon = serde_json::to_string(&schema.canonicalized()).expect("schema serializes");
+        let id = match self.read_schema_ids.entry((dataset.to_owned(), canon)) {
+            Entry::Occupied(e) => *e.get(),
+            Entry::Vacant(e) => {
+                let id = ReadSchemaId(self.counters.read_schema_id.next() as i32);
+                self.read_schemas.insert(id, schema);
+                *e.insert(id)
+            }
+        };
+        self.current_read_schema.insert(dataset.to_owned(), id);
+        Ok(id)
     }
 
     fn insert_new_chunks(&mut self, chunks: Vec<NewChunk>) -> Result<(), StorageError> {
@@ -1087,7 +1142,7 @@ impl SchedulerStorage for InMemoryStorage {
             .into_iter()
             .filter_map(|id| self.schemas.get(&id).map(|schema| (id, schema.clone())))
             .collect();
-        let bundle = SchemaBundle::from_schemas(schemas);
+        let bundle = SchemaBundle::from_sections(schemas, self.active_read_schemas()?);
         Ok((assignment, bundle))
     }
 

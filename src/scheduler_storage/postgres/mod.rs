@@ -279,6 +279,43 @@ impl SchedulerStorage for PostgresStorage {
         })
     }
 
+    fn active_read_schemas(
+        &self,
+    ) -> Result<BTreeMap<crate::scheduler_storage::ReadSchemaId, DatasetSchema>, StorageError> {
+        self.with_conn_ref(async move |conn| {
+            schema::active_read_schemas(conn)
+                .await
+                .map_err(StorageError::from)
+        })
+    }
+
+    fn promote_read_schema(
+        &mut self,
+        dataset: &str,
+        schema: DatasetSchema,
+    ) -> Result<crate::scheduler_storage::ReadSchemaId, StorageError> {
+        let dataset = dataset.to_owned();
+        self.with_conn(async move |conn| {
+            let mut tx = conn.begin().await.context("promote_read_schema: begin")?;
+            let dataset_id: crate::scheduler_storage::DatasetPk =
+                sqlx::query_scalar("SELECT id FROM datasets WHERE name = $1")
+                    .bind(&dataset)
+                    .fetch_optional(&mut *tx)
+                    .await
+                    .context("promote_read_schema: resolve dataset")?
+                    .ok_or_else(|| {
+                        StorageError::Database(anyhow::anyhow!(
+                            "promote_read_schema: dataset {dataset} not found"
+                        ))
+                    })?;
+            let id =
+                scheduler_metadata::pg::schema::promote_read_schema(&mut tx, dataset_id, &schema)
+                    .await?;
+            tx.commit().await.context("promote_read_schema: commit")?;
+            Ok(id)
+        })
+    }
+
     fn insert_new_chunks(&mut self, chunks: Vec<NewChunk>) -> Result<(), StorageError> {
         let batch_size = self.batch_size;
         self.with_conn(async move |conn| {
@@ -451,8 +488,11 @@ impl SchedulerStorage for PostgresStorage {
             let mut schema_ids: BTreeSet<SchemaId> = wa.schema_ids();
             schema_ids.extend(bundle_schema_ids);
             let schema_ids: Vec<SchemaId> = schema_ids.into_iter().collect();
-            let bundle = SchemaBundle::from_schemas(
+            // The read section carries content, not just ids: the portal validates queries against
+            // it, and it moves the BundleId so a caching client notices a promote.
+            let bundle = SchemaBundle::from_sections(
                 scheduler_metadata::pg::schema::load_schemas(conn, Some(&schema_ids)).await?,
+                schema::active_read_schemas(conn).await?,
             );
             Ok::<_, StorageError>((wa, bundle))
         })

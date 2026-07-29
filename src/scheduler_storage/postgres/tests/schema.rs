@@ -5,27 +5,20 @@
 
 use std::collections::BTreeMap;
 
+use sqlx::Connection;
+
 use super::{current_schema_id, fresh_storage, register_chunk};
 use crate::scheduler_storage::algorithm::IdealMapping;
 use crate::scheduler_storage::postgres::PostgresStorage;
 use crate::scheduler_storage::test_harness::inspect::StorageInspect;
 use crate::scheduler_storage::test_harness::utils::{
-    StaticSchedulingAlgorithm, dataset, new_dataset, worker,
+    StaticSchedulingAlgorithm, dataset, new_dataset, schema_with_tables, worker,
 };
 use crate::scheduler_storage::{
-    BundleId, ChunkPk, SchedulerStorage, SchemaBundle, SchemaId, StorageError, WorkerAssignment,
-    WorkerPk,
+    BundleId, ChunkPk, DatasetPk, SchedulerStorage, SchemaBundle, SchemaId, StorageError,
+    WorkerAssignment, WorkerPk,
 };
 use crate::types::{DatasetSchema, TableSchema};
-
-fn schema_with_tables(tables: &[&str]) -> DatasetSchema {
-    DatasetSchema::new(
-        tables
-            .iter()
-            .map(|t| ((*t).to_owned(), TableSchema::default()))
-            .collect(),
-    )
-}
 
 fn schema_one_table(table: &str, fields: &[&str], default_fields: &[&str]) -> DatasetSchema {
     let mut tables = BTreeMap::new();
@@ -97,6 +90,44 @@ fn set_chunk_tables_present(
         .unwrap();
 }
 
+/// Make `schema` the dataset's current READ schema, as the metadata service's admin path
+/// (`PUT /datasets/{name}/read-schema`) does — the scheduler exposes no API of its own for it.
+fn promote_read_schema(storage: &mut PostgresStorage, ds: String, schema: DatasetSchema) {
+    storage
+        .with_conn(async move |conn| {
+            let dataset_id: DatasetPk =
+                sqlx::query_scalar("SELECT id FROM datasets WHERE name = $1")
+                    .bind(&ds)
+                    .fetch_one(&mut *conn)
+                    .await
+                    .unwrap();
+            let mut tx = conn.begin().await.unwrap();
+            scheduler_metadata::pg::schema::promote_read_schema(&mut tx, dataset_id, &schema)
+                .await
+                .unwrap();
+            tx.commit().await.unwrap();
+            Ok::<_, StorageError>(())
+        })
+        .unwrap();
+}
+
+/// The dataset's current read schema (`superseded_at IS NULL`); `None` if never promoted.
+fn current_read_schema(storage: &mut PostgresStorage, ds: String) -> Option<DatasetSchema> {
+    storage
+        .with_conn(async move |conn| {
+            let row: Option<sqlx::types::Json<DatasetSchema>> = sqlx::query_scalar(
+                "SELECT r.schema FROM read_schemas r JOIN datasets d ON d.id = r.dataset_id \
+                 WHERE d.name = $1 AND r.superseded_at IS NULL",
+            )
+            .bind(&ds)
+            .fetch_optional(&mut *conn)
+            .await
+            .unwrap();
+            Ok::<_, StorageError>(row.map(|j| j.0))
+        })
+        .unwrap()
+}
+
 /// Place every given chunk on every given worker and run one cycle.
 fn schedule(
     storage: &mut PostgresStorage,
@@ -104,6 +135,16 @@ fn schedule(
     worker_ids: &[WorkerPk],
     at: u64,
 ) -> WorkerAssignment {
+    schedule_with_bundle(storage, chunk_pks, worker_ids, at).0
+}
+
+/// [`schedule`], keeping the bundle frozen with the assignment instead of dropping it.
+fn schedule_with_bundle(
+    storage: &mut PostgresStorage,
+    chunk_pks: &[ChunkPk],
+    worker_ids: &[WorkerPk],
+    at: u64,
+) -> (WorkerAssignment, SchemaBundle) {
     storage.register_new_chunks().expect("register new chunks");
     let workers: Vec<WorkerPk> = worker_ids.to_vec();
     let mapping: IdealMapping = chunk_pks.iter().map(|&pk| (pk, workers.clone())).collect();
@@ -111,7 +152,6 @@ fn schedule(
     storage
         .run_scheduling_cycle(&algorithm, &(), at, 60)
         .expect("scheduling succeeds")
-        .0
 }
 
 fn one_worker(storage: &mut PostgresStorage) -> Vec<WorkerPk> {
@@ -177,7 +217,8 @@ fn active_schema_bundle_holds_only_in_play_schemas() {
         bundle.schemas(),
         &BTreeMap::from([(a_schema, schema_with_tables(&["blocks"]))]),
     );
-    assert_eq!(bundle.id(), BundleId::from_schema_ids([a_schema]));
+    // No read schema promoted, so the read section is empty.
+    assert_eq!(bundle.id(), BundleId::from_sections([a_schema], []));
 
     // Promote "a" to the portal — still in play, so the set is unchanged.
     storage.confirm_worker_assignment(wa.id, 100).unwrap();
@@ -186,6 +227,55 @@ fn active_schema_bundle_holds_only_in_play_schemas() {
         SchemaBundle::generate(&storage).unwrap().id(),
         bundle.id(),
         "portal-served keeps the same in-play schema set",
+    );
+}
+
+/// The bundle carries the dataset's current READ schema — what a portal validates queries against —
+/// alongside the WRITE schemas its chunks are pinned to, and promoting one moves the fingerprint.
+/// That movement is what lets a portal cache the bundle and re-fetch only when the set changed;
+/// without it a promote is invisible and the cache never invalidates.
+#[test]
+fn schema_bundle_carries_the_current_read_schema() {
+    let mut storage = fresh_storage("bundle_read_schema");
+    let write_schema = schema_with_tables(&["blocks"]);
+    storage
+        .insert_new_datasets(vec![new_dataset("ds", write_schema.clone())])
+        .expect("insert dataset");
+    let pk = register_chunk(&mut storage, "ds", 1, 100);
+    let write_schema_id = current_schema_id(&mut storage, dataset("ds"));
+    let workers = one_worker(&mut storage);
+
+    let (_, before) = schedule_with_bundle(&mut storage, &[pk], &workers, 100);
+    assert_eq!(
+        before.schemas(),
+        &BTreeMap::from([(write_schema_id, write_schema)]),
+        "the bundle starts as exactly the placed chunk's write schema",
+    );
+
+    // A read schema whose table set no write schema has, so its presence would be unambiguous.
+    let read_schema = schema_with_tables(&["blocks", "logs"]);
+    promote_read_schema(&mut storage, dataset("ds"), read_schema.clone());
+    assert_eq!(
+        current_read_schema(&mut storage, dataset("ds")).as_ref(),
+        Some(&read_schema),
+        "the promote landed — the dataset does have a current read schema",
+    );
+
+    let (_, after) = schedule_with_bundle(&mut storage, &[pk], &workers, 200);
+    assert_eq!(
+        after.read_schemas().values().collect::<Vec<_>>(),
+        vec![&read_schema],
+        "the bundle carries the current read schema, so a portal can resolve it",
+    );
+    assert_eq!(
+        after.schemas(),
+        before.schemas(),
+        "and the write section is untouched — the two are separate id spaces",
+    );
+    assert_ne!(
+        after.id(),
+        before.id(),
+        "the fingerprint moves, so a portal caching the bundle knows to re-fetch",
     );
 }
 

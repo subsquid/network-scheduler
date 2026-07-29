@@ -9,7 +9,7 @@ use crate::weight::SchedulingChunk;
 /// The id newtypes, ingest input types, and the error enum now live in `scheduler-metadata`; the
 /// scheduler keeps its historical `scheduler_storage::{…}` surface via this re-export.
 pub use scheduler_metadata::{
-    ChunkPk, DatasetPk, NewChunk, NewDataset, SchemaId, StorageError, WorkerPk,
+    ChunkPk, DatasetPk, NewChunk, NewDataset, ReadSchemaId, SchemaId, StorageError, WorkerPk,
 };
 
 /// Lower a discovered [`Chunk`](crate::types::Chunk) to a [`NewChunk`] pinned to `schema_id`.
@@ -153,8 +153,8 @@ pub trait SchedulerStorage {
     /// mappings, run `algorithm` in-process, diff + commit results.
     ///
     /// Returns the published `WorkerAssignment` (ideal ∪ stale) with the [`SchemaBundle`] frozen
-    /// with it — the schemas its chunks reference — so the two stay paired. On `Shortage` neither
-    /// advances.
+    /// with it — the write schemas its chunks reference, plus the current read schemas of the
+    /// datasets in play — so the two stay paired. On `Shortage` neither advances.
     fn run_scheduling_cycle<Algo>(
         &mut self,
         algorithm: &Algo,
@@ -181,9 +181,10 @@ pub trait SchedulerStorage {
     fn mark_for_removal(&mut self, chunk_pk: ChunkPk, now: Tick) -> Result<(), StorageError>;
 
     // Seeding/ingestion entry points (production ingestion and the offline tools). Each dataset
-    // carries its identity and storage location plus an initial WRITE schema (the read schema is a
-    // PG/ingest-only concern — see PgIngest); `NewDataset::new` derives the name from the location
-    // (scheme stripped), or `with_name` sets an explicit one.
+    // carries its identity and storage location plus an initial WRITE schema — deliberately no read
+    // pointer, so the read registry keeps exactly one writer (see `promote_read_schema`).
+    // `NewDataset::new` derives the name from the location (scheme stripped), or `with_name` sets
+    // an explicit one.
     fn insert_new_datasets(&mut self, datasets: Vec<NewDataset>) -> Result<(), StorageError>;
     fn insert_new_chunks(&mut self, chunks: Vec<NewChunk>) -> Result<(), StorageError>;
 
@@ -207,6 +208,23 @@ pub trait SchedulerStorage {
     /// [`SchemaBundle`]). One round-trip; independent of the published `WorkerAssignment`/
     /// `PortalAssignment`, which can lag or fail on their own.
     fn active_schema_bundle(&self) -> Result<BTreeMap<SchemaId, DatasetSchema>, StorageError>;
+
+    /// The current READ schema of every dataset in play, over the same routable window
+    /// `active_schema_bundle` uses — so the read section retires on the same clock as the write
+    /// one, and a decommissioned dataset stops being carried once its chunks are tombstoned.
+    fn active_read_schemas(&self) -> Result<BTreeMap<ReadSchemaId, DatasetSchema>, StorageError>;
+
+    /// Make `schema` the dataset's current read schema, returning its (content-deduped) id.
+    ///
+    /// In production the read registry has exactly ONE writer — the metadata service's admin
+    /// endpoint — and the scheduler only ever reads it; this exists so tests and the simulation
+    /// can drive promotion against either backend. Do not call it from the scheduler's own loops:
+    /// a second writer is what the read path's concurrency argument rests on not existing.
+    fn promote_read_schema(
+        &mut self,
+        dataset: &str,
+        schema: DatasetSchema,
+    ) -> Result<ReadSchemaId, StorageError>;
 
     /// Register a new chunk replacement for an old chunk. New chunk must have the same block range
     /// as the old chunk. A production path now — reorgs drive it.

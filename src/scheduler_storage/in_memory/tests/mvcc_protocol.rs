@@ -2,6 +2,7 @@
 //! span scheduling cycles and visibility cycles together.
 
 use super::*;
+use crate::scheduler_storage::test_harness::utils::schema_with_tables;
 use maplit::{btreemap, hashset};
 use std::collections::{BTreeMap, HashSet};
 
@@ -380,7 +381,8 @@ fn schema_bundle_holds_only_in_play_schemas() {
 
     let bundle = SchemaBundle::generate(&storage).unwrap();
     assert_eq!(bundle.schemas(), &BTreeMap::from([(a_schema, schema_a)]));
-    assert_eq!(bundle.id(), BundleId::from_schema_ids([a_schema]));
+    // No read schema promoted, so the read section is empty.
+    assert_eq!(bundle.id(), BundleId::from_sections([a_schema], []));
 
     // Promote "a" to the portal — still in play, so the bundle is unchanged.
     storage
@@ -391,6 +393,73 @@ fn schema_bundle_holds_only_in_play_schemas() {
         .unwrap();
     assert!(portal.chunk_workers.contains_key(&a_pk));
     assert_eq!(SchemaBundle::generate(&storage).unwrap().id(), bundle.id());
+}
+
+/// In-memory twin of the Postgres `schema_bundle_carries_the_current_read_schema`: the read
+/// section tracks the current read schema and moves the fingerprint, a re-promote of previously
+/// superseded content revives its original id (mirroring `ON CONFLICT ... SET superseded_at =
+/// NULL`), and a dataset with no chunk in the routable window contributes nothing.
+#[test]
+fn bundle_read_section_tracks_the_current_read_schema() {
+    let mut storage = InMemoryStorage::default();
+    storage
+        .insert_new_datasets(vec![dataset("a"), dataset("b")])
+        .unwrap();
+    let a = chunk("a", 1, 100);
+    storage.insert_new_chunks(vec![a.clone()]).unwrap();
+    let a_pk = storage.pk_of(&a);
+    storage
+        .update_worker_set(&[worker(1, None)], 0, 1000)
+        .unwrap();
+    let w1 = workers(&storage)[0].worker_id;
+    run_cycle(&mut storage, &a_pk, vec![w1], CYCLE_INTERVAL);
+
+    let before = SchemaBundle::generate(&storage).unwrap();
+    assert!(before.read_schemas().is_empty(), "nothing promoted yet");
+
+    // "b" has no placed chunk, so its read schema must not enter the bundle.
+    let r_b = storage
+        .promote_read_schema(&dataset("b"), schema_with_tables(&["only_b"]))
+        .unwrap();
+    let r1 = storage
+        .promote_read_schema(&dataset("a"), schema_with_tables(&["blocks"]))
+        .unwrap();
+    let one = SchemaBundle::generate(&storage).unwrap();
+    assert_eq!(
+        one.read_schemas().keys().copied().collect::<Vec<_>>(),
+        vec![r1],
+        "only datasets in the routable window contribute; {r_b} is unplaced",
+    );
+    assert_ne!(one.id(), before.id(), "a promote moves the fingerprint");
+    assert_eq!(
+        one.schemas(),
+        before.schemas(),
+        "and leaves the write section alone",
+    );
+
+    // Supersede it, then re-promote the original content: the first id comes back.
+    let r2 = storage
+        .promote_read_schema(&dataset("a"), schema_with_tables(&["blocks", "logs"]))
+        .unwrap();
+    assert_ne!(r1, r2);
+    let two = SchemaBundle::generate(&storage).unwrap();
+    assert_eq!(
+        two.read_schemas().keys().copied().collect::<Vec<_>>(),
+        vec![r2],
+        "one current read schema per dataset — the superseded one leaves the bundle",
+    );
+    assert_eq!(
+        storage
+            .promote_read_schema(&dataset("a"), schema_with_tables(&["blocks"]))
+            .unwrap(),
+        r1,
+        "re-promoting superseded content revives its original id, never mints a new one",
+    );
+    assert_eq!(
+        SchemaBundle::generate(&storage).unwrap().id(),
+        one.id(),
+        "so the fingerprint returns to exactly what it was under that schema",
+    );
 }
 
 /// Retirement rides the chunk tombstone clock: a chunk dropped from the portal stays

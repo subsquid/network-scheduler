@@ -35,6 +35,17 @@ pub fn dataset(name: &str) -> String {
     format!("s3://{name}")
 }
 
+/// A schema with the named tables, each with no fields — enough to exercise table-set membership
+/// and the bundle's content-dedup without pinning field lists.
+pub fn schema_with_tables(tables: &[&str]) -> DatasetSchema {
+    DatasetSchema::new(
+        tables
+            .iter()
+            .map(|t| ((*t).to_owned(), crate::types::TableSchema::default()))
+            .collect(),
+    )
+}
+
 /// A [`NewDataset`] for the trait's `insert_new_datasets`. These fixtures keep `location == name`
 /// (both the `s3://`-prefixed string), matching how [`chunk`] references its dataset.
 pub fn new_dataset(name: &str, schema: DatasetSchema) -> NewDataset {
