@@ -395,10 +395,9 @@ fn schema_bundle_holds_only_in_play_schemas() {
     assert_eq!(SchemaBundle::generate(&storage).unwrap().id(), bundle.id());
 }
 
-/// In-memory twin of the Postgres `schema_bundle_carries_the_current_read_schema`: the read
-/// section tracks the current read schema and moves the fingerprint, a re-promote of previously
-/// superseded content revives its original id (mirroring `ON CONFLICT ... SET superseded_at =
-/// NULL`), and a dataset with no chunk in the routable window contributes nothing.
+/// In-memory twin of Postgres' `schema_bundle_carries_the_current_read_schema`, plus two things it
+/// can't reach: a re-promote of superseded content revives its original id, and a dataset outside
+/// the routable window contributes nothing.
 #[test]
 fn bundle_read_section_tracks_the_current_read_schema() {
     let mut storage = InMemoryStorage::default();

@@ -90,8 +90,7 @@ fn set_chunk_tables_present(
         .unwrap();
 }
 
-/// Make `schema` the dataset's current READ schema, as the metadata service's admin path
-/// (`PUT /datasets/{name}/read-schema`) does — the scheduler exposes no API of its own for it.
+/// Promote a read schema, as `PUT /datasets/{name}/read-schema` does.
 fn promote_read_schema(storage: &mut PostgresStorage, ds: String, schema: DatasetSchema) {
     storage
         .with_conn(async move |conn| {
@@ -111,7 +110,7 @@ fn promote_read_schema(storage: &mut PostgresStorage, ds: String, schema: Datase
         .unwrap();
 }
 
-/// The dataset's current read schema (`superseded_at IS NULL`); `None` if never promoted.
+/// The `superseded_at IS NULL` row; `None` if never promoted.
 fn current_read_schema(storage: &mut PostgresStorage, ds: String) -> Option<DatasetSchema> {
     storage
         .with_conn(async move |conn| {
@@ -138,7 +137,7 @@ fn schedule(
     schedule_with_bundle(storage, chunk_pks, worker_ids, at).0
 }
 
-/// [`schedule`], keeping the bundle frozen with the assignment instead of dropping it.
+/// [`schedule`], keeping the bundle instead of dropping it.
 fn schedule_with_bundle(
     storage: &mut PostgresStorage,
     chunk_pks: &[ChunkPk],
@@ -230,10 +229,8 @@ fn active_schema_bundle_holds_only_in_play_schemas() {
     );
 }
 
-/// The bundle carries the dataset's current READ schema — what a portal validates queries against —
-/// alongside the WRITE schemas its chunks are pinned to, and promoting one moves the fingerprint.
-/// That movement is what lets a portal cache the bundle and re-fetch only when the set changed;
-/// without it a promote is invisible and the cache never invalidates.
+/// The bundle carries the current read schema alongside the write schemas, and a promote moves the
+/// fingerprint — without that movement a caching portal never invalidates.
 #[test]
 fn schema_bundle_carries_the_current_read_schema() {
     let mut storage = fresh_storage("bundle_read_schema");
@@ -252,7 +249,7 @@ fn schema_bundle_carries_the_current_read_schema() {
         "the bundle starts as exactly the placed chunk's write schema",
     );
 
-    // A read schema whose table set no write schema has, so its presence would be unambiguous.
+    // A table set no write schema has, so its presence is unambiguous.
     let read_schema = schema_with_tables(&["blocks", "logs"]);
     promote_read_schema(&mut storage, dataset("ds"), read_schema.clone());
     assert_eq!(
@@ -279,16 +276,13 @@ fn schema_bundle_carries_the_current_read_schema() {
     );
 }
 
-/// A dataset placed for the FIRST time in this cycle must still get its read schema into the
-/// bundle. The cycle's chunk scan runs before `apply_deltas_and_swap` stamps
-/// `applied_at_worker_assignment_id`, so a first-placement chunk still reads as never-entered and
-/// the routable-window scan alone misses its dataset — exactly as it misses its write schema, which
-/// is why the write side starts from `wa.schema_ids()` rather than from the scan.
+/// A dataset placed for the first time this cycle must still reach the bundle. The scan runs before
+/// `apply_deltas_and_swap` stamps `applied_at_worker_assignment_id`, so the chunk reads as
+/// never-entered and the scan alone misses its dataset — the reason the write side starts from
+/// `wa.schema_ids()`.
 ///
-/// [`schema_bundle_carries_the_current_read_schema`] cannot catch this: it promotes after a cycle
-/// has already stamped the chunk. The order here — promote, THEN place for the first time — is the
-/// whole point. Found by the Postgres sims (empty read section on the first-placement cycle);
-/// pinned deterministically here.
+/// The order is the whole point: [`schema_bundle_carries_the_current_read_schema`] promotes after a
+/// cycle has already stamped the chunk, so it cannot catch this.
 #[test]
 fn first_placement_cycle_carries_the_read_schema() {
     let mut storage = fresh_storage("bundle_first_placement");
@@ -300,7 +294,7 @@ fn first_placement_cycle_carries_the_read_schema() {
     promote_read_schema(&mut storage, dataset("ds"), read_schema.clone());
     let workers = one_worker(&mut storage);
 
-    // The very first cycle to place this chunk: nothing has stamped it as entered yet.
+    // Nothing has stamped this chunk as entered yet.
     let (wa, bundle) = schedule_with_bundle(&mut storage, &[pk], &workers, 100);
     assert!(
         wa.chunks.contains_key(&pk),

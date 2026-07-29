@@ -238,15 +238,12 @@ pub(crate) struct InMemoryStorage {
     /// Each dataset's latest-registered write schema id, so the sim can stamp inserts with the id a
     /// fresh write would pin. Earlier ids stay in `schemas` (write schemas are immutable).
     current_schema: HashMap<Dataset, SchemaId>,
-    /// Read-schema payloads by id (mirrors `read_schemas`). Never pruned — the pg table has no
-    /// delete path today, and ids are never reused, so a superseded id keeps resolving.
+    /// Mirrors `read_schemas`. Never pruned, so a superseded id keeps resolving.
     read_schemas: HashMap<ReadSchemaId, DatasetSchema>,
     /// `(dataset, canonical json)` → id, mirroring `UNIQUE (dataset_id, hash)`: re-promoting
-    /// previously superseded content revives that same id, exactly as
-    /// `ON CONFLICT ... DO UPDATE SET superseded_at = NULL` does.
+    /// superseded content revives its id, as `ON CONFLICT ... SET superseded_at = NULL` does.
     read_schema_ids: HashMap<(Dataset, String), ReadSchemaId>,
-    /// The dataset's current read schema — the `superseded_at IS NULL` row. Supersession is just
-    /// this pointer moving, so no per-row stamp is needed.
+    /// The `superseded_at IS NULL` row. Supersession is this pointer moving, so no per-row stamp.
     current_read_schema: HashMap<Dataset, ReadSchemaId>,
     chunks: BTreeMap<ChunkPk, WorkerAssignmentChunk>,
     /// Natural identity → surrogate pk; a duplicate `(dataset, id)` insert is rejected
@@ -676,9 +673,8 @@ impl InMemoryStorage {
             .collect();
     }
 
-    /// Datasets with a chunk in the routable window (entered a worker assignment, not yet
-    /// tombstoned) — the scoping `active_schema_bundle` applies to write schemas, so the read
-    /// section shrinks on the same clock.
+    /// Datasets with a chunk in the routable window — the scoping `active_schema_bundle` applies to
+    /// write schemas, so the read section shrinks on the same clock.
     fn datasets_in_routable_window(&self) -> BTreeSet<Dataset> {
         self.sched_chunk_metadata
             .iter()
@@ -1234,9 +1230,8 @@ impl SchedulerStorage for InMemoryStorage {
 
         let workers = self.assignment_workers();
 
-        // Exactly the datasets the (post-eviction) chunk set names, each mapped to its current
-        // read pointer — `None` where none was ever promoted, which is the seeded state. Same rule
-        // as the Postgres `portal_read_schema_refs`, derived from the same post-eviction set.
+        // The post-eviction chunk set's datasets, each with its current read pointer. Same rule as
+        // Postgres' `portal_read_schema_refs`.
         let read_schemas: BTreeMap<crate::types::DatasetId, Option<ReadSchemaId>> = portal_chunks
             .values()
             .map(|chunk| chunk.dataset.clone())

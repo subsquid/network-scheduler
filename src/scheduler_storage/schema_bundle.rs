@@ -1,10 +1,9 @@
-//! The dataset schemas a published assignment reference, with a content [`BundleId`] clients use
-//! to detect changes. Two sections: the WRITE schemas the assignment's chunks are pinned to (built
-//! from those chunks and frozen with the assignment, so the two can't drift) and the current READ
-//! schemas of the datasets in play.
+//! Schemas published alongside an assignment: the WRITE schemas its chunks pin, and the current
+//! READ schemas of the datasets in play. Built from the assignment's own chunks, so the two can't
+//! drift.
 //!
-//! The fingerprint covers both, so promoting a read schema moves it — that is what lets a portal
-//! cache the bundle and re-fetch only when the set actually changed.
+//! [`BundleId`] covers both sections, so a promote moves it — that is what lets a portal cache the
+//! bundle and re-fetch only on a change.
 
 use std::collections::BTreeMap;
 
@@ -15,26 +14,20 @@ use super::{ReadSchemaId, SchemaId, WorkerAssignmentChunk};
 use super::{SchedulerStorage, StorageError};
 use crate::types::DatasetSchema;
 
-/// Domain tag: keeps this fingerprint from colliding with any other SHA-256 over id lists, and
-/// pins the encoding so a future format change is a different id rather than a silent collision.
+/// Pins the encoding: a future format change becomes a different id, not a silent collision.
 const BUNDLE_ID_DOMAIN: &[u8] = b"sqd.schema-bundle.v1";
 
-/// Content id of a [`SchemaBundle`]: SHA-256 over its sorted write- and read-schema ids. Ids are
-/// content-deduped serials, so equal ids ⇒ equal content — but only within one storage instance,
-/// not across DBs.
+/// SHA-256 over the bundle's sorted ids. Ids are content-deduped serials, so equal ids ⇒ equal
+/// content — within one database, not across them.
 ///
-/// The two sections are hashed separately, each length-prefixed behind its own tag. `schemas.id`
-/// and `read_schemas.id` are independent `SERIAL`s that hand out the same small integers, so a
-/// flat hash over both would let write-{3} and read-{3} collide; the tags and lengths make the
-/// section a value carries part of its identity. Primary keys are never reused, so an id in an
-/// already-published bundle can never later mean a different schema.
+/// Each section is hashed behind its own tag and length: `schemas.id` and `read_schemas.id` are
+/// independent `SERIAL`s handing out the same integers, so a flat hash would let write-3 and
+/// read-3 collide. Ids are never reused, so an id in a published bundle keeps its meaning.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct BundleId([u8; 32]);
 
 impl BundleId {
-    /// `SchemaBundle` is the only production caller for now, and its ids come pre-sorted from a
-    /// `BTreeMap` — order isn't normalized here, so a caller with unsorted ids must sort first
-    /// (checked in debug builds).
+    /// Ids must arrive sorted (they do, from a `BTreeMap`); order isn't normalised here.
     pub(crate) fn from_sections(
         write_ids: impl IntoIterator<Item = SchemaId>,
         read_ids: impl IntoIterator<Item = ReadSchemaId>,
@@ -79,7 +72,6 @@ impl std::fmt::Debug for BundleId {
     }
 }
 
-/// In debug builds, catch a caller passing ids a `BTreeMap` didn't already sort.
 fn debug_assert_sorted(ids: impl Iterator<Item = i32>, section: &str) {
     #[cfg(debug_assertions)]
     {
@@ -92,9 +84,8 @@ fn debug_assert_sorted(ids: impl Iterator<Item = i32>, section: &str) {
     let _ = (ids, section);
 }
 
-/// Two sections: the WRITE schemas chunks are pinned to (a worker derives a chunk's file set from
-/// them) and the current READ schemas (what a portal validates queries against). They key on
-/// disjoint id spaces and are never interchangeable — see [`BundleId`].
+/// Workers derive file sets from the write section; portals validate queries against the read one.
+/// The two key on disjoint id spaces — see [`BundleId`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SchemaBundle {
     id: BundleId,
@@ -103,7 +94,6 @@ pub struct SchemaBundle {
 }
 
 impl SchemaBundle {
-    /// Wrap the assignment's schemas and stamp the content id.
     pub(crate) fn from_sections(
         schemas: BTreeMap<SchemaId, DatasetSchema>,
         read_schemas: BTreeMap<ReadSchemaId, DatasetSchema>,
@@ -116,8 +106,7 @@ impl SchemaBundle {
         }
     }
 
-    /// Snapshot of the in-play schemas for tests; production uses the bundle returned from
-    /// `run_scheduling_cycle`.
+    /// For tests; production takes the bundle from `run_scheduling_cycle`.
     #[cfg(test)]
     pub(crate) fn generate(storage: &impl SchedulerStorage) -> Result<Self, StorageError> {
         Ok(Self::from_sections(
@@ -156,10 +145,8 @@ impl SchemaBundle {
 
     /// The chunk's `<table>.parquet` files, from its pinned schema and `tables_present` bitmap.
     ///
-    /// The bitmap is positional over the pinned schema's tables in sorted-name order, so it is only
-    /// meaningful against the exact schema it was resolved under. A length disagreement proves it
-    /// is being read against a different table list and is refused — see
-    /// [`ChunkFilesError::BitmapArity`].
+    /// The bitmap is positional over that schema's tables in sorted-name order, so a length
+    /// mismatch means it was resolved against a different table list — refused, not applied.
     pub fn chunk_files(
         &self,
         chunk: &WorkerAssignmentChunk,
@@ -183,18 +170,15 @@ impl SchemaBundle {
     }
 }
 
-/// Why a chunk's file set could not be derived. Both variants are invariant violations the caller
-/// surfaces rather than papers over: a wrong file list is worse than none, because the worker acts
-/// on it — a missing file reads as legitimate absence rather than as an error.
+/// Both variants must reach the caller rather than degrade to a shorter file list: a worker acts on
+/// that list, and a missing file reads as legitimate absence, not as an error.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChunkFilesError {
-    /// The chunk's pinned schema is absent from the bundle, so its file set cannot be described at
-    /// all (the condition ADR 0002 exists to prevent).
+    /// Pinned schema absent from the bundle — the state ADR 0002 exists to prevent.
     SchemaMissing { schema_id: SchemaId },
-    /// The presence bitmap's length disagrees with the pinned schema's table count, so its bits
-    /// index a different table list than the one being applied. Reached by re-pinning a chunk to a
-    /// schema with a different table set without recomputing the bitmap: bits would silently shift
-    /// onto the wrong tables, and positions past the end would read as "legitimately absent".
+    /// Bitmap length ≠ the pinned schema's table count. Reached by re-pinning a chunk without
+    /// recomputing the bitmap: bits shift onto the wrong tables, and positions past the end read as
+    /// "absent".
     BitmapArity {
         schema_id: SchemaId,
         bitmap_len: usize,
@@ -226,15 +210,11 @@ impl std::fmt::Display for ChunkFilesError {
 
 impl std::error::Error for ChunkFilesError {}
 
-/// A schema's `<table>.parquet` files, filtered by a chunk's table-presence bitmap.
+/// `None` = every table present. It records no schema, so it can't be arity-checked: re-pinning a
+/// NULL-bitmap chunk to a superset schema would claim files it lacks. A re-pin must therefore
+/// materialise NULL into an explicit bitmap first.
 ///
-/// `None` = every table present. That sentinel carries no record of which schema produced it, so
-/// unlike an explicit bitmap it cannot be arity-checked: re-pinning a NULL-bitmap chunk to a
-/// *superset* schema silently claims files the chunk does not have. Anything that re-pins must
-/// therefore materialise NULL into an explicit bitmap first.
-///
-/// Precondition: an explicit bitmap's length equals `schema.tables().len()` — checked by
-/// [`SchemaBundle::chunk_files`], the only caller.
+/// Precondition (checked by the only caller): an explicit bitmap's length is `tables().len()`.
 fn chunk_files(schema: &DatasetSchema, bitmap: Option<&bit_vec::BitVec>) -> Vec<String> {
     schema
         .tables()
@@ -319,16 +299,13 @@ mod tests {
         );
     }
 
-    /// A bitmap is positional over one exact schema. If its length disagrees with the pinned
-    /// schema's table count it was resolved against a different table list, and applying it anyway
-    /// yields a plausible-but-wrong file set with no error — the failure mode that makes re-pinning
-    /// a chunk to a different table set unsafe. Both directions must be refused.
+    /// Applying a mismatched bitmap yields a plausible-but-wrong file set with no error — the
+    /// failure mode that makes re-pinning unsafe. Both directions must be refused.
     #[test]
     fn chunk_files_rejects_a_bitmap_of_the_wrong_arity() {
         let b = bundle(&[(1, schema(&["blocks", "logs", "transactions"]))]);
 
-        // Too short — as if the chunk were written under a 2-table schema and re-pinned to this
-        // one. Previously `transactions` silently read as "legitimately absent".
+        // Too short, as if re-pinned from a 2-table schema: `transactions` used to read as absent.
         assert_eq!(
             b.chunk_files(&chunk(1, Some(bit_vec::BitVec::from_elem(2, true)))),
             Err(ChunkFilesError::BitmapArity {
@@ -337,8 +314,7 @@ mod tests {
                 tables: 3,
             }),
         );
-        // Too long — the extra bits were silently ignored, so a table the chunk does carry could be
-        // dropped and every position after the divergence means the wrong table.
+        // Too long: extra bits used to be ignored, so positions could mean the wrong table.
         assert_eq!(
             b.chunk_files(&chunk(1, Some(bit_vec::BitVec::from_elem(4, true)))),
             Err(ChunkFilesError::BitmapArity {
@@ -347,7 +323,6 @@ mod tests {
                 tables: 3,
             }),
         );
-        // Exact arity is the only accepted explicit bitmap.
         assert_eq!(
             b.chunk_files(&chunk(1, Some(bit_vec::BitVec::from_elem(3, true))))
                 .map(|files| files.len()),
@@ -355,8 +330,7 @@ mod tests {
         );
     }
 
-    /// The NULL sentinel has no arity to check, so it is accepted against any schema — the residual
-    /// hazard a re-pin has to close by materialising it into an explicit bitmap first.
+    /// NULL has no arity to check, so it passes against any schema — the residue a re-pin must close.
     #[test]
     fn chunk_files_accepts_the_null_bitmap_against_any_schema() {
         let b = bundle(&[(1, schema(&["blocks", "logs"]))]);
@@ -379,9 +353,8 @@ mod tests {
         assert_ne!(write_only(&[1]), write_only(&[2]));
     }
 
-    /// The two id spaces are independent SERIALs handing out the same integers, so the fingerprint
-    /// must distinguish which section an id sits in — otherwise promoting a read schema whose id
-    /// happens to match a write id would leave the bundle looking unchanged.
+    /// Without per-section tagging, promoting a read schema whose id matches a write id would leave
+    /// the fingerprint unchanged.
     #[test]
     fn bundle_id_separates_the_two_sections() {
         assert_ne!(write_only(&[3]), read_only(&[3]));

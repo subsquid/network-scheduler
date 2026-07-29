@@ -1419,33 +1419,27 @@ fn churn_knife_edge_false_shortage_is_excused() {
     );
 }
 
-/// A read schema promoted during a shortage streak is named by the portal assignment while the
-/// bundle stays frozen from the last successful scheduling cycle — so the portal names an id its own
-/// bundle cannot resolve. `run_scheduling_cycle` returns `Shortage` before the bundle is built,
-/// while `run_visibility_cycle` keeps publishing a freshly resolved pointer, and nothing persists
-/// which read ids a published bundle carried, so the visibility cycle cannot know what the frozen
-/// bundle holds. The walk oracle stands this case down; these two tests pin it in place.
+/// A promote during a shortage streak is published by the visibility cycle while the bundle stays
+/// frozen, so the portal names an id its own bundle cannot resolve. Nothing records which read ids a
+/// published bundle carried, so the visibility cycle cannot know what the frozen bundle holds. The
+/// walk oracle stands this down; these tests pin it.
 ///
-/// `floor` is the whole polarity switch. 3 over 2 workers is unsatisfiable — `min_replication` is
-/// not clamped to the worker count, and `Placement::ensure_minimum`'s tag loop refuses a worker that
-/// already holds the chunk — so every later cycle shortages and the bundle freezes. Floor 2 is a
-/// no-op retune whose cycle succeeds, so the bundle advances past the promote. Same actions
-/// otherwise, which is what proves the failure comes from the freeze and not from a broken resolver.
+/// `floor` is the polarity switch: 3 over 2 workers is unsatisfiable (`min_replication` is not
+/// clamped to the worker count, and `ensure_minimum` refuses a worker already holding the chunk), so
+/// every later cycle shortages. Floor 2 is a no-op retune whose cycle succeeds. Same actions
+/// otherwise, which is what shows the failure comes from the freeze, not a broken resolver.
 fn portal_read_schema_case(floor: u16) -> (SimConfig, Vec<Action>) {
     let config = SimConfig {
         worker_count: 2,
         min_replication: 2,
         ..base_config()
     };
-    // Key 11: not a multiple of 20, so it gets its own block window rather than the shared
-    // collision window that registration rejects.
+    // Not a multiple of 20, so it gets its own block window rather than the rejected shared one.
     let chunk = new_chunk((mint_key(11), CHUNK_SIZE, 1, "s3://sim-1".to_string()));
     let actions = vec![
         // Generation 1: the chunk is placed on both workers.
         Action::AddChunks(vec![chunk]),
-        // 100% quorum: both workers must poll before the watermark advances, and nothing becomes
-        // portal-visible without it — otherwise the assignment names no dataset and the oracle is
-        // vacuous.
+        // 100% quorum: without both polls nothing is portal-visible and the oracle is vacuous.
         Action::WorkerFetchAssignment {
             worker: 0,
             succeeds: true,
@@ -1454,40 +1448,34 @@ fn portal_read_schema_case(floor: u16) -> (SimConfig, Vec<Action>) {
             worker: 1,
             succeeds: true,
         },
-        // Promoted at generation 1, running no cycle — a promote lands on the ingester's clock.
-        // SCHEMA_POOL[1] rather than [0]: [0] is `DatasetSchema::default()`, byte-identical to the
-        // write schema every dataset is seeded with, so promoting it would read as a no-op.
+        // No cycle: a promote lands on the ingester's clock. Not SCHEMA_POOL[0] — that is
+        // `DatasetSchema::default()`, identical to the seeded write schema, so it would be a no-op.
         Action::PromoteReadSchema {
             dataset: "s3://sim-1".into(),
             schema: SCHEMA_POOL[1].clone(),
         },
-        // Generation 2: schedules fine, so this bundle is built after the promote and carries the
-        // new read id; the visibility pass promotes the chunk, so the portal now names sim-1.
+        // Generation 2: succeeds, so this bundle carries the new read id and the portal names sim-1.
         Action::AdvanceClock(1),
-        // In-fixture positive control: this pair is coherent AND enforced (generation 2 > promoted
-        // at 1), so a refactor that neuters the oracle fails here first.
+        // Positive control: coherent and enforced (generation 2 > promoted-at 1), so a refactor that
+        // neuters the oracle fails here first.
         Action::PortalFetchAssignment { succeeds: true },
-        // `do_set_min_replication` runs the cycle itself.
         Action::SetMinReplication(floor),
-        // SCHEMA_POOL[0] has never been in this dataset's READ registry (the seed touched only the
-        // write registry), so the id genuinely moves — re-promoting the same content would be
-        // id-stable on both backends and the test would pass vacuously.
+        // SCHEMA_POOL[0] was never in this dataset's read registry, so the id genuinely moves;
+        // re-promoting the same content is id-stable and would pass vacuously.
         Action::PromoteReadSchema {
             dataset: "s3://sim-1".into(),
             schema: SCHEMA_POOL[0].clone(),
         },
-        // Under floor 3 this shortages again, but the visibility pass still publishes — with the
-        // FRESH pointer. Under floor 2 the cycle succeeds and the bundle picks the promote up.
+        // Floor 3 shortages again, yet the visibility pass still publishes the fresh pointer.
         Action::AdvanceClock(1),
         Action::PortalFetchAssignment { succeeds: true },
     ];
     (config, actions)
 }
 
-/// The pinned gap: `replay` passes because the walk oracle stands down on a frozen bundle, and the
-/// unexcused verdict then reports the incoherence this case exists to hold in place. When the bundle
-/// is allowed to advance under shortage, this assertion flips to an empty fault list and the
-/// stand-down arm in `assert_portal_read_schema_resolution` goes with it.
+/// The pinned gap: `replay` passes because the walk stands down on a frozen bundle, and the
+/// unexcused verdict reports the incoherence. Letting the bundle advance under shortage flips this to
+/// an empty fault list and removes the stand-down with it.
 #[test]
 fn portal_read_schema_outruns_the_frozen_bundle() {
     let (config, actions) = portal_read_schema_case(3);
@@ -1503,11 +1491,9 @@ fn portal_read_schema_outruns_the_frozen_bundle() {
     );
 }
 
-/// Positive control on the same actions with a satisfiable floor: the cycle after the promote
-/// succeeds, its bundle carries the new read id, and the reference resolves. Without it the pinned
-/// gap above would also pass if resolution were broken outright. `replay` is itself an assertion
-/// here — at generation 3 > promoted-at 2 the walk oracle is enforcing, so a broken reference panics
-/// inside `check_invariants` before the explicit check runs.
+/// Same actions, satisfiable floor: the cycle after the promote succeeds and the reference resolves.
+/// Without this the pinned gap would also pass if resolution were broken outright. `replay` is itself
+/// an assertion — at generation 3 the walk is enforcing, so a broken reference panics first.
 #[test]
 fn portal_read_schema_resolves_after_a_successful_cycle() {
     let (config, actions) = portal_read_schema_case(2);

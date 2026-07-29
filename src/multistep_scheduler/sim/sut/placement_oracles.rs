@@ -229,24 +229,14 @@ pub(super) fn schema_bundle_consistency(
     Ok(())
 }
 
-/// Every dataset the worker assignment names must have its promoted READ schema carried in the
-/// bundle frozen with that assignment — otherwise a portal validating a query against that dataset
-/// has nothing to resolve.
+/// Every dataset the worker assignment names must have its promoted read schema in the bundle
+/// frozen with it. Subject is the bundle; reference is `promoted`, the sim's own promote log —
+/// neither derived from the other, so this can't pass by one storage query agreeing with itself.
 ///
-/// The reference is `promoted`, the sim's own log of what it handed to `promote_read_schema`, and
-/// the subject is the published bundle. Neither is derived from the other through storage, so this
-/// cannot pass by both sides reading the same query — the failure mode of a containment check
-/// written against a storage-derived expectation.
-///
-/// Scoped to datasets the assignment actually names: a promote for a dataset with no placed chunk
-/// is correctly absent (nothing routes to it, so nothing needs to describe it).
-///
-/// A promote propagates on the next successful scheduling cycle, never instantly, so each entry
-/// carries the bundle generation current when it was issued and is only enforced once
-/// `bundle_generation` has moved past it. That is not a loophole for the frozen-shortage case — it
-/// encodes it: while placement is in shortage no bundle is frozen, the generation never advances,
-/// and a promote genuinely cannot reach a portal. If bundle generation is ever decoupled from
-/// placement, this check tightens on its own with no edit.
+/// A promote reaches the bundle on the next successful cycle, not instantly, so an entry is only
+/// enforced once `bundle_generation` passes the generation it was issued at. That encodes the
+/// shortage case rather than excusing it: a frozen bundle never advances the generation, and a
+/// promote genuinely cannot reach a portal. Decoupling the two tightens this with no edit.
 pub(super) fn bundle_covers_promoted_read_schemas(
     bundle: &SchemaBundle,
     worker_assignment: Option<&WorkerAssignment>,
@@ -256,15 +246,11 @@ pub(super) fn bundle_covers_promoted_read_schemas(
     let Some(assignment) = worker_assignment else {
         return Ok(());
     };
-    // Compared by content, not by id: `DatasetSchema` is not `Ord`, and content is also the only
-    // thing the sim knows independently of storage — an id would have to be read back from the
-    // backend that assigned it. The read section holds one schema per in-play dataset, so the
-    // linear scan is trivial.
+    // By content, not id: content is the only thing the sim knows without reading storage back.
     for chunk in assignment.chunks.values() {
         let Some((expected, promoted_at)) = promoted.get(chunk.dataset.as_str()) else {
             continue;
         };
-        // Not yet due: no bundle has been frozen since this promote.
         if bundle_generation <= *promoted_at {
             continue;
         }
@@ -283,14 +269,10 @@ pub(super) fn bundle_covers_promoted_read_schemas(
     Ok(())
 }
 
-/// Why a portal's read-schema reference is incoherent with the bundle it was published with. A
-/// typed verdict rather than a string, so a regression can pin the exact fault without asserting on
-/// message text or on a backend-assigned id.
+/// Typed so a regression can pin the exact fault without matching message text or a backend id.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ReadSchemaFault {
-    /// A dataset the chunk set names has no reference entry at all — a resolution omission. Ids are
-    /// never reused, so a reference that could not be produced must be visible, never answered by
-    /// silence.
+    /// A named dataset has no entry at all — an omission, which must be visible rather than silent.
     Unscoped { dataset: String },
     /// An entry for a dataset no chunk names — the reference failed to retire.
     Orphaned { dataset: String },
@@ -355,26 +337,23 @@ impl std::fmt::Display for ReadSchemaFault {
     }
 }
 
-/// CONSUMER-SIDE read-schema resolvability: every read schema the PORTAL names must resolve in the
-/// bundle the portal was handed alongside it.
+/// Every read schema the portal names must resolve in the bundle it was handed with.
 ///
-/// Subject is the assignment a portal actually holds; the reference is the bundle captured at that
-/// same publication plus the sim's own promote log. The bundle comes from `run_scheduling_cycle`,
-/// the reference map from `run_visibility_cycle`, and the promote log is never read back from a
-/// backend — so unlike [`schema_bundle_consistency`], which draws subject and invariant from the
-/// same chunk pins, this cannot pass by one query agreeing with itself.
+/// Subject is the assignment a portal holds; reference is the bundle captured at that publication
+/// plus the sim's promote log. The two come from different cycles and the log never touches storage,
+/// so unlike [`schema_bundle_consistency`] — which draws both sides from the chunk pins — this can
+/// actually fail.
 ///
-/// Returns **every** fault, never just the first: the caller partitions them into fatal and
-/// gap-excused, and a single early return would let one excused fault mask a real one behind it.
+/// Returns every fault, not the first: the caller partitions fatal from gap-excused, and an early
+/// return would let an excused fault mask a real one.
 ///
-/// Resolution is checked BY ID, not by content: read ids are allocated per `(dataset, content)`, so
-/// with a small canned schema pool a content-only check would be satisfied by any dataset's entry.
-/// Content is then checked separately, to catch a right-shaped id resolving to the wrong schema.
+/// Resolution is by id. Read ids are per `(dataset, content)`, so against a small canned pool a
+/// content check alone would be satisfied by any dataset's entry; content is checked separately, to
+/// catch an id resolving to the wrong schema.
 ///
-/// No age stand-down. Resolvability is not availability (ADR 0002 — a chunk may sit at zero copies
-/// yet stay fully resolvable), and a captured pair is self-consistent at any age; copying
-/// `portal_consistency`'s `age >= M_TICKS` gate would silence the target case outright, since a
-/// shortage streak advances the clock by `M_TICKS` per drain.
+/// No age stand-down: a captured pair is self-consistent at any age, and copying
+/// `portal_consistency`'s `age >= M_TICKS` gate would silence the target case, since a shortage
+/// streak advances the clock by `M_TICKS` per drain.
 pub(super) fn portal_read_schemas_resolve(
     portal: &PortalAssignment,
     bundle: &SchemaBundle,
@@ -399,7 +378,7 @@ pub(super) fn portal_read_schemas_resolve(
     for (dataset, reference) in &portal.read_schemas {
         let logged = promoted.get(dataset.as_str());
         match (reference, logged) {
-            // Never promoted, nothing referenced — the seeded state of every dataset.
+            // Never promoted — the seeded state of every dataset.
             (None, None) => {}
             (None, Some((_, promoted_at))) => faults.push(ReadSchemaFault::MissingReference {
                 dataset: dataset.to_string(),

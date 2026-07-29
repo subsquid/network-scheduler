@@ -130,25 +130,20 @@ pub struct PortalAssignment {
     pub chunk_workers: BTreeMap<ChunkPk, Vec<WorkerPk>>,
     pub chunks: BTreeMap<ChunkPk, WorkerAssignmentChunk>,
     pub workers: BTreeMap<WorkerPk, AssignmentWorker>,
-    /// Per-dataset READ-schema reference: the id a portal validates this dataset's queries under.
-    /// Ids only — the payload travels in the [`SchemaBundle`], and a portal resolves it with
-    /// `bundle.get_read(id)`.
+    /// The read-schema id a portal validates each dataset's queries under; resolved against the
+    /// [`SchemaBundle`] published with the assignment.
     ///
-    /// **Total over the datasets `chunks` names, and no wider.** A dataset enters with its first
-    /// portal-visible chunk and leaves with its last, so this retires on the same clock as the
-    /// chunk set; keying it off the `datasets` registry instead would grow forever, since nothing
+    /// **Total over the datasets `chunks` names, and no wider** — so it retires with the last
+    /// visible chunk. Keying it off the `datasets` registry would grow forever, since nothing
     /// deletes a dataset row.
     ///
-    /// `None` = never promoted. That is the seeded state of every dataset the scheduler creates
-    /// (`insert_new_datasets` writes no read pointer), so it is an honest published state — and
-    /// deliberately distinct from a *missing key*, which would be a resolution failure rather than
-    /// an answer.
+    /// `None` = never promoted, the seeded state of every dataset the scheduler creates. Distinct
+    /// from a missing key, which would be a resolution failure rather than an answer.
     pub read_schemas: BTreeMap<DatasetId, Option<ReadSchemaId>>,
 }
 
 impl PortalAssignment {
-    /// The datasets this assignment names, derived from its chunk set — the exact scope
-    /// `read_schemas` is total over.
+    /// The scope `read_schemas` is total over.
     pub(crate) fn named_datasets(&self) -> BTreeSet<DatasetId> {
         self.chunks
             .values()
@@ -234,17 +229,14 @@ pub trait SchedulerStorage {
     /// `PortalAssignment`, which can lag or fail on their own.
     fn active_schema_bundle(&self) -> Result<BTreeMap<SchemaId, DatasetSchema>, StorageError>;
 
-    /// The current READ schema of every dataset in play, over the same routable window
-    /// `active_schema_bundle` uses — so the read section retires on the same clock as the write
-    /// one, and a decommissioned dataset stops being carried once its chunks are tombstoned.
+    /// Every in-play dataset's current read schema, over the same routable window
+    /// `active_schema_bundle` uses, so both sections retire on one clock.
     fn active_read_schemas(&self) -> Result<BTreeMap<ReadSchemaId, DatasetSchema>, StorageError>;
 
-    /// Make `schema` the dataset's current read schema, returning its (content-deduped) id.
+    /// Make `schema` the dataset's current read schema, returning its content-deduped id.
     ///
-    /// In production the read registry has exactly ONE writer — the metadata service's admin
-    /// endpoint — and the scheduler only ever reads it; this exists so tests and the simulation
-    /// can drive promotion against either backend. Do not call it from the scheduler's own loops:
-    /// a second writer is what the read path's concurrency argument rests on not existing.
+    /// For tests and the simulation only. In production the read registry has one writer, the
+    /// metadata service; the read path's concurrency argument rests on there being no second.
     fn promote_read_schema(
         &mut self,
         dataset: &str,

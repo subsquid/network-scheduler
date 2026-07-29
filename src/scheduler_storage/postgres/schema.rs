@@ -39,16 +39,12 @@ pub(super) async fn active_schema_bundle(
     Ok(rows.into_iter().map(|(id, json)| (id, json.0)).collect())
 }
 
-/// The current read-schema *id* of each named dataset — the reference a portal assignment
-/// publishes. Driven by the exact dataset list the caller derived from its (post-eviction) chunk
-/// set, so it is total over that set by construction: a dataset with visible chunks and no read
-/// row yields `None`, which is a published answer, not an omission.
+/// Each named dataset's current read-schema id, for the portal assignment to publish. Keyed on the
+/// caller's post-eviction chunk set, so it is total over that set: a dataset with no read row yields
+/// `None`, which is an answer, not an omission.
 ///
-/// Ids only, no payload: the content travels in the bundle, built in a different transaction, so
-/// there is nothing here for the id to need atomic consistency with. That is why this can be a
-/// plain indexed lookup over a handful of rows rather than a per-dataset `EXISTS` over `chunks` —
-/// the latter costs O(chunks) per *retired* dataset, every cycle, forever, since nothing deletes
-/// `datasets` rows and no index matches the portal-visible predicate.
+/// Ids only — the content travels in the bundle, built in another transaction, so there is nothing
+/// here for the id to be atomically consistent with.
 pub(super) async fn portal_read_schema_refs(
     conn: &mut PgConnection,
     datasets: &[&str],
@@ -73,21 +69,17 @@ pub(super) async fn portal_read_schema_refs(
         .collect())
 }
 
-/// The current read schema of each named dataset, id and content together — the bundle's read
-/// section. The caller passes the datasets of the routable window it already scanned, so this is a
-/// keyed lookup over a handful of rows.
+/// The bundle's read section: id and content for each named dataset. The caller passes the datasets
+/// from the routable window it already scanned, making this a keyed lookup.
 ///
-/// Deliberately NOT a per-dataset `EXISTS` over `chunks`. A read schema is a dataset-level pointer
-/// that no chunk need be written under, so the natural predicate is "does this dataset have a live
-/// chunk" — and proving that *negative* for a retired dataset means walking every one of its chunk
-/// rows, every cycle, forever: nothing deletes `datasets` or `chunks` rows, and no index matches
-/// the routable predicate. (Contrast [`active_schema_bundle`], whose probe is per-*schema* and
-/// rides the purpose-built `chunks_schema_id` index.) Taking the answer from the cycle's own scan
-/// costs nothing and cannot drift from it.
+/// Not a per-dataset `EXISTS` over `chunks`. A read schema is a dataset-level pointer no chunk need
+/// be written under, so the predicate would be "has this dataset a live chunk" — and proving that
+/// negative for a retired dataset walks all its chunk rows, every cycle, forever, since nothing
+/// deletes `datasets` or `chunks` and no index matches the routable predicate. (Contrast
+/// [`active_schema_bundle`]: its probe is per-*schema* and rides `chunks_schema_id`.)
 ///
-/// Id and content come from one statement, so there is no resolve-then-load gap a concurrent
-/// promote could open. A promote landing either side of it costs one cycle of freshness, never
-/// resolvability.
+/// One statement, so no concurrent promote can open a resolve-then-load gap; a promote either side
+/// of it costs a cycle of freshness, never resolvability.
 pub(super) async fn read_schemas_for_datasets(
     conn: &mut PgConnection,
     datasets: &[&str],
@@ -109,18 +101,14 @@ pub(super) async fn read_schemas_for_datasets(
     Ok(rows.into_iter().map(|(id, json)| (id, json.0)).collect())
 }
 
-/// [`read_schemas_for_datasets`] over the whole routable window, for callers that have not already
-/// scanned it — the `SchedulerStorage` trait method, used by tests and by
-/// [`SchemaBundle::generate`](crate::scheduler_storage::SchemaBundle). The scheduling cycle uses
-/// the keyed form; both must select the same window.
+/// [`read_schemas_for_datasets`] over the whole routable window, for callers without one already —
+/// the trait method, used by tests. The cycle uses the keyed form; both must select the same window.
 ///
-/// Enumerating forward (metadata → chunks → read_schemas) rather than proving a per-dataset
-/// negative reads better, but measured on 50K tombstoned rows it is **not** cheaper: no index
-/// matches `applied_at_worker_assignment_id IS NOT NULL AND dropped_from_worker_assignment_at IS
-/// NULL`, so either shape seq-scans `sched_chunk_metadata` (~358 vs ~350 buffers). That is fine
-/// here because no production path calls this — the cycle passes its own dataset set and reads 2
-/// buffers — but do not reach for this form expecting it to scale. The same missing index is why
-/// `fetch_portal_visible_chunks` already scans that table every visibility cycle.
+/// Enumerating forward reads better than a per-dataset negative but measured no cheaper (~358 vs
+/// ~350 buffers on 50K tombstoned rows): no index matches the routable predicate, so either shape
+/// seq-scans `sched_chunk_metadata`. Acceptable only because no production path calls this — the
+/// cycle reads 2 buffers. The same missing index is why `fetch_portal_visible_chunks` scans that
+/// table every visibility cycle.
 pub(super) async fn active_read_schemas(
     conn: &mut PgConnection,
 ) -> Result<BTreeMap<ReadSchemaId, DatasetSchema>> {

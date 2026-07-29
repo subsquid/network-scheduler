@@ -207,10 +207,9 @@ pub(super) enum Action {
         dataset: String,
         schema: DatasetSchema,
     },
-    /// Promote `dataset`'s current READ schema — the metadata service's admin path, which in
-    /// production runs on the ingester's clock with no scheduler coordination. Unlike
-    /// [`Action::SetDatasetSchema`] (the write registry) this affects no chunk: it changes what
-    /// the bundle must carry for readers.
+    /// Promote `dataset`'s current READ schema — the ingester's admin path, on its own clock with no
+    /// scheduler coordination. Unlike [`Action::SetDatasetSchema`] (the write registry) it touches
+    /// no chunk.
     PromoteReadSchema {
         dataset: String,
         schema: DatasetSchema,
@@ -343,24 +342,19 @@ pub(super) struct SimUnderTest<D: SimStorage> {
     /// Bundle frozen with `latest_worker_assignment`; both stay frozen together across a shortage
     /// streak, so the oracle checks the assignment against the bundle it shipped with.
     latest_worker_bundle: Option<SchemaBundle>,
-    /// Read schemas as the SIM issued them: dataset → (content handed to `promote_read_schema`,
-    /// [`bundle_generation`](Self::bundle_generation) at the moment of the promote). Written only
-    /// from the sim's own action, never read back from a backend — it is the read-schema oracle's
-    /// independent reference, so subject (the published bundle) and reference (this map) cannot
-    /// agree by construction the way a storage-derived expectation would.
+    /// dataset → (content the sim promoted, [`bundle_generation`](Self::bundle_generation) then).
+    /// Written only by the sim's action, never read back from a backend — that independence is what
+    /// makes the read-schema oracle able to fail.
     model_read_schemas: BTreeMap<String, (DatasetSchema, u64)>,
-    /// Bumped every time a bundle is frozen. A promote reaches the bundle on the next successful
-    /// scheduling cycle, never instantly, so the oracle waits for a generation strictly newer than
-    /// the promote's before demanding coverage. Under a sustained shortage this never advances —
-    /// which is exactly today's contract: a frozen bundle carries no new read schema.
+    /// Bumped whenever a bundle is frozen. The oracle waits for a generation newer than a promote's
+    /// before demanding coverage; under shortage this never advances, which is the contract today.
     bundle_generation: u64,
     /// Latest published portal assignment (what a `PortalFetch` samples).
     latest_portal_assignment: Option<PortalAssignment>,
     /// Confirmation watermark at the latest portal assignment's publication — the consistency
     /// oracle's accountability bound.
     latest_portal_watermark: AssignmentId,
-    /// The publication accompanying `latest_portal_assignment`, captured in the sole setter so the
-    /// bundle, generation and promote log can never drift from the assignment they shipped with.
+    /// Captured in the sole setter, so it can't drift from the assignment it shipped with.
     latest_portal_publication: Option<observers::PortalPublication>,
     /// Per departed worker, the newest assignment that still placed it — until the routing
     /// watermark passes it, the oracles hold the worker to nothing (see
@@ -524,10 +518,9 @@ impl<D: SimStorage> SimUnderTest<D> {
         ));
     }
 
-    /// Refresh the portal observer from the current publication — the single path both the explicit
-    /// fetch action and the convergence fixed point take. `check_converged` bypasses
-    /// `do_portal_fetch`, and shortage regressions land there, so a second refresh site would leave
-    /// the captured pair stale in exactly the states the read-schema oracle targets.
+    /// The single refresh path for both the fetch action and the convergence fixed point.
+    /// `check_converged` bypasses `do_portal_fetch` and shortage regressions land there, so a second
+    /// site would leave the captured pair stale in exactly the states the oracle targets.
     fn refresh_portal_observer(&mut self) {
         let Some(assignment) = self.latest_portal_assignment.clone() else {
             return;
@@ -582,10 +575,8 @@ impl<D: SimStorage> SimUnderTest<D> {
         self.trace_step(&format!("SetDatasetSchema({dataset})"));
     }
 
-    /// Promote `dataset`'s current read schema, recording the content in `model_read_schemas` as
-    /// the oracle's reference. Deliberately does NOT run a cycle: a promote lands on the
-    /// ingester's clock, so the interleaving worth testing is one that falls between cycles — and,
-    /// during a shortage streak, one whose bundle never advances at all.
+    /// Records the content as the oracle's reference. Runs no cycle on purpose: a promote lands on
+    /// the ingester's clock, so the interleaving worth testing is one falling between cycles.
     pub(super) fn do_promote_read_schema(&mut self, dataset: &str, schema: DatasetSchema) {
         self.storage
             .promote_read_schema(dataset, schema.clone())
@@ -1187,11 +1178,8 @@ impl<D: SimStorage> SimUnderTest<D> {
         self.assert_schema_bundle_consistency();
         self.latest_portal_watermark =
             self.storage.get_worker_assignment_confirmation() as AssignmentId;
-        // Captured HERE, not at fetch time: the promote log and the bundle must be the ones in
-        // force when this assignment was published. Rebuilding the triple when a portal fetches
-        // would let a promote issued afterwards retroactively indict an assignment that predates
-        // it — the assignment would be blamed for referencing nothing, when nothing was there to
-        // reference.
+        // Captured here, not at fetch time: rebuilding it on fetch would let a later promote indict
+        // an assignment that predates it.
         self.latest_portal_publication = Some(observers::PortalPublication {
             bundle: self.latest_worker_bundle.clone(),
             generation: self.bundle_generation,
@@ -1396,19 +1384,16 @@ impl<D: SimStorage> SimUnderTest<D> {
         }
     }
 
-    /// Every read schema the portal names must resolve in the bundle it was handed with — checked
-    /// against what the portal actually holds, not against the latest published pair.
+    /// Checked against what the portal holds, not the latest published pair.
     ///
-    /// **Known gap, deliberately excused:** an `Unresolvable` whose promote landed at or after the
-    /// bundle's generation is the frozen-bundle window. `run_scheduling_cycle` returns `Shortage`
-    /// before the bundle is built, while `run_visibility_cycle` keeps publishing a freshly resolved
-    /// pointer, and nothing persists which read ids a published bundle carried — so the visibility
-    /// cycle cannot know what the frozen bundle holds. Pinned by
-    /// `portal_read_schema_outruns_the_frozen_bundle`; when the bundle is allowed to advance under
-    /// shortage this arm and that test go together.
+    /// **Known gap, excused:** an `Unresolvable` promoted at or after the bundle's generation is the
+    /// frozen-bundle window — `run_scheduling_cycle` returns `Shortage` before building a bundle
+    /// while the visibility cycle keeps publishing a fresh pointer, and nothing records which read
+    /// ids a published bundle carried. Pinned by `portal_read_schema_outruns_the_frozen_bundle`;
+    /// letting the bundle advance under shortage removes both.
     ///
-    /// Everything else is fatal, and the excused count is measured rather than silently dropped —
-    /// an excuse that starts firing broadly shows up as a statistic instead of hiding a regression.
+    /// Everything else is fatal. The excused count is measured, so an excuse that starts firing
+    /// broadly shows up as a statistic instead of hiding a regression.
     fn assert_portal_read_schema_resolution(&self) {
         let Some(publication) = self.portal_state.publication.as_ref() else {
             return;
@@ -1441,8 +1426,7 @@ impl<D: SimStorage> SimUnderTest<D> {
         }
     }
 
-    /// The unexcused verdict, for regressions that need to assert on the gap itself rather than on
-    /// the walk's stand-down. `None` before a portal has fetched anything.
+    /// The unexcused verdict, for regressions asserting on the gap itself. `None` before a fetch.
     #[cfg(test)]
     pub(super) fn portal_read_schema_faults(
         &self,

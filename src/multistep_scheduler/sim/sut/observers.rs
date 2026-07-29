@@ -122,24 +122,20 @@ pub(super) struct Portal {
     pub(super) snapshot: Option<PortalAssignment>,
     pub(super) fetched_at: Tick,
     pub(super) watermark: AssignmentId,
-    /// The publication `snapshot` was taken from — the bundle, generation and promote log as of
-    /// the same instant. Captured rather than read live, so a promote issued after this fetch can
-    /// never retroactively indict a pair that was coherent when handed over.
+    /// The publication `snapshot` came from. Captured, not read live, so a later promote can't
+    /// indict a pair that was coherent when handed over.
     pub(super) publication: Option<PortalPublication>,
 }
 
-/// Everything published alongside a portal assignment, captured at the instant of publication so a
-/// consumer-side oracle can never pair a held assignment with a bundle the portal never saw.
+/// Captured at publication, so an oracle can't pair a held assignment with a bundle never sent.
 #[derive(Debug, Clone)]
 pub(super) struct PortalPublication {
-    /// The bundle in force at publication — the one a portal holding this assignment would have to
-    /// resolve against. `None` before the first successful scheduling cycle. Under a shortage
-    /// streak this is the FROZEN bundle, which is the point rather than an artefact.
+    /// What a portal holding this assignment must resolve against; `None` before the first
+    /// successful cycle. Under shortage this is the frozen bundle — the point, not an artefact.
     pub(super) bundle: Option<SchemaBundle>,
     /// `bundle_generation` at publication.
     pub(super) generation: u64,
-    /// The sim's own promote log as of publication — written only by the sim's action, never read
-    /// back from a backend.
+    /// The sim's promote log at publication; never read back from a backend.
     pub(super) promoted: BTreeMap<String, (DatasetSchema, u64)>,
 }
 

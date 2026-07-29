@@ -146,9 +146,8 @@ pub(super) struct ActiveChunks {
     pub(super) published: FxHashMap<ChunkPk, WorkerAssignmentChunk>,
     /// schema_ids of every chunk that has entered a worker assignment and is not yet tombstoned (ADR 0002)
     pub(super) bundle_schema_ids: BTreeSet<SchemaId>,
-    /// Datasets of those same chunks — the routable window at dataset granularity. Collected here,
-    /// in the scan the cycle already performs, so the bundle's read section costs a keyed lookup
-    /// instead of a per-dataset existence proof over `chunks`.
+    /// The same chunks' datasets. Collected in this scan so the bundle's read section is a keyed
+    /// lookup rather than a per-dataset existence proof over `chunks`.
     pub(super) bundle_datasets: BTreeSet<crate::types::DatasetId>,
 }
 

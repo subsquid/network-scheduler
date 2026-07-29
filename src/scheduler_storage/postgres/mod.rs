@@ -489,17 +489,14 @@ impl SchedulerStorage for PostgresStorage {
             let mut schema_ids: BTreeSet<SchemaId> = wa.schema_ids();
             schema_ids.extend(bundle_schema_ids);
             let schema_ids: Vec<SchemaId> = schema_ids.into_iter().collect();
-            // Datasets from the same in-transaction scan the write ids came from, so the read
-            // section covers the routable window without a second pass over `chunks` — unioned with
-            // the assignment's own datasets for the same reason `schema_ids` starts from
-            // `wa.schema_ids()`: the scan runs before `apply_deltas_and_swap` stamps
-            // `applied_at_worker_assignment_id`, so a chunk placed for the FIRST time this cycle is
-            // named by the assignment while its row still reads as never-entered.
+            // Datasets from the same scan the write ids came from, unioned with the assignment's own
+            // for the reason `schema_ids` starts at `wa.schema_ids()`: the scan runs before
+            // `apply_deltas_and_swap` stamps `applied_at_worker_assignment_id`, so a chunk placed for
+            // the first time this cycle still reads as never-entered.
             let mut routable: BTreeSet<&str> = bundle_datasets.iter().map(|d| d.as_str()).collect();
             routable.extend(wa.chunks.values().map(|chunk| chunk.dataset.as_str()));
             let routable_datasets: Vec<&str> = routable.into_iter().collect();
-            // The read section carries content, not just ids: the portal validates queries against
-            // it, and it moves the BundleId so a caching client notices a promote.
+
             let bundle = SchemaBundle::from_sections(
                 scheduler_metadata::pg::schema::load_schemas(conn, Some(&schema_ids)).await?,
                 schema::read_schemas_for_datasets(conn, &routable_datasets).await?,
@@ -557,16 +554,15 @@ impl SchedulerStorage for PostgresStorage {
             phase::promote_eligible_chunks(&mut tx, new_pa_id, confirmed_up_to).await?;
             phase::drop_marked_chunks(&mut tx, new_pa_id).await?;
 
-            // The whole artifact is assembled inside the transaction: the chunk set, the eviction
-            // that trims it, its routing, and its read-schema references now share one commit. It
-            // also makes the eviction's un-promotes transactional, closing the window where a crash
-            // between the commit and the eviction left chunks promoted that the assignment dropped.
+            // Assembled inside the transaction so the chunk set, the eviction that trims it, its
+            // routing and its read references share one commit — which also makes the eviction's
+            // un-promotes transactional, closing a crash window that left chunks promoted after the
+            // assignment dropped them.
             let mut chunks = phase::fetch_portal_visible_chunks(&mut tx).await?;
             // Settle overlaps in memory over the visible set we just fetched (see
             // `evict_portal_overlaps`), keeping the assignment disjoint without a per-promotion probe.
             phase::evict_portal_overlaps(&mut tx, &mut chunks).await?;
-            // Resolved from the POST-eviction chunk set, so the reference is exactly scoped to the
-            // datasets this assignment actually names — no prune, no superset to reconcile.
+            // From the post-eviction set, so the reference needs no pruning to match what is named.
             let named: Vec<&str> = chunks
                 .values()
                 .map(|chunk| chunk.dataset.as_str())
