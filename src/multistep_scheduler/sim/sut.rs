@@ -57,7 +57,7 @@ mod churn;
 mod flood;
 mod guided;
 mod observers;
-mod placement_oracles;
+pub(super) mod placement_oracles;
 mod preconditions;
 mod trace;
 mod zero_quorum;
@@ -359,6 +359,9 @@ pub(super) struct SimUnderTest<D: SimStorage> {
     /// Confirmation watermark at the latest portal assignment's publication — the consistency
     /// oracle's accountability bound.
     latest_portal_watermark: AssignmentId,
+    /// The publication accompanying `latest_portal_assignment`, captured in the sole setter so the
+    /// bundle, generation and promote log can never drift from the assignment they shipped with.
+    latest_portal_publication: Option<observers::PortalPublication>,
     /// Per departed worker, the newest assignment that still placed it — until the routing
     /// watermark passes it, the oracles hold the worker to nothing (see
     /// [`routing_has_caught_up_with_departure`](Self::routing_has_caught_up_with_departure)).
@@ -521,14 +524,29 @@ impl<D: SimStorage> SimUnderTest<D> {
         ));
     }
 
+    /// Refresh the portal observer from the current publication — the single path both the explicit
+    /// fetch action and the convergence fixed point take. `check_converged` bypasses
+    /// `do_portal_fetch`, and shortage regressions land there, so a second refresh site would leave
+    /// the captured pair stale in exactly the states the read-schema oracle targets.
+    fn refresh_portal_observer(&mut self) {
+        let Some(assignment) = self.latest_portal_assignment.clone() else {
+            return;
+        };
+        let Some(publication) = self.latest_portal_publication.clone() else {
+            return;
+        };
+        self.portal_state.observer_assignment(
+            &assignment,
+            self.latest_portal_watermark,
+            publication,
+            self.now,
+        );
+    }
+
     /// The portal polls the latest portal assignment: success refreshes its snapshot to age zero.
     fn do_portal_fetch(&mut self, succeeds: bool) {
-        if succeeds && let Some(assignment) = self.latest_portal_assignment.clone() {
-            self.portal_state.observer_assignment(
-                &assignment,
-                self.latest_portal_watermark,
-                self.now,
-            );
+        if succeeds {
+            self.refresh_portal_observer();
         }
         self.trace_step(&format!(
             "PortalFetch({})",
@@ -973,13 +991,7 @@ impl<D: SimStorage> SimUnderTest<D> {
         }
         // Refresh the portal at the fixed point. Below a 100% quorum the designated laggards are
         // still behind, so even this fetch carries straggler-scoping obligations.
-        if let Some(portal_assignment) = self.latest_portal_assignment.clone() {
-            self.portal_state.observer_assignment(
-                &portal_assignment,
-                self.latest_portal_watermark,
-                self.now,
-            );
-        }
+        self.refresh_portal_observer();
         // Fixed-point routing liveness: the per-cycle strand check tolerates preempted-but-still-
         // routed pairs as bounded routing-lag. At a drained, shortage-free fixed point all lag has
         // resolved, so routing must match the assignment pair-by-pair — a mismatch here is a stuck
@@ -1175,6 +1187,16 @@ impl<D: SimStorage> SimUnderTest<D> {
         self.assert_schema_bundle_consistency();
         self.latest_portal_watermark =
             self.storage.get_worker_assignment_confirmation() as AssignmentId;
+        // Captured HERE, not at fetch time: the promote log and the bundle must be the ones in
+        // force when this assignment was published. Rebuilding the triple when a portal fetches
+        // would let a promote issued afterwards retroactively indict an assignment that predates
+        // it — the assignment would be blamed for referencing nothing, when nothing was there to
+        // reference.
+        self.latest_portal_publication = Some(observers::PortalPublication {
+            bundle: self.latest_worker_bundle.clone(),
+            generation: self.bundle_generation,
+            promoted: self.model_read_schemas.clone(),
+        });
         self.latest_portal_assignment = Some(assignment);
     }
 
@@ -1363,6 +1385,7 @@ impl<D: SimStorage> SimUnderTest<D> {
         ) {
             panic!("{message}");
         }
+        self.assert_portal_read_schema_resolution();
         if let Err(message) = placement_oracles::bundle_covers_promoted_read_schemas(
             bundle,
             self.latest_worker_assignment.as_ref(),
@@ -1371,6 +1394,67 @@ impl<D: SimStorage> SimUnderTest<D> {
         ) {
             panic!("{message}");
         }
+    }
+
+    /// Every read schema the portal names must resolve in the bundle it was handed with — checked
+    /// against what the portal actually holds, not against the latest published pair.
+    ///
+    /// **Known gap, deliberately excused:** an `Unresolvable` whose promote landed at or after the
+    /// bundle's generation is the frozen-bundle window. `run_scheduling_cycle` returns `Shortage`
+    /// before the bundle is built, while `run_visibility_cycle` keeps publishing a freshly resolved
+    /// pointer, and nothing persists which read ids a published bundle carried — so the visibility
+    /// cycle cannot know what the frozen bundle holds. Pinned by
+    /// `portal_read_schema_outruns_the_frozen_bundle`; when the bundle is allowed to advance under
+    /// shortage this arm and that test go together.
+    ///
+    /// Everything else is fatal, and the excused count is measured rather than silently dropped —
+    /// an excuse that starts firing broadly shows up as a statistic instead of hiding a regression.
+    fn assert_portal_read_schema_resolution(&self) {
+        let Some(publication) = self.portal_state.publication.as_ref() else {
+            return;
+        };
+        let (Some(portal), Some(bundle)) = (
+            self.portal_state.snapshot.as_ref(),
+            publication.bundle.as_ref(),
+        ) else {
+            return;
+        };
+        let faults =
+            placement_oracles::portal_read_schemas_resolve(portal, bundle, &publication.promoted);
+        let (excused, fatal): (Vec<_>, Vec<_>) = faults.into_iter().partition(|fault| {
+            matches!(
+                fault,
+                placement_oracles::ReadSchemaFault::Unresolvable { promoted_at, .. }
+                    if publication.generation <= *promoted_at
+            )
+        });
+        statistics::measure(
+            "schema: read refs excused by frozen bundle",
+            excused.len() as f64,
+        );
+        statistics::classify(
+            !fatal.is_empty(),
+            "schema: portal read reference unresolvable (fatal)",
+        );
+        if let Some(fault) = fatal.first() {
+            panic!("{fault}");
+        }
+    }
+
+    /// The unexcused verdict, for regressions that need to assert on the gap itself rather than on
+    /// the walk's stand-down. `None` before a portal has fetched anything.
+    #[cfg(test)]
+    pub(super) fn portal_read_schema_faults(
+        &self,
+    ) -> Option<Vec<placement_oracles::ReadSchemaFault>> {
+        let publication = self.portal_state.publication.as_ref()?;
+        let portal = self.portal_state.snapshot.as_ref()?;
+        let bundle = publication.bundle.as_ref()?;
+        Some(placement_oracles::portal_read_schemas_resolve(
+            portal,
+            bundle,
+            &publication.promoted,
+        ))
     }
 
     // ---- Observation layer (fleet + portal) -------------------------------------------------
@@ -1833,6 +1917,7 @@ impl<D: SimStorage> SimUnderTest<D> {
             bundle_generation: 0,
             latest_portal_assignment: None,
             latest_portal_watermark: 0,
+            latest_portal_publication: None,
             placed_until_departure: BTreeMap::new(),
             confirm_threshold_pct: config.confirm_threshold_pct,
             converge_checked: false,

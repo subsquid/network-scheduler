@@ -130,6 +130,31 @@ pub struct PortalAssignment {
     pub chunk_workers: BTreeMap<ChunkPk, Vec<WorkerPk>>,
     pub chunks: BTreeMap<ChunkPk, WorkerAssignmentChunk>,
     pub workers: BTreeMap<WorkerPk, AssignmentWorker>,
+    /// Per-dataset READ-schema reference: the id a portal validates this dataset's queries under.
+    /// Ids only — the payload travels in the [`SchemaBundle`], and a portal resolves it with
+    /// `bundle.get_read(id)`.
+    ///
+    /// **Total over the datasets `chunks` names, and no wider.** A dataset enters with its first
+    /// portal-visible chunk and leaves with its last, so this retires on the same clock as the
+    /// chunk set; keying it off the `datasets` registry instead would grow forever, since nothing
+    /// deletes a dataset row.
+    ///
+    /// `None` = never promoted. That is the seeded state of every dataset the scheduler creates
+    /// (`insert_new_datasets` writes no read pointer), so it is an honest published state — and
+    /// deliberately distinct from a *missing key*, which would be a resolution failure rather than
+    /// an answer.
+    pub read_schemas: BTreeMap<DatasetId, Option<ReadSchemaId>>,
+}
+
+impl PortalAssignment {
+    /// The datasets this assignment names, derived from its chunk set — the exact scope
+    /// `read_schemas` is total over.
+    pub(crate) fn named_datasets(&self) -> BTreeSet<DatasetId> {
+        self.chunks
+            .values()
+            .map(|chunk| chunk.dataset.clone())
+            .collect()
+    }
 }
 
 /// Storage backend for the MVCC scheduler lifecycle.

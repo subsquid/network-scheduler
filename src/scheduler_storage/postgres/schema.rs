@@ -39,6 +39,40 @@ pub(super) async fn active_schema_bundle(
     Ok(rows.into_iter().map(|(id, json)| (id, json.0)).collect())
 }
 
+/// The current read-schema *id* of each named dataset — the reference a portal assignment
+/// publishes. Driven by the exact dataset list the caller derived from its (post-eviction) chunk
+/// set, so it is total over that set by construction: a dataset with visible chunks and no read
+/// row yields `None`, which is a published answer, not an omission.
+///
+/// Ids only, no payload: the content travels in the bundle, built in a different transaction, so
+/// there is nothing here for the id to need atomic consistency with. That is why this can be a
+/// plain indexed lookup over a handful of rows rather than a per-dataset `EXISTS` over `chunks` —
+/// the latter costs O(chunks) per *retired* dataset, every cycle, forever, since nothing deletes
+/// `datasets` rows and no index matches the portal-visible predicate.
+pub(super) async fn portal_read_schema_refs(
+    conn: &mut PgConnection,
+    datasets: &[&str],
+) -> Result<BTreeMap<crate::types::DatasetId, Option<ReadSchemaId>>> {
+    let mut timer = crate::metrics::PhaseTimer::new("portal_read_schema_refs");
+    if datasets.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    let rows: Vec<(String, Option<ReadSchemaId>)> = sqlx::query_as(
+        "SELECT d.name, r.id FROM datasets d \
+         LEFT JOIN read_schemas r ON r.dataset_id = d.id AND r.superseded_at IS NULL \
+         WHERE d.name = ANY($1)",
+    )
+    .bind(datasets)
+    .fetch_all(conn)
+    .await
+    .context("portal_read_schema_refs")?;
+    timer.stmt(rows.len() as u64);
+    Ok(rows
+        .into_iter()
+        .map(|(name, id)| (std::sync::Arc::new(name), id))
+        .collect())
+}
+
 /// The current read schema of every dataset with a chunk in the same routable window
 /// [`active_schema_bundle`] uses. Scoping to that window (rather than to every row in `datasets`)
 /// is what lets the read section shrink: a decommissioned dataset drops out once its last chunk is

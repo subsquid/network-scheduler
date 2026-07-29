@@ -27,7 +27,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use crate::scheduler_storage::test_harness::inspect::Snapshot;
 use crate::scheduler_storage::{
-    ChunkPk, PortalAssignment, SchemaBundle, Tick, WorkerAssignment, WorkerPk,
+    ChunkPk, PortalAssignment, ReadSchemaId, SchemaBundle, Tick, WorkerAssignment, WorkerPk,
 };
 use crate::types::DatasetSchema;
 
@@ -283,6 +283,151 @@ pub(super) fn bundle_covers_promoted_read_schemas(
     Ok(())
 }
 
+/// Why a portal's read-schema reference is incoherent with the bundle it was published with. A
+/// typed verdict rather than a string, so a regression can pin the exact fault without asserting on
+/// message text or on a backend-assigned id.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ReadSchemaFault {
+    /// A dataset the chunk set names has no reference entry at all — a resolution omission. Ids are
+    /// never reused, so a reference that could not be produced must be visible, never answered by
+    /// silence.
+    Unscoped { dataset: String },
+    /// An entry for a dataset no chunk names — the reference failed to retire.
+    Orphaned { dataset: String },
+    /// The sim promoted for this dataset before publication, yet the reference is `None`.
+    MissingReference { dataset: String, promoted_at: u64 },
+    /// The reference names an id for a dataset the sim never promoted for.
+    Fabricated { dataset: String, id: ReadSchemaId },
+    /// The reference names an id the paired bundle cannot resolve. **This is the frozen-bundle
+    /// gap**: the visibility cycle published a fresh pointer against a bundle that never advanced.
+    Unresolvable {
+        dataset: String,
+        id: ReadSchemaId,
+        promoted_at: u64,
+    },
+    /// The id resolves, but to content the sim never promoted for this dataset — a wrong-dataset or
+    /// wrong-section attribution that presence alone cannot see.
+    ContentMismatch { dataset: String, id: ReadSchemaId },
+}
+
+impl std::fmt::Display for ReadSchemaFault {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unscoped { dataset } => write!(
+                f,
+                "dataset {dataset} has portal-visible chunks but no read-schema reference — the \
+                    backend omitted it instead of publishing an explicit `None`"
+            ),
+            Self::Orphaned { dataset } => write!(
+                f,
+                "dataset {dataset} has a read-schema reference but no chunk in the assignment — \
+                    the reference failed to retire with its last visible chunk"
+            ),
+            Self::MissingReference {
+                dataset,
+                promoted_at,
+            } => write!(
+                f,
+                "dataset {dataset} had a read schema promoted (at bundle generation \
+                    {promoted_at}) but the portal assignment references none"
+            ),
+            Self::Fabricated { dataset, id } => write!(
+                f,
+                "portal references read schema {id} for dataset {dataset}, which never had one \
+                    promoted"
+            ),
+            Self::Unresolvable {
+                dataset,
+                id,
+                promoted_at,
+            } => write!(
+                f,
+                "portal references read schema {id} for dataset {dataset} (promoted at bundle \
+                    generation {promoted_at}) but the bundle published with that assignment cannot \
+                    resolve it — the portal names a schema it cannot read"
+            ),
+            Self::ContentMismatch { dataset, id } => write!(
+                f,
+                "read schema {id} resolves in the bundle, but to content never promoted for \
+                    dataset {dataset}"
+            ),
+        }
+    }
+}
+
+/// CONSUMER-SIDE read-schema resolvability: every read schema the PORTAL names must resolve in the
+/// bundle the portal was handed alongside it.
+///
+/// Subject is the assignment a portal actually holds; the reference is the bundle captured at that
+/// same publication plus the sim's own promote log. The bundle comes from `run_scheduling_cycle`,
+/// the reference map from `run_visibility_cycle`, and the promote log is never read back from a
+/// backend — so unlike [`schema_bundle_consistency`], which draws subject and invariant from the
+/// same chunk pins, this cannot pass by one query agreeing with itself.
+///
+/// Returns **every** fault, never just the first: the caller partitions them into fatal and
+/// gap-excused, and a single early return would let one excused fault mask a real one behind it.
+///
+/// Resolution is checked BY ID, not by content: read ids are allocated per `(dataset, content)`, so
+/// with a small canned schema pool a content-only check would be satisfied by any dataset's entry.
+/// Content is then checked separately, to catch a right-shaped id resolving to the wrong schema.
+///
+/// No age stand-down. Resolvability is not availability (ADR 0002 — a chunk may sit at zero copies
+/// yet stay fully resolvable), and a captured pair is self-consistent at any age; copying
+/// `portal_consistency`'s `age >= M_TICKS` gate would silence the target case outright, since a
+/// shortage streak advances the clock by `M_TICKS` per drain.
+pub(super) fn portal_read_schemas_resolve(
+    portal: &PortalAssignment,
+    bundle: &SchemaBundle,
+    promoted: &BTreeMap<String, (DatasetSchema, u64)>,
+) -> Vec<ReadSchemaFault> {
+    let mut faults = Vec::new();
+    let named = portal.named_datasets();
+    for dataset in &named {
+        if !portal.read_schemas.contains_key(dataset) {
+            faults.push(ReadSchemaFault::Unscoped {
+                dataset: dataset.to_string(),
+            });
+        }
+    }
+    for dataset in portal.read_schemas.keys() {
+        if !named.contains(dataset) {
+            faults.push(ReadSchemaFault::Orphaned {
+                dataset: dataset.to_string(),
+            });
+        }
+    }
+    for (dataset, reference) in &portal.read_schemas {
+        let logged = promoted.get(dataset.as_str());
+        match (reference, logged) {
+            // Never promoted, nothing referenced — the seeded state of every dataset.
+            (None, None) => {}
+            (None, Some((_, promoted_at))) => faults.push(ReadSchemaFault::MissingReference {
+                dataset: dataset.to_string(),
+                promoted_at: *promoted_at,
+            }),
+            (Some(id), None) => faults.push(ReadSchemaFault::Fabricated {
+                dataset: dataset.to_string(),
+                id: *id,
+            }),
+            (Some(id), Some((content, promoted_at))) => match bundle.get_read(*id) {
+                None => faults.push(ReadSchemaFault::Unresolvable {
+                    dataset: dataset.to_string(),
+                    id: *id,
+                    promoted_at: *promoted_at,
+                }),
+                Some(resolved) if resolved != content => {
+                    faults.push(ReadSchemaFault::ContentMismatch {
+                        dataset: dataset.to_string(),
+                        id: *id,
+                    })
+                }
+                Some(_) => {}
+            },
+        }
+    }
+    faults
+}
+
 /// A converged-floor violation: the under-replicated chunk (for the failure dump) and the message.
 pub(super) struct FloorViolation {
     pub(super) chunk: usize,
@@ -524,6 +669,7 @@ mod tests {
                 .collect(),
             chunks: BTreeMap::new(),
             workers: BTreeMap::new(),
+            read_schemas: BTreeMap::new(),
         }
     }
 

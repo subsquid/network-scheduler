@@ -547,22 +547,34 @@ impl SchedulerStorage for PostgresStorage {
             phase::promote_eligible_chunks(&mut tx, new_pa_id, confirmed_up_to).await?;
             phase::drop_marked_chunks(&mut tx, new_pa_id).await?;
 
-            tx.commit().await.context("run_visibility_cycle: commit")?;
-
-            let mut chunks = phase::fetch_portal_visible_chunks(conn).await?;
+            // The whole artifact is assembled inside the transaction: the chunk set, the eviction
+            // that trims it, its routing, and its read-schema references now share one commit. It
+            // also makes the eviction's un-promotes transactional, closing the window where a crash
+            // between the commit and the eviction left chunks promoted that the assignment dropped.
+            let mut chunks = phase::fetch_portal_visible_chunks(&mut tx).await?;
             // Settle overlaps in memory over the visible set we just fetched (see
             // `evict_portal_overlaps`), keeping the assignment disjoint without a per-promotion probe.
-            // The eviction's un-promotes are written back before the routing fetch, so its
-            // server-side visibility predicate sees the same set as `chunks`.
-            phase::evict_portal_overlaps(conn, &mut chunks).await?;
-            let chunk_workers = phase::fetch_confirmed_routing(conn).await?;
-            let workers = phase::fetch_portal_workers(conn).await?;
+            phase::evict_portal_overlaps(&mut tx, &mut chunks).await?;
+            // Resolved from the POST-eviction chunk set, so the reference is exactly scoped to the
+            // datasets this assignment actually names — no prune, no superset to reconcile.
+            let named: Vec<&str> = chunks
+                .values()
+                .map(|chunk| chunk.dataset.as_str())
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect();
+            let read_schemas = schema::portal_read_schema_refs(&mut tx, &named).await?;
+            let chunk_workers = phase::fetch_confirmed_routing(&mut tx).await?;
+            let workers = phase::fetch_portal_workers(&mut tx).await?;
+
+            tx.commit().await.context("run_visibility_cycle: commit")?;
 
             Ok::<_, StorageError>(phase::assemble_portal_assignment(
                 new_pa_id,
                 chunks,
                 chunk_workers,
                 workers,
+                read_schemas,
             ))
         })
     }

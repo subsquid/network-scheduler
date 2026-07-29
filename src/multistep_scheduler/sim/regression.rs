@@ -2,6 +2,7 @@
 //! carry their own key/size/weight/dataset, so each sequence replays deterministically with no
 //! seed. The replay *is* the assertion: it panics iff the property is violated.
 
+use super::sut::placement_oracles::ReadSchemaFault;
 use super::sut::{Action, ConvergenceCheck, NewChunk, SimConfig, SimUnderTest};
 use super::utils::{
     CHUNK_SIZE, NEVER_GC_TICKS, SCHEMA_POOL, WORKER_CAPACITY, blocks_for_key, mint_key, new_chunk,
@@ -1415,5 +1416,104 @@ fn churn_knife_edge_false_shortage_is_excused() {
             ]),
             Action::CheckConverged(ConvergenceCheck::FloorLocallyFeasible),
         ],
+    );
+}
+
+/// A read schema promoted during a shortage streak is named by the portal assignment while the
+/// bundle stays frozen from the last successful scheduling cycle — so the portal names an id its own
+/// bundle cannot resolve. `run_scheduling_cycle` returns `Shortage` before the bundle is built,
+/// while `run_visibility_cycle` keeps publishing a freshly resolved pointer, and nothing persists
+/// which read ids a published bundle carried, so the visibility cycle cannot know what the frozen
+/// bundle holds. The walk oracle stands this case down; these two tests pin it in place.
+///
+/// `floor` is the whole polarity switch. 3 over 2 workers is unsatisfiable — `min_replication` is
+/// not clamped to the worker count, and `Placement::ensure_minimum`'s tag loop refuses a worker that
+/// already holds the chunk — so every later cycle shortages and the bundle freezes. Floor 2 is a
+/// no-op retune whose cycle succeeds, so the bundle advances past the promote. Same actions
+/// otherwise, which is what proves the failure comes from the freeze and not from a broken resolver.
+fn portal_read_schema_case(floor: u16) -> (SimConfig, Vec<Action>) {
+    let config = SimConfig {
+        worker_count: 2,
+        min_replication: 2,
+        ..base_config()
+    };
+    // Key 11: not a multiple of 20, so it gets its own block window rather than the shared
+    // collision window that registration rejects.
+    let chunk = new_chunk((mint_key(11), CHUNK_SIZE, 1, "s3://sim-1".to_string()));
+    let actions = vec![
+        // Generation 1: the chunk is placed on both workers.
+        Action::AddChunks(vec![chunk]),
+        // 100% quorum: both workers must poll before the watermark advances, and nothing becomes
+        // portal-visible without it — otherwise the assignment names no dataset and the oracle is
+        // vacuous.
+        Action::WorkerFetchAssignment {
+            worker: 0,
+            succeeds: true,
+        },
+        Action::WorkerFetchAssignment {
+            worker: 1,
+            succeeds: true,
+        },
+        // Promoted at generation 1, running no cycle — a promote lands on the ingester's clock.
+        // SCHEMA_POOL[1] rather than [0]: [0] is `DatasetSchema::default()`, byte-identical to the
+        // write schema every dataset is seeded with, so promoting it would read as a no-op.
+        Action::PromoteReadSchema {
+            dataset: "s3://sim-1".into(),
+            schema: SCHEMA_POOL[1].clone(),
+        },
+        // Generation 2: schedules fine, so this bundle is built after the promote and carries the
+        // new read id; the visibility pass promotes the chunk, so the portal now names sim-1.
+        Action::AdvanceClock(1),
+        // In-fixture positive control: this pair is coherent AND enforced (generation 2 > promoted
+        // at 1), so a refactor that neuters the oracle fails here first.
+        Action::PortalFetchAssignment { succeeds: true },
+        // `do_set_min_replication` runs the cycle itself.
+        Action::SetMinReplication(floor),
+        // SCHEMA_POOL[0] has never been in this dataset's READ registry (the seed touched only the
+        // write registry), so the id genuinely moves — re-promoting the same content would be
+        // id-stable on both backends and the test would pass vacuously.
+        Action::PromoteReadSchema {
+            dataset: "s3://sim-1".into(),
+            schema: SCHEMA_POOL[0].clone(),
+        },
+        // Under floor 3 this shortages again, but the visibility pass still publishes — with the
+        // FRESH pointer. Under floor 2 the cycle succeeds and the bundle picks the promote up.
+        Action::AdvanceClock(1),
+        Action::PortalFetchAssignment { succeeds: true },
+    ];
+    (config, actions)
+}
+
+/// The pinned gap: `replay` passes because the walk oracle stands down on a frozen bundle, and the
+/// unexcused verdict then reports the incoherence this case exists to hold in place. When the bundle
+/// is allowed to advance under shortage, this assertion flips to an empty fault list and the
+/// stand-down arm in `assert_portal_read_schema_resolution` goes with it.
+#[test]
+fn portal_read_schema_outruns_the_frozen_bundle() {
+    let (config, actions) = portal_read_schema_case(3);
+    let sut = replay(&config, actions);
+    let faults = sut.portal_read_schema_faults().expect("portal has fetched");
+    assert!(
+        matches!(
+            faults.as_slice(),
+            [ReadSchemaFault::Unresolvable { dataset, .. }] if dataset == "s3://sim-1"
+        ),
+        "expected exactly one Unresolvable fault for s3://sim-1 — a widening of the gap must fail \
+         this test rather than be absorbed by it. got {faults:?}",
+    );
+}
+
+/// Positive control on the same actions with a satisfiable floor: the cycle after the promote
+/// succeeds, its bundle carries the new read id, and the reference resolves. Without it the pinned
+/// gap above would also pass if resolution were broken outright. `replay` is itself an assertion
+/// here — at generation 3 > promoted-at 2 the walk oracle is enforcing, so a broken reference panics
+/// inside `check_invariants` before the explicit check runs.
+#[test]
+fn portal_read_schema_resolves_after_a_successful_cycle() {
+    let (config, actions) = portal_read_schema_case(2);
+    let sut = replay(&config, actions);
+    assert_eq!(
+        sut.portal_read_schema_faults().expect("portal has fetched"),
+        vec![],
     );
 }

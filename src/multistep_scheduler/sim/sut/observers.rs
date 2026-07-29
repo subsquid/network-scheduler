@@ -6,8 +6,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::scheduler_storage::{
-    AssignmentId, ChunkPk, PortalAssignment, Tick, WorkerAssignment, WorkerPk,
+    AssignmentId, ChunkPk, PortalAssignment, SchemaBundle, Tick, WorkerAssignment, WorkerPk,
 };
+use crate::types::DatasetSchema;
 
 /// One worker's observed local state.
 #[derive(Debug, Default)]
@@ -121,6 +122,25 @@ pub(super) struct Portal {
     pub(super) snapshot: Option<PortalAssignment>,
     pub(super) fetched_at: Tick,
     pub(super) watermark: AssignmentId,
+    /// The publication `snapshot` was taken from — the bundle, generation and promote log as of
+    /// the same instant. Captured rather than read live, so a promote issued after this fetch can
+    /// never retroactively indict a pair that was coherent when handed over.
+    pub(super) publication: Option<PortalPublication>,
+}
+
+/// Everything published alongside a portal assignment, captured at the instant of publication so a
+/// consumer-side oracle can never pair a held assignment with a bundle the portal never saw.
+#[derive(Debug, Clone)]
+pub(super) struct PortalPublication {
+    /// The bundle in force at publication — the one a portal holding this assignment would have to
+    /// resolve against. `None` before the first successful scheduling cycle. Under a shortage
+    /// streak this is the FROZEN bundle, which is the point rather than an artefact.
+    pub(super) bundle: Option<SchemaBundle>,
+    /// `bundle_generation` at publication.
+    pub(super) generation: u64,
+    /// The sim's own promote log as of publication — written only by the sim's action, never read
+    /// back from a backend.
+    pub(super) promoted: BTreeMap<String, (DatasetSchema, u64)>,
 }
 
 impl Portal {
@@ -130,11 +150,13 @@ impl Portal {
         &mut self,
         assignment: &PortalAssignment,
         watermark: AssignmentId,
+        publication: PortalPublication,
         now: Tick,
     ) {
         self.snapshot = Some(assignment.clone());
         self.fetched_at = now;
         self.watermark = watermark;
+        self.publication = Some(publication);
     }
 }
 
@@ -255,8 +277,18 @@ mod tests {
             chunk_workers: BTreeMap::new(),
             chunks: BTreeMap::new(),
             workers: BTreeMap::new(),
+            read_schemas: BTreeMap::new(),
         };
-        portal.observer_assignment(&pa, 2, 12);
+        portal.observer_assignment(
+            &pa,
+            2,
+            PortalPublication {
+                bundle: None,
+                generation: 0,
+                promoted: BTreeMap::new(),
+            },
+            12,
+        );
         assert_eq!(portal.fetched_at, 12);
         assert_eq!(portal.watermark, 2);
         assert_eq!(portal.snapshot_age(20), 8);

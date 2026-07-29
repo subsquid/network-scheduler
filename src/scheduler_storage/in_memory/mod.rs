@@ -1234,11 +1234,26 @@ impl SchedulerStorage for InMemoryStorage {
 
         let workers = self.assignment_workers();
 
+        // Exactly the datasets the (post-eviction) chunk set names, each mapped to its current
+        // read pointer — `None` where none was ever promoted, which is the seeded state. Same rule
+        // as the Postgres `portal_read_schema_refs`, derived from the same post-eviction set.
+        let read_schemas: BTreeMap<crate::types::DatasetId, Option<ReadSchemaId>> = portal_chunks
+            .values()
+            .map(|chunk| chunk.dataset.clone())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .map(|dataset| {
+                let current = self.current_read_schema.get(dataset.as_str()).copied();
+                (dataset, current)
+            })
+            .collect();
+
         Ok(PortalAssignment {
             id: portal_assignment_id as AssignmentId,
             chunk_workers,
             chunks: portal_chunks,
             workers,
+            read_schemas,
         })
     }
 

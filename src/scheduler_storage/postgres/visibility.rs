@@ -1,7 +1,7 @@
 //! Phase helpers for [`PostgresStorage::run_visibility_cycle`] and
 //! [`PostgresStorage::confirm_worker_assignment`].
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use anyhow::{Context, Result};
 use sqlx::postgres::PgConnection;
@@ -462,11 +462,23 @@ pub(super) fn assemble_portal_assignment(
     chunks: BTreeMap<ChunkPk, WorkerAssignmentChunk>,
     chunk_workers: BTreeMap<ChunkPk, Vec<WorkerPk>>,
     workers: BTreeMap<WorkerPk, AssignmentWorker>,
+    read_schemas: BTreeMap<crate::types::DatasetId, Option<crate::scheduler_storage::ReadSchemaId>>,
 ) -> PortalAssignment {
-    PortalAssignment {
+    let assignment = PortalAssignment {
         id,
         chunk_workers,
         chunks,
         workers,
-    }
+        read_schemas,
+    };
+    debug_assert_eq!(
+        assignment
+            .read_schemas
+            .keys()
+            .cloned()
+            .collect::<BTreeSet<_>>(),
+        assignment.named_datasets(),
+        "read_schemas must be exactly the datasets the chunk set names",
+    );
+    assignment
 }
