@@ -499,7 +499,7 @@ impl SchedulerStorage for PostgresStorage {
 
             let bundle = SchemaBundle::from_sections(
                 scheduler_metadata::pg::schema::load_schemas(conn, Some(&schema_ids)).await?,
-                schema::read_schemas_for_datasets(conn, &routable_datasets).await?,
+                schema::read_schemas_by_id(conn, &routable_datasets).await?,
             );
             Ok::<_, StorageError>((wa, bundle))
         })
@@ -569,7 +569,7 @@ impl SchedulerStorage for PostgresStorage {
                 .collect::<BTreeSet<_>>()
                 .into_iter()
                 .collect();
-            let read_schemas = schema::portal_read_schema_refs(&mut tx, &named).await?;
+            let read_schemas = schema::read_schema_ids_by_dataset(&mut tx, &named).await?;
             let chunk_workers = phase::fetch_confirmed_routing(&mut tx).await?;
             let workers = phase::fetch_portal_workers(&mut tx).await?;
 

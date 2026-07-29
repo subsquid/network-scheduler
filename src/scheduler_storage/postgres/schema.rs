@@ -39,17 +39,20 @@ pub(super) async fn active_schema_bundle(
     Ok(rows.into_iter().map(|(id, json)| (id, json.0)).collect())
 }
 
-/// Each named dataset's current read-schema id, for the portal assignment to publish. Keyed on the
-/// caller's post-eviction chunk set, so it is total over that set: a dataset with no read row yields
-/// `None`, which is an answer, not an omission.
+/// Each named dataset's current read-schema id, for the portal assignment to publish.
+///
+/// Driven from `datasets` with a LEFT JOIN, so the result is TOTAL over the named set: a dataset
+/// with no read row yields `None`. That is what makes "never promoted" publishable and distinct from
+/// a key the backend failed to produce. Compare [`read_schemas_by_id`], which inner-joins because a
+/// dataset without a read schema has no payload to carry.
 ///
 /// Ids only — the content travels in the bundle, built in another transaction, so there is nothing
 /// here for the id to be atomically consistent with.
-pub(super) async fn portal_read_schema_refs(
+pub(super) async fn read_schema_ids_by_dataset(
     conn: &mut PgConnection,
     datasets: &[&str],
 ) -> Result<BTreeMap<crate::types::DatasetId, Option<ReadSchemaId>>> {
-    let mut timer = crate::metrics::PhaseTimer::new("portal_read_schema_refs");
+    let mut timer = crate::metrics::PhaseTimer::new("read_schema_ids_by_dataset");
     if datasets.is_empty() {
         return Ok(BTreeMap::new());
     }
@@ -61,7 +64,7 @@ pub(super) async fn portal_read_schema_refs(
     .bind(datasets)
     .fetch_all(conn)
     .await
-    .context("portal_read_schema_refs")?;
+    .context("read_schema_ids_by_dataset")?;
     timer.stmt(rows.len() as u64);
     Ok(rows
         .into_iter()
@@ -69,8 +72,11 @@ pub(super) async fn portal_read_schema_refs(
         .collect())
 }
 
-/// The bundle's read section: id and content for each named dataset. The caller passes the datasets
-/// from the routable window it already scanned, making this a keyed lookup.
+/// The bundle's read section: payloads keyed by id, for the named datasets. The caller passes the
+/// routable window it already scanned, making this a keyed lookup.
+///
+/// Inner join, unlike [`read_schema_ids_by_dataset`]: a dataset with no read schema contributes no
+/// payload, and the bundle is keyed by id, so there is no slot for an absent one.
 ///
 /// Not a per-dataset `EXISTS` over `chunks`. A read schema is a dataset-level pointer no chunk need
 /// be written under, so the predicate would be "has this dataset a live chunk" — and proving that
@@ -80,11 +86,11 @@ pub(super) async fn portal_read_schema_refs(
 ///
 /// One statement, so no concurrent promote can open a resolve-then-load gap; a promote either side
 /// of it costs a cycle of freshness, never resolvability.
-pub(super) async fn read_schemas_for_datasets(
+pub(super) async fn read_schemas_by_id(
     conn: &mut PgConnection,
     datasets: &[&str],
 ) -> Result<BTreeMap<ReadSchemaId, DatasetSchema>> {
-    let mut timer = crate::metrics::PhaseTimer::new("read_schemas_for_datasets");
+    let mut timer = crate::metrics::PhaseTimer::new("read_schemas_by_id");
     if datasets.is_empty() {
         return Ok(BTreeMap::new());
     }
@@ -96,12 +102,12 @@ pub(super) async fn read_schemas_for_datasets(
     .bind(datasets)
     .fetch_all(conn)
     .await
-    .context("read_schemas_for_datasets")?;
+    .context("read_schemas_by_id")?;
     timer.stmt(rows.len() as u64);
     Ok(rows.into_iter().map(|(id, json)| (id, json.0)).collect())
 }
 
-/// [`read_schemas_for_datasets`] over the whole routable window, for callers without one already —
+/// [`read_schemas_by_id`] over the whole routable window, for callers without one already —
 /// the trait method, used by tests. The cycle uses the keyed form; both must select the same window.
 ///
 /// Enumerating forward reads better than a per-dataset negative but measured no cheaper (~358 vs

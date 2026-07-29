@@ -1231,7 +1231,7 @@ impl SchedulerStorage for InMemoryStorage {
         let workers = self.assignment_workers();
 
         // The post-eviction chunk set's datasets, each with its current read pointer. Same rule as
-        // Postgres' `portal_read_schema_refs`.
+        // Postgres' `read_schema_ids_by_dataset`.
         let read_schemas: BTreeMap<crate::types::DatasetId, Option<ReadSchemaId>> = portal_chunks
             .values()
             .map(|chunk| chunk.dataset.clone())
