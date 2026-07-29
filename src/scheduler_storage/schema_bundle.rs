@@ -172,43 +172,24 @@ impl SchemaBundle {
 
 /// Both variants must reach the caller rather than degrade to a shorter file list: a worker acts on
 /// that list, and a missing file reads as legitimate absence, not as an error.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum ChunkFilesError {
     /// Pinned schema absent from the bundle — the state ADR 0002 exists to prevent.
+    #[error("chunk pins schema {schema_id}, absent from the bundle — no file set can be derived")]
     SchemaMissing { schema_id: SchemaId },
     /// Bitmap length ≠ the pinned schema's table count. Reached by re-pinning a chunk without
     /// recomputing the bitmap: bits shift onto the wrong tables, and positions past the end read as
     /// "absent".
+    #[error(
+        "tables_present has {bitmap_len} bits but pinned schema {schema_id} has {tables} tables — \
+         the bitmap indexes a different table list"
+    )]
     BitmapArity {
         schema_id: SchemaId,
         bitmap_len: usize,
         tables: usize,
     },
 }
-
-impl std::fmt::Display for ChunkFilesError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::SchemaMissing { schema_id } => write!(
-                f,
-                "chunk pins schema {schema_id}, which is absent from the bundle — its file set \
-                 cannot be derived"
-            ),
-            Self::BitmapArity {
-                schema_id,
-                bitmap_len,
-                tables,
-            } => write!(
-                f,
-                "chunk's tables_present has {bitmap_len} bits but pinned schema {schema_id} has \
-                 {tables} tables — the bitmap was resolved against a different schema, so its bits \
-                 index the wrong tables"
-            ),
-        }
-    }
-}
-
-impl std::error::Error for ChunkFilesError {}
 
 /// `None` = every table present. It records no schema, so it can't be arity-checked: re-pinning a
 /// NULL-bitmap chunk to a superset schema would claim files it lacks. A re-pin must therefore

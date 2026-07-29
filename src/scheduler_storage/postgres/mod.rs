@@ -481,26 +481,8 @@ impl SchedulerStorage for PostgresStorage {
             )
             .await?;
 
-            // Bundle covers the assignment's chunks (ideal ∪ stale) plus every chunk in its
-            // routable window — entered a worker assignment, not yet tombstoned — so a chunk the
-            // latest assignment dropped but an earlier confirmed entry still routes to keeps its
-            // schema (ADR 0002). Only the content load hits the DB, and schema content is
-            // immutable per id, so the by-id read is safe under concurrent writers.
-            let mut schema_ids: BTreeSet<SchemaId> = wa.schema_ids();
-            schema_ids.extend(bundle_schema_ids);
-            let schema_ids: Vec<SchemaId> = schema_ids.into_iter().collect();
-            // Datasets from the same scan the write ids came from, unioned with the assignment's own
-            // for the reason `schema_ids` starts at `wa.schema_ids()`: the scan runs before
-            // `apply_deltas_and_swap` stamps `applied_at_worker_assignment_id`, so a chunk placed for
-            // the first time this cycle still reads as never-entered.
-            let mut routable: BTreeSet<&str> = bundle_datasets.iter().map(|d| d.as_str()).collect();
-            routable.extend(wa.chunks.values().map(|chunk| chunk.dataset.as_str()));
-            let routable_datasets: Vec<&str> = routable.into_iter().collect();
-
-            let bundle = SchemaBundle::from_sections(
-                scheduler_metadata::pg::schema::load_schemas(conn, Some(&schema_ids)).await?,
-                schema::read_schemas_by_id(conn, &routable_datasets).await?,
-            );
+            let bundle =
+                schema::build_bundle(conn, &wa, bundle_schema_ids, &bundle_datasets).await?;
             Ok::<_, StorageError>((wa, bundle))
         })
     }

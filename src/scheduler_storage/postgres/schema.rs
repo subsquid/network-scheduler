@@ -1,13 +1,13 @@
 //! Scheduler-side schema probe over `sched_chunk_metadata`: which read schemas are still in play.
 //! Joins a scheduler-owned table, so it lives here rather than in `scheduler-metadata`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::{Context, Result};
 use sqlx::postgres::PgConnection;
 
-use crate::scheduler_storage::{ReadSchemaId, SchemaId};
-use crate::types::DatasetSchema;
+use crate::scheduler_storage::{ReadSchemaId, SchemaBundle, SchemaId, WorkerAssignment};
+use crate::types::{DatasetId, DatasetSchema};
 
 /// Schemas of chunks placed on a worker at some point and not yet tombstoned. Portal-served chunks
 /// are already covered: portal promotion requires prior worker placement, and tombstoning requires
@@ -132,4 +132,41 @@ pub(super) async fn active_read_schemas(
     .context("active_read_schemas")?;
     timer.stmt(rows.len() as u64);
     Ok(rows.into_iter().map(|(id, json)| (id, json.0)).collect())
+}
+
+/// The bundle to freeze with `assignment`: write schemas for every chunk in its routable window, and
+/// the current read schema of every dataset there.
+///
+/// `scanned_*` are what the cycle's own chunk scan saw. Both are unioned with the assignment's own
+/// chunks, because the scan runs before `apply_deltas_and_swap` stamps
+/// `applied_at_worker_assignment_id` — a chunk placed for the first time this cycle is named by the
+/// assignment while its row still reads as never-entered.
+///
+/// The window is deliberately wider than "currently held": a chunk the latest assignment dropped can
+/// still be routed off an earlier confirmed entry, so its schema must stay resolvable (ADR 0002).
+/// Only content loads hit the DB here, and content is immutable per id, so reading it after the
+/// cycle's commit is safe under concurrent writers.
+pub(super) async fn build_bundle(
+    conn: &mut PgConnection,
+    assignment: &WorkerAssignment,
+    scanned_schema_ids: BTreeSet<SchemaId>,
+    scanned_datasets: &BTreeSet<DatasetId>,
+) -> Result<SchemaBundle> {
+    let mut schema_ids = scanned_schema_ids;
+    schema_ids.extend(assignment.schema_ids());
+    let schema_ids: Vec<SchemaId> = schema_ids.into_iter().collect();
+
+    let mut datasets: BTreeSet<&str> = scanned_datasets.iter().map(|d| d.as_str()).collect();
+    datasets.extend(
+        assignment
+            .chunks
+            .values()
+            .map(|chunk| chunk.dataset.as_str()),
+    );
+    let datasets: Vec<&str> = datasets.into_iter().collect();
+
+    Ok(SchemaBundle::from_sections(
+        scheduler_metadata::pg::schema::load_schemas(conn, Some(&schema_ids)).await?,
+        read_schemas_by_id(conn, &datasets).await?,
+    ))
 }
