@@ -144,18 +144,60 @@ fn shared(pgdata: PgData) -> &'static Shared {
     })
 }
 
-/// Execute one statement on a fresh admin connection. Used only for
-/// `CREATE DATABASE`, which cannot run inside a transaction/pool.
+/// Execute one statement on a fresh admin connection. Used only for `CREATE`/`DROP DATABASE`,
+/// which cannot run inside a transaction/pool.
 async fn admin_exec(admin_url: &str, sql: &str) {
+    admin_try_exec(admin_url, sql)
+        .await
+        .unwrap_or_else(|err| panic!("{err:#}"));
+}
+
+/// [`admin_exec`] for callers that must not panic — see [`CaseDb::drop`].
+async fn admin_try_exec(admin_url: &str, sql: &str) -> anyhow::Result<()> {
+    use anyhow::Context;
     use sqlx::Connection;
     let mut conn = sqlx::PgConnection::connect(admin_url)
         .await
-        .expect("admin connect");
-    // In-crate admin DDL (CREATE DATABASE), never user input — hence `AssertSqlSafe`.
+        .context("admin connect")?;
+    // In-crate admin DDL, never user input — hence `AssertSqlSafe`.
     sqlx::query(sqlx::AssertSqlSafe(sql))
         .execute(&mut conn)
         .await
-        .expect("admin exec");
+        .with_context(|| format!("admin exec: {sql}"))?;
+    Ok(())
+}
+
+/// A case's database, dropped when this guard is — so PGDATA holds the cases running at once, not
+/// every case the process has run.
+///
+/// Without it the suite passed ~130 databases and filled the test tmpfs mid-run. That surfaces
+/// nowhere near its cause: the WAL write that hit `ENOSPC` panicked a backend, crash recovery
+/// could not write WAL either, and the cluster went down — every case after it failed on connect,
+/// none of them for a reason of its own.
+///
+/// Not `Clone`: a second guard would let the first drop pull the database out from under a case
+/// still using it.
+pub struct CaseDb {
+    name: String,
+}
+
+impl Drop for CaseDb {
+    fn drop(&mut self) {
+        // `explain` mode leaves the container up for post-mortem; keep the case's data too.
+        if explain::enabled() {
+            return;
+        }
+        let Some(shared) = SHARED.get() else { return };
+        // FORCE: the case's connections close as its values drop, and sqlx closes a socket without
+        // waiting for the backend to go — Postgres refuses to drop a database that still has one.
+        let sql = format!("DROP DATABASE IF EXISTS {} WITH (FORCE)", self.name);
+        // A failing case is already unwinding, and panicking in a `Drop` during unwind aborts the
+        // process — that would replace the real failure with an abort. Report and move on; the
+        // container's exit reclaims the space regardless.
+        if let Err(err) = shared.rt.block_on(admin_try_exec(&shared.admin_url, &sql)) {
+            eprintln!("pg_harness: could not drop {}: {err:#}", self.name);
+        }
+    }
 }
 
 /// `url` with its database segment swapped to `db`. Assumes a
@@ -165,29 +207,34 @@ fn url_with_db(url: &str, db: &str) -> String {
     format!("{base}/{db}")
 }
 
-/// A fresh database cloned from the migrated template, on the default test backing. `prefix`+`id`
-/// must be unique within the process (a duplicate `CREATE DATABASE` panics).
+/// A fresh database cloned from the migrated template, on the default test backing, dropped with
+/// the returned storage. `prefix`+`id` must be unique within the process (a duplicate
+/// `CREATE DATABASE` panics).
 #[cfg(test)]
 pub(crate) fn fresh_db(prefix: &str, id: u64) -> PostgresStorage {
     fresh_db_with(TEST_PGDATA, prefix, id)
 }
 
-/// Create a fresh migrated database on `pgdata` (cloned from the template) and return its URL,
-/// without connecting. The one place the `CREATE DATABASE … TEMPLATE` step lives.
-fn fresh_db_url_with(pgdata: PgData, prefix: &str, id: u64) -> String {
+/// Create a fresh migrated database on `pgdata` (cloned from the template) and return its URL and
+/// its [`CaseDb`], without connecting. The one place the `CREATE DATABASE … TEMPLATE` step lives.
+fn fresh_db_url_with(pgdata: PgData, prefix: &str, id: u64) -> (String, CaseDb) {
     let s = shared(pgdata);
     let name = format!("{prefix}_{id}");
     s.rt.block_on(admin_exec(
         &s.admin_url,
         &format!("CREATE DATABASE {name} TEMPLATE {}", s.template),
     ));
-    url_with_db(&s.admin_url, &name)
+    (url_with_db(&s.admin_url, &name), CaseDb { name })
 }
 
 /// URL of a fresh migrated database on the default test backing, without connecting or taking the
-/// scheduler session lock — for tests that need several raw connections to one database.
+/// scheduler session lock — for tests that need several raw connections to one database. The
+/// database lives until the returned [`CaseDb`] drops, so hold it for as long as the URL is used.
+///
+/// A plain `String` rather than a guard that derefs to one: these tests clone the URL into spawned
+/// writers, and a guard cloned alongside it would drop the database while they are still on it.
 #[cfg(test)]
-pub(crate) fn fresh_db_url(prefix: &str, id: u64) -> String {
+pub(crate) fn fresh_db_url(prefix: &str, id: u64) -> (String, CaseDb) {
     fresh_db_url_with(TEST_PGDATA, prefix, id)
 }
 
@@ -195,7 +242,10 @@ pub(crate) fn fresh_db_url(prefix: &str, id: u64) -> String {
 /// the mainnet-scale reshuffle-sim passes [`PgData::Disk`]. The first call in a process fixes the
 /// backing for the shared container; later calls reuse it.
 pub fn fresh_db_with(pgdata: PgData, prefix: &str, id: u64) -> PostgresStorage {
-    PostgresStorage::connect(&fresh_db_url_with(pgdata, prefix, id)).expect("connect fresh db")
+    let (url, db) = fresh_db_url_with(pgdata, prefix, id);
+    PostgresStorage::connect(&url)
+        .expect("connect fresh db")
+        .owning(db)
 }
 
 #[cfg(test)]

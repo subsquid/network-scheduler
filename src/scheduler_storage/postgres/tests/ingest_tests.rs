@@ -18,7 +18,7 @@ use scheduler_metadata::{
 
 use crate::scheduler_storage::SchedulerStorage;
 use crate::scheduler_storage::postgres::PostgresStorage;
-use crate::scheduler_storage::test_harness::pg_harness::fresh_db_url;
+use crate::scheduler_storage::test_harness::pg_harness::{CaseDb, fresh_db_url};
 
 // --- inputs -----------------------------------------------------------------------------------
 
@@ -67,16 +67,18 @@ struct IngestHarness {
     url: String,
     rt: tokio::runtime::Runtime,
     ing: PgIngest,
+    /// Declared last so the database outlives `ing`'s pool.
+    _db: CaseDb,
 }
 
 impl IngestHarness {
     fn new(name: &str) -> Self {
-        let url = fresh_db_url(name, super::TEST_ID.fetch_add(1, Ordering::Relaxed));
+        let (url, _db) = fresh_db_url(name, super::TEST_ID.fetch_add(1, Ordering::Relaxed));
         let rt = current_rt();
         let ing = rt
             .block_on(PgIngest::connect(&url))
             .expect("connect PgIngest");
-        Self { url, rt, ing }
+        Self { url, rt, ing, _db }
     }
 
     fn block<F: Future>(&self, f: F) -> F::Output {
@@ -1138,7 +1140,7 @@ fn concurrent_writers_on_one_dataset_serialize() {
 /// is_serialization_failure only matches 40001, not the 23505 this race raises.
 #[test]
 fn first_ever_promote_race_is_conflict_not_500() {
-    let url = fresh_db_url(
+    let (url, _db) = fresh_db_url(
         "ingest_first_promote_race",
         super::TEST_ID.fetch_add(1, Ordering::Relaxed),
     );
