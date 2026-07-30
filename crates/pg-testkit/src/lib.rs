@@ -6,8 +6,8 @@
 //! process, so each gets its own container.
 //!
 //! A crate and not a feature of `scheduler-metadata`: Cargo unifies features across workspace
-//! members built together, so a feature there would put a docker client in `metadata-service`, which
-//! ships as an image. Nothing can unify a crate on.
+//! members built together, so a feature there put a docker client in the dependency graph of every
+//! crate depending on it — `metadata-service` included. Nothing can unify a crate on.
 //!
 //! It migrates its template with this workspace's `MIGRATOR`, so it is this project's harness, not a
 //! general-purpose one.

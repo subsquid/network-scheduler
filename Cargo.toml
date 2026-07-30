@@ -42,7 +42,6 @@ parking_lot = "0.12.3"
 parquet = "54.2"
 prometheus-client = { workspace = true }
 scheduler-metadata = { path = "crates/scheduler-metadata", optional = true }
-# Hands the harness to reshuffle-sim, which starts its own Postgres when given no --database-url.
 pg-testkit = { path = "crates/pg-testkit", optional = true }
 rand = "0.9.1"
 rayon = "1.10.0"
@@ -67,8 +66,6 @@ rustc-hash = "2"
 [dev-dependencies]
 claims = "0.8"
 maplit = "1.0.2"
-# The crate's own tests get the harness here rather than through the `pg-testkit` feature, which
-# exists only to hand it to downstream crates.
 pg-testkit = { path = "crates/pg-testkit" }
 # The iterative state-machine runner — whose generator can read the live SUT — lives in
 # `proptest-state-machine::iterative_runner`. Pinned to the HEAD of define-null/proptest's
