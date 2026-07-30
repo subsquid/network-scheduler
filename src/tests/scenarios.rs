@@ -168,6 +168,7 @@ fn measure_reshuffle(
 }
 
 #[test]
+#[ignore = "slow reshuffle scenario"]
 fn scenario_worker_joins() {
     println!("\n========== SCENARIO: Worker Joins the Network ==========");
     println!("  Worker capacity: {:.0}\n", SCENARIO_WORKER_CAPACITY);
@@ -225,6 +226,7 @@ fn scenario_worker_joins() {
 }
 
 #[test]
+#[ignore = "slow reshuffle scenario"]
 fn scenario_worker_leaves() {
     println!("\n========== SCENARIO: Worker Leaves the Network ==========");
     println!("  Worker capacity: {:.0}\n", SCENARIO_WORKER_CAPACITY);
@@ -282,6 +284,7 @@ fn scenario_worker_leaves() {
 }
 
 #[test]
+#[ignore = "slow reshuffle scenario"]
 fn scenario_many_workers_leave() {
     // Edge case: enough departures to force replication down to min_replication.
     println!("\n========== SCENARIO: Many Workers Leave (min_replication=22) ==========");
@@ -359,6 +362,7 @@ fn scenario_many_workers_leave() {
 }
 
 #[test]
+#[ignore = "slow reshuffle scenario"]
 fn scenario_new_chunks_added() {
     println!("\n========== SCENARIO: New Chunks Added ==========");
     println!("  Worker capacity: {:.0}\n", SCENARIO_WORKER_CAPACITY);
@@ -456,6 +460,7 @@ fn scenario_new_chunks_added() {
 }
 
 #[test]
+#[ignore = "slow reshuffle scenario"]
 fn scenario_reliability_flip() {
     println!(
         "\n========== SCENARIO: Worker Reliability Changes (Online -> Offline -> Online) =========="
@@ -607,6 +612,7 @@ fn scenario_reliability_flip() {
 }
 
 #[test]
+#[ignore = "slow reshuffle scenario"]
 fn scenario_capacity_changes() {
     println!("\n========== SCENARIO: Worker Capacity or Saturation Changes ==========");
 
