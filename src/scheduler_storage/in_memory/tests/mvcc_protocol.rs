@@ -535,7 +535,7 @@ fn schema_bundle_retains_removing_chunk_until_tombstone() {
 }
 
 /// ADR 0002: a portal-visible chunk that loses its last holder (departure) keeps its schema in the
-/// frozen bundle, even though it falls out of ideal ∪ stale — so portals can still resolve it.
+/// bundle, even though it falls out of ideal ∪ stale — so portals can still resolve it.
 #[test]
 fn schema_bundle_covers_holderless_portal_visible_chunk() {
     let Setup {
@@ -571,7 +571,7 @@ fn schema_bundle_covers_holderless_portal_visible_chunk() {
         .unwrap();
 
     // Next cycle places nothing (no active workers) -> chunk is holderless (ideal={}, stale={}),
-    // still portal_visible. The frozen bundle must still carry its schema.
+    // still portal_visible. The bundle must still carry its schema.
     let wa2 = storage
         .run_scheduling_cycle(
             &StaticSchedulingAlgorithm {

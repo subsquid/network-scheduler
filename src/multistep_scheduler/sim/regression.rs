@@ -1,10 +1,8 @@
 //! Deterministic action sequences, each pinning one scheduler property. Chunks carry their own
 //! key/size/weight/dataset, so a sequence replays with no seed.
 //!
-//! Most cases are **captured**: shrunk (or delta-debugged) from a walk that actually failed, and the
-//! replay *is* the assertion — it panics iff the property is violated. A few are **hand-built**;
-//! those say so, and say why, and may assert by probing the SUT after the replay instead. Check
-//! which kind a case is before treating it as evidence that proptest found something.
+//! Every case is captured: shrunk (or delta-debugged) from a walk that actually failed, and the
+//! replay *is* the assertion — it panics iff the property is violated.
 
 use super::sut::{Action, ConvergenceCheck, NewChunk, SimConfig, SimUnderTest};
 use super::utils::{
@@ -1426,7 +1424,7 @@ fn churn_knife_edge_false_shortage_is_excused() {
 /// to use it. Captured from `in_memory::churn_simulation` (proptest-shrunk) when the bundle still
 /// froze with the assignment under a shortage; the strict oracle now enforces the fix during
 /// `replay`. The shortage is real capacity pressure, not a floor above the worker count.
-fn portal_read_schema_frozen_bundle_case() -> (SimConfig, Vec<Action>) {
+fn portal_read_schema_under_shortage_case() -> (SimConfig, Vec<Action>) {
     let config = SimConfig {
         worker_count: 4,
         min_replication: 4,
@@ -1453,13 +1451,13 @@ fn portal_read_schema_frozen_bundle_case() -> (SimConfig, Vec<Action>) {
 
 #[test]
 fn portal_read_schema_resolves_under_shortage() {
-    let (config, actions) = portal_read_schema_frozen_bundle_case();
+    let (config, actions) = portal_read_schema_under_shortage_case();
     replay(&config, actions);
 }
 
 /// Postgres twin: the same case on the real backend, keeping the shortage-round bundle at parity.
 #[test]
 fn portal_read_schema_resolves_under_shortage_pg() {
-    let (config, actions) = portal_read_schema_frozen_bundle_case();
+    let (config, actions) = portal_read_schema_under_shortage_case();
     replay_pg(&config, actions);
 }

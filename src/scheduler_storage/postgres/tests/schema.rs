@@ -154,11 +154,10 @@ fn chunk_tables_present_is_returned_with_schema_id() {
     );
 }
 
-/// `active_schema_bundle` (the DB predicate) holds exactly the in-play schemas: a worker-held
-/// (then portal-served) chunk's schema is included, an unplaced chunk's is excluded, and the id is
-/// content-addressed over that set.
+/// The bundle holds exactly the in-play schemas: a worker-held (then portal-served) chunk's schema
+/// is included, an unplaced chunk's is excluded, and the id is content-addressed over that set.
 #[test]
-fn active_schema_bundle_holds_only_in_play_schemas() {
+fn bundle_holds_only_in_play_schemas() {
     let mut storage = fresh_storage("active_bundle");
     storage
         .insert_new_datasets(vec![

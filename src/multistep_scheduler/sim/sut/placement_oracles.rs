@@ -201,9 +201,9 @@ pub(super) fn routing_matches_assignment_at_fixed_point(
     Ok(())
 }
 
-/// Every chunk a published assignment names must resolve under the [`SchemaBundle`] frozen with
-/// that worker assignment: the chunk's pinned `schema_id` must be in the bundle, or a worker/portal
-/// couldn't derive its file set. Either assignment may be absent (nothing published yet).
+/// Every chunk a published assignment names must resolve under the [`SchemaBundle`] published with
+/// it: the chunk's pinned `schema_id` must be in the bundle, or a worker/portal couldn't derive its
+/// file set. Either assignment may be absent (nothing published yet).
 pub(super) fn schema_bundle_consistency(
     bundle: &SchemaBundle,
     worker_assignment: Option<&WorkerAssignment>,
@@ -218,9 +218,8 @@ pub(super) fn schema_bundle_consistency(
         for (chunk_pk, chunk) in chunks {
             if !bundle.contains(chunk.schema_id) {
                 return Err(format!(
-                    "{label} names chunk {chunk_pk:?} with schema {}, absent from the schema \
-                     bundle frozen with the worker assignment — a worker or portal couldn't \
-                     resolve this chunk's file set",
+                    "{label} names chunk {chunk_pk:?} with schema {}, absent from the published \
+                     schema bundle — a worker or portal couldn't resolve this chunk's file set",
                     chunk.schema_id,
                 ));
             }

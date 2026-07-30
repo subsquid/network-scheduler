@@ -77,8 +77,8 @@ CREATE INDEX IF NOT EXISTS chunks_dataset_range_gist ON chunks USING gist (
     int8range(first_block, first_block + last_block_delta, '[]')
 );
 
--- Drives active_schema_bundle's per-schema "does any live chunk still use this schema?" probe.
--- chunk_pk is included so the nested-loop scan stays index-only.
+-- Drives the per-schema "does any live chunk still use this schema?" probe (LIVE_CHUNK_EXISTS,
+-- the `active` flag of list_write_schemas). chunk_pk is included so the scan stays index-only.
 CREATE INDEX IF NOT EXISTS chunks_schema_id ON chunks (schema_id, chunk_pk);
 
 -- Drives head()'s resume-point probe. Within a dataset, admitted chunks are non-overlapping with
