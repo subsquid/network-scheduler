@@ -69,7 +69,7 @@ fn concurrent_multi_dataset_inserts_do_not_deadlock() {
         }
     }
 
-    let url = fresh_db_url(
+    let (url, _db) = fresh_db_url(
         "lock_deadlock",
         super::TEST_ID.fetch_add(1, Ordering::Relaxed),
     );

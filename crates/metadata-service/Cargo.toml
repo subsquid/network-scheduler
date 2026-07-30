@@ -34,6 +34,5 @@ sha2 = "0.10"
 tower-http = { version = "0.6", features = ["timeout"] }
 
 [dev-dependencies]
-testcontainers = { version = "0.27.2", features = ["watchdog"] }
-testcontainers-modules = { version = "0.15", features = ["postgres"] }
+pg-testkit = { path = "../pg-testkit" }
 tower = { version = "0.5", features = ["util"] }   # ServiceExt::oneshot

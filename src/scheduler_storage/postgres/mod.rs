@@ -8,8 +8,8 @@
 //! `m_ticks`/`gc_ticks` are raw tick counts used in integer arithmetic.
 
 mod admission;
+mod auto_explain;
 mod debug;
-pub mod explain;
 mod nonoverlap;
 mod rows;
 mod scheduling_cycle;
@@ -55,6 +55,10 @@ pub struct PostgresStorage {
     rt: tokio::runtime::Runtime,
     conn: std::cell::RefCell<PgConnection>,
     batch_size: usize,
+    /// Declared last so it drops after `conn`: the harness can only drop a database once this
+    /// storage's connection to it is gone.
+    #[cfg(any(test, feature = "pg-testkit"))]
+    case_db: Option<pg_testkit::CaseDb>,
 }
 
 impl PostgresStorage {
@@ -97,7 +101,16 @@ impl PostgresStorage {
             rt,
             conn: std::cell::RefCell::new(conn),
             batch_size: DEFAULT_BATCH_SIZE,
+            #[cfg(any(test, feature = "pg-testkit"))]
+            case_db: None,
         })
+    }
+
+    /// Tie a harness database to this storage, so the case's database goes when the storage does.
+    #[cfg(any(test, feature = "pg-testkit"))]
+    pub(crate) fn owning(mut self, db: pg_testkit::CaseDb) -> Self {
+        self.case_db = Some(db);
+        self
     }
 
     /// Run pending sqlx migrations. Call once on startup before the scheduling loop.

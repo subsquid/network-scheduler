@@ -1192,18 +1192,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 
 [[package]]
-name = "clear-block-hash"
-version = "0.0.1"
-dependencies = [
- "anyhow",
- "clap",
- "flate2",
- "libp2p-identity",
- "network-scheduler",
- "sqd-assignments 0.1.0 (git+https://github.com/subsquid/sqd-network.git?rev=fa19681)",
-]
-
-[[package]]
 name = "clickhouse"
 version = "0.13.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2909,6 +2897,7 @@ dependencies = [
  "bytesize",
  "clap",
  "humantime",
+ "pg-testkit",
  "prometheus-client",
  "scheduler-metadata",
  "secrecy",
@@ -2918,8 +2907,6 @@ dependencies = [
  "sha2 0.10.9",
  "sqlx",
  "subtle",
- "testcontainers",
- "testcontainers-modules",
  "thiserror 2.0.18",
  "tokio",
  "tower",
@@ -3008,7 +2995,6 @@ dependencies = [
  "clap",
  "clickhouse",
  "dotenv",
- "dtor",
  "flatbuffers 25.12.19",
  "flate2",
  "futures",
@@ -3020,6 +3006,7 @@ dependencies = [
  "multihash",
  "parking_lot",
  "parquet",
+ "pg-testkit",
  "prometheus-client",
  "proptest",
  "proptest-state-machine",
@@ -3039,8 +3026,6 @@ dependencies = [
  "sqd-messages",
  "sqlx",
  "tempfile",
- "testcontainers",
- "testcontainers-modules",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -3384,6 +3369,19 @@ checksum = "b4c5cc86750666a3ed20bdaf5ca2a0344f9c67674cae0515bec2da16fbaa47db"
 dependencies = [
  "fixedbitset",
  "indexmap 2.14.0",
+]
+
+[[package]]
+name = "pg-testkit"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "dtor",
+ "scheduler-metadata",
+ "sqlx",
+ "testcontainers",
+ "testcontainers-modules",
+ "tokio",
 ]
 
 [[package]]
