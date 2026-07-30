@@ -456,11 +456,9 @@ impl SchedulerStorage for PostgresStorage {
             phase::write_future_ideal(&mut tx, &ideal_mappings, batch_size).await?;
             phase::apply_deltas_and_swap(&mut tx, new_wa_id, &evicted).await?;
 
-            // The write-schema ids this round's bundle covers: the routable window from the scan,
-            // plus the new ideal's chunks — the scan ran before this cycle stamped first-placed
-            // chunks, so they must be added from the in-memory mapping (same reason the old
-            // in-cycle bundle unioned `wa.schema_ids()`). Committed atomically with the
-            // assignment; a shortage returns before this point, freezing the previous set.
+            // The round's bundle write ids: the scanned window plus the new ideal's chunks — the
+            // scan ran before this cycle stamped first-placed chunks, so those come from the
+            // in-memory mapping.
             let published_schema_ids: Vec<SchemaId> =
                 {
                     let mut ids = bundle_schema_ids;

@@ -80,18 +80,14 @@ pub(super) async fn read_schemas_by_id(
 }
 
 /// The generator: one bundle from committed rows alone, identical under success, shortage, and on
-/// a fresh process. Write section: the routable window (ADR 0002) ∪ the persisted set of the last
-/// successful assignment — the window alone can shrink below what the frozen published assignment
-/// still names, since Phase A keeps tombstoning during a shortage. Read section: the CURRENT read
-/// schema of every dataset either side references, so a promote always reaches the next bundle.
+/// a fresh process. Write section: the routable window ∪ the persisted set of the last successful
+/// assignment (the window alone can shrink below what the frozen assignment names — Phase A keeps
+/// tombstoning during a shortage). Read section: the CURRENT read schema of every dataset either
+/// side references, so a promote always reaches the next bundle.
 ///
-/// One `REPEATABLE READ, READ ONLY` transaction: both sections and the persisted set are read from
-/// a single snapshot, so a cycle or promote landing concurrently (the WIP service branch runs this
-/// from a different loop than the scheduler's) cannot skew them against each other.
-///
-/// Loads are strict: a window or persisted id whose `schemas` row is missing is an error, not an
-/// omission — under the soft-then-hard-delete policy a silent shrink here would republish a bundle
-/// that quietly dropped a schema consumers still resolve.
+/// One `REPEATABLE READ, READ ONLY` transaction: everything is read from a single snapshot, so a
+/// concurrent cycle or promote cannot skew the sections against each other. Loads are strict — a
+/// referenced id whose `schemas` row is missing is an error, never a silent shrink.
 pub(super) async fn generate_bundle(conn: &mut PgConnection) -> Result<SchemaBundle> {
     let _timer = crate::metrics::Timer::new("generate_schema_bundle");
     let mut tx = conn.begin().await.context("generate_bundle: begin")?;
@@ -100,32 +96,34 @@ pub(super) async fn generate_bundle(conn: &mut PgConnection) -> Result<SchemaBun
         .await
         .context("generate_bundle: set isolation")?;
 
-    // Window: distinct (schema id, dataset name) over chunks that entered a worker assignment and
-    // are not yet tombstoned.
-    let window: Vec<(SchemaId, String)> = sqlx::query_as(
-        "SELECT DISTINCT c.schema_id, d.name          FROM sched_chunk_metadata m          JOIN chunks c ON c.chunk_pk = m.chunk_pk          JOIN datasets d ON d.id = c.dataset_id          WHERE m.applied_at_worker_assignment_id IS NOT NULL            AND m.dropped_from_worker_assignment_at IS NULL",
+    // (schema id, dataset name) over the window ∪ the persisted set. The persisted arm resolves
+    // its dataset through the schema row — `chunks_schema_same_dataset` makes that the chunk's own
+    // dataset.
+    let refs: Vec<(SchemaId, String)> = sqlx::query_as(
+        "SELECT DISTINCT c.schema_id, d.name \
+         FROM sched_chunk_metadata m \
+         JOIN chunks c ON c.chunk_pk = m.chunk_pk \
+         JOIN datasets d ON d.id = c.dataset_id \
+         WHERE m.applied_at_worker_assignment_id IS NOT NULL \
+           AND m.dropped_from_worker_assignment_at IS NULL \
+         UNION \
+         SELECT w.schema_id, d.name \
+         FROM sched_worker_assignment_schemas w \
+         JOIN schemas s ON s.id = w.schema_id \
+         JOIN datasets d ON d.id = s.dataset_id",
     )
     .fetch_all(&mut *tx)
     .await
-    .context("generate_bundle: window")?;
+    .context("generate_bundle: collect refs")?;
 
-    // Persisted set of the last successful assignment; datasets via the schema's own dataset (the
-    // `chunks_schema_same_dataset` FK makes that exactly the chunk's dataset).
-    let persisted: Vec<(SchemaId, String)> = sqlx::query_as(
-        "SELECT w.schema_id, d.name          FROM sched_worker_assignment_schemas w          JOIN schemas s ON s.id = w.schema_id          JOIN datasets d ON d.id = s.dataset_id",
-    )
-    .fetch_all(&mut *tx)
-    .await
-    .context("generate_bundle: persisted set")?;
-
-    let mut schema_ids: BTreeSet<SchemaId> = BTreeSet::new();
-    let mut datasets: BTreeSet<String> = BTreeSet::new();
-    for (id, dataset) in window.into_iter().chain(persisted) {
-        schema_ids.insert(id);
-        datasets.insert(dataset);
-    }
-    let schema_ids: Vec<SchemaId> = schema_ids.into_iter().collect();
-    let dataset_refs: Vec<&str> = datasets.iter().map(String::as_str).collect();
+    let schema_ids: Vec<SchemaId> = refs
+        .iter()
+        .map(|(id, _)| *id)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let datasets: BTreeSet<&str> = refs.iter().map(|(_, d)| d.as_str()).collect();
+    let dataset_refs: Vec<&str> = datasets.into_iter().collect();
 
     let schemas = scheduler_metadata::pg::schema::load_schemas(&mut tx, Some(&schema_ids)).await?;
     let missing: Vec<SchemaId> = schema_ids

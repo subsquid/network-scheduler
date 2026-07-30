@@ -80,8 +80,7 @@ pub async fn run(
             )
             .context("run multistep scheduling cycle")?
     };
-    // Exercises the production bundle path even though nothing publishes it yet; the BundleId is
-    // the value a caching consumer would key on.
+    // Nothing publishes the bundle yet; generating it exercises the production path.
     let bundle = storage
         .generate_schema_bundle()
         .context("generate schema bundle")?;

@@ -61,10 +61,10 @@ pub(super) async fn open_worker_assignment(
     Ok(id)
 }
 
-/// Replace `sched_worker_assignment_schemas` with `schema_ids` — the write-schema ids the round's
-/// bundle covers, computed in Rust from data the cycle already holds (never derived server-side
-/// from the placement tables; that would scan millions of rows for a few hundred ids). Runs in the
-/// cycle's transaction, so a shortage freezes the previous set by never reaching this write.
+/// Replace `sched_worker_assignment_schemas` with `schema_ids`, computed in Rust from data the
+/// cycle already holds — deriving them server-side from the placement tables would scan millions
+/// of rows for a few hundred ids. In the cycle's transaction, so a shortage freezes the previous
+/// set by never reaching this write.
 pub(super) async fn persist_assignment_schemas(
     tx: &mut Transaction<'_, Postgres>,
     schema_ids: &[SchemaId],

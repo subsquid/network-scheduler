@@ -133,12 +133,10 @@ CREATE TABLE IF NOT EXISTS sched_chunk_metadata (
     dropped_from_worker_assignment_at BIGINT
 );
 
--- Write-schema ids covered by the bundle of the last SUCCESSFUL scheduling cycle, written in the
--- same transaction that commits the assignment (a shortage rolls back before the write, freezing
--- the set with the assignment it describes). Read by generate_schema_bundle so a bundle built
--- during a shortage still covers everything the frozen published assignment names. A few hundred
--- rows, replaced wholesale each success — never derived from the placement tables. The FK also
--- blocks a future hard-delete of a schema row the published assignment still references.
+-- Write-schema ids of the last successful cycle's bundle, replaced wholesale in the transaction
+-- that commits the assignment — a shortage never reaches the write, freezing the set with the
+-- assignment it describes. Keeps a shortage-round bundle covering the frozen published assignment;
+-- the FK also blocks hard-deleting a schema row that assignment still references.
 CREATE TABLE IF NOT EXISTS sched_worker_assignment_schemas (
     schema_id INTEGER PRIMARY KEY REFERENCES schemas(id)
 );

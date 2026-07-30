@@ -678,15 +678,12 @@ impl InMemoryStorage {
             .collect();
     }
 
-    /// Datasets with a chunk in the routable window — the scoping `active_schema_bundle` applies to
-    /// write schemas, so the read section shrinks on the same clock.
-    fn datasets_in_routable_window(&self) -> BTreeSet<Dataset> {
+    /// Chunks in the routable window: entered a worker assignment, not yet tombstoned (ADR 0002).
+    fn routable_window_chunks(&self) -> impl Iterator<Item = &WorkerAssignmentChunk> {
         self.sched_chunk_metadata
             .iter()
             .filter(|(_, meta)| meta.entered_worker_assignment() && !meta.tombstoned())
             .filter_map(|(pk, _)| self.chunks.get(pk))
-            .map(|chunk| (*chunk.dataset).clone())
-            .collect()
     }
 
     /// Register `dataset`'s write schema and return its id, reusing the id of previously seen
@@ -819,21 +816,16 @@ impl SchedulerStorage for InMemoryStorage {
     }
 
     fn generate_schema_bundle(&self) -> Result<SchemaBundle, StorageError> {
-        // Write section: routable window ∪ the persisted set of the last successful assignment —
-        // the postgres `generate_bundle` semantics verbatim. A persisted id missing from `schemas`
-        // is an error, never a silent shrink.
+        // Write section: routable window ∪ persisted set (postgres `generate_bundle` verbatim).
         let mut ids: BTreeSet<SchemaId> = self.worker_assignment_schemas.clone();
-        for (pk, meta) in &self.sched_chunk_metadata {
-            if meta.entered_worker_assignment()
-                && !meta.tombstoned()
-                && let Some(chunk) = self.chunks.get(pk)
-            {
-                ids.insert(chunk.schema_id);
-            }
+        let mut datasets: BTreeSet<Dataset> = BTreeSet::new();
+        for chunk in self.routable_window_chunks() {
+            ids.insert(chunk.schema_id);
+            datasets.insert((*chunk.dataset).clone());
         }
         let mut schemas: BTreeMap<SchemaId, DatasetSchema> = BTreeMap::new();
-        let mut datasets: BTreeSet<Dataset> = self.datasets_in_routable_window();
         for id in ids {
+            // A referenced id missing from `schemas` is an error, never a silent shrink.
             let schema = self.schemas.get(&id).ok_or_else(|| {
                 StorageError::Database(anyhow::anyhow!(
                     "generate_schema_bundle: schemas map is missing referenced id {id}"
@@ -844,7 +836,7 @@ impl SchedulerStorage for InMemoryStorage {
                 datasets.insert(dataset.clone());
             }
         }
-        // Read section: the CURRENT pointer of every referenced dataset — promotes always land.
+        // Read section: the CURRENT pointer of every referenced dataset.
         let read_schemas: BTreeMap<ReadSchemaId, DatasetSchema> = datasets
             .into_iter()
             .filter_map(|dataset| self.current_read_schema.get(&dataset).copied())
@@ -1136,17 +1128,11 @@ impl SchedulerStorage for InMemoryStorage {
             }
         }
 
-        // Persist the round's bundle write ids — routable window ∪ this assignment — atomically
-        // with the assignment (mirrors `sched_worker_assignment_schemas`; a shortage returned
-        // earlier, leaving the previous set frozen).
+        // Persist the round's bundle write ids (window ∪ this assignment), atomically with the
+        // assignment; a shortage returned earlier, leaving the previous set frozen.
         let mut schema_ids: BTreeSet<SchemaId> =
             assignment.chunks.values().map(|c| c.schema_id).collect();
-        schema_ids.extend(
-            self.sched_chunk_metadata
-                .iter()
-                .filter(|(_, meta)| meta.entered_worker_assignment() && !meta.tombstoned())
-                .filter_map(|(pk, _)| self.chunks.get(pk).map(|c| c.schema_id)),
-        );
+        schema_ids.extend(self.routable_window_chunks().map(|c| c.schema_id));
         self.worker_assignment_schemas = schema_ids;
 
         Ok(assignment)

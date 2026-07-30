@@ -112,7 +112,13 @@ fn schedule(
     worker_ids: &[WorkerPk],
     at: u64,
 ) -> WorkerAssignment {
-    schedule_with_bundle(storage, chunk_pks, worker_ids, at).0
+    storage.register_new_chunks().expect("register new chunks");
+    let workers: Vec<WorkerPk> = worker_ids.to_vec();
+    let mapping: IdealMapping = chunk_pks.iter().map(|&pk| (pk, workers.clone())).collect();
+    let algorithm = StaticSchedulingAlgorithm { mapping };
+    storage
+        .run_scheduling_cycle(&algorithm, &(), at, 60)
+        .expect("scheduling succeeds")
 }
 
 /// [`schedule`], also generating the bundle the round would publish.
@@ -122,13 +128,7 @@ fn schedule_with_bundle(
     worker_ids: &[WorkerPk],
     at: u64,
 ) -> (WorkerAssignment, SchemaBundle) {
-    storage.register_new_chunks().expect("register new chunks");
-    let workers: Vec<WorkerPk> = worker_ids.to_vec();
-    let mapping: IdealMapping = chunk_pks.iter().map(|&pk| (pk, workers.clone())).collect();
-    let algorithm = StaticSchedulingAlgorithm { mapping };
-    let wa = storage
-        .run_scheduling_cycle(&algorithm, &(), at, 60)
-        .expect("scheduling succeeds");
+    let wa = schedule(storage, chunk_pks, worker_ids, at);
     let bundle = storage.generate_schema_bundle().expect("generate bundle");
     (wa, bundle)
 }

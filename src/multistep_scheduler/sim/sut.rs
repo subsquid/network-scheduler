@@ -1110,11 +1110,8 @@ impl<D: SimStorage> SimUnderTest<D> {
     // ---- Storage cycle (shared machinery) ---------------------------------------------------
 
     /// Run one scheduling pass against the live clock, recording the shortage flag. Returns the new
-    /// assignment's id on success, or `None` on a recorded shortage.
-    ///
-    /// The bundle is generated on EVERY outcome: it is a function of committed rows (routable
-    /// window ∪ the persisted set of the last successful assignment), so a shortage advances it —
-    /// promotes keep flowing to portals while the assignment stays frozen. That is the fix the
+    /// assignment's id on success, or `None` on a recorded shortage. The bundle is generated on
+    /// EVERY outcome, so a shortage advances it while the assignment stays frozen — the fix the
     /// strict read-schema oracle enforces.
     fn run_scheduler(&mut self) -> Option<AssignmentId> {
         let id =
@@ -1394,10 +1391,9 @@ impl<D: SimStorage> SimUnderTest<D> {
         }
     }
 
-    /// Checked against what the portal holds, not the latest published pair. Strict: every fault is
-    /// fatal. The bundle advances on every round including shortages (it is generated from
-    /// committed rows, independent of placement), so there is no frozen-bundle state left to
-    /// excuse — a portal must always be able to resolve every read schema it is told to use.
+    /// Checked against what the portal holds, not the latest published pair. Strict — every fault
+    /// is fatal: the bundle advances on every round including shortages, so there is no frozen
+    /// state left to excuse.
     fn assert_portal_read_schema_resolution(&self) {
         let Some(publication) = self.portal_state.publication.as_ref() else {
             return;

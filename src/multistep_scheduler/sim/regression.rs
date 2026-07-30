@@ -1422,13 +1422,11 @@ fn churn_knife_edge_false_shortage_is_excused() {
     );
 }
 
-/// A read schema promoted while the fleet is over-subscribed must still be resolvable by the portal
-/// that is told to use it. Captured from `in_memory::churn_simulation` (shrunk by proptest to these
-/// seven transitions) back when the bundle froze with the assignment under a shortage — the portal
-/// then named an id its own bundle could not resolve. Now the bundle is generated every round from
-/// committed rows, so the promote reaches it even though placement keeps failing, and the strict
-/// read-schema oracle enforces exactly that during `replay` — the replay is the assertion. The
-/// shortage is real capacity pressure (4 workers, floor 4, saturation 0.8).
+/// A read schema promoted while the fleet is over-subscribed must still resolve for the portal told
+/// to use it. Captured from `in_memory::churn_simulation` (proptest-shrunk to seven transitions)
+/// when the bundle still froze with the assignment under a shortage. The bundle now regenerates
+/// every round, and the strict read-schema oracle enforces that during `replay` — the replay is the
+/// assertion. The shortage is real capacity pressure (4 workers, floor 4, saturation 0.8).
 fn portal_read_schema_frozen_bundle_case() -> (SimConfig, Vec<Action>) {
     let config = SimConfig {
         worker_count: 4,
