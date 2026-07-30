@@ -1,10 +1,13 @@
 //! The service's operational surface: `/metrics`, `/health`, `/ready`.
 //!
-//! Liveness is the heartbeat rule. Each task stamps [`Heartbeat::beat`] when a unit of work
-//! completes — not when a tick merely runs — so a task that keeps looping while every attempt
-//! fails, or one wedged inside an uncancellable call, both stop advancing their stamp. One number
-//! per task then covers every stall cause without instrumenting each dependency, and `/health`
-//! turns it into the only recovery the service has for a wedge: a restart.
+//! Liveness and freshness are separate, because they call for different responses. `/health` is
+//! wired to an orchestrator whose only move is a restart, so it fires on the only failure a restart
+//! resolves: a task wedged inside an uncancellable call, seen as a loop that stopped coming round
+//! ([`Heartbeat::still_running`]). A task looping while every attempt fails is *not* that — killing
+//! it cannot reach a downed ClickHouse or S3, and the replacement must redo startup against the
+//! same outage — so it keeps passing `/health` while its [`Heartbeat::beat`] stamp stands still.
+//! That stamp is exported as `task_last_success_seconds` and left to alerting, which can page a
+//! human instead of restarting a process that is already doing its best.
 
 use std::{
     net::SocketAddr,
@@ -41,12 +44,17 @@ const STALL_PERIODS: u32 = 3;
 /// * `last_success` — work actually landed. Exported as `task_last_success_seconds` and left to
 ///   alerting, which can page a human instead of restarting a process that is doing its best.
 ///
-/// Both start at process construction, so a task that never succeeds still goes stale on its own
-/// clock rather than staying green forever behind an unbounded startup grace.
+/// Neither is seeded with a value it did not earn: both are `0` — "never" — until the thing they
+/// describe actually happens. The staleness clock before the first pass comes from `started`
+/// instead, so a task that never completes a pass still goes stale without either timestamp having
+/// to claim work that never ran.
 pub struct Heartbeat {
     task: &'static str,
     period: Duration,
-    /// Unix seconds of the last completed pass; process start until the first one.
+    /// Unix seconds of construction: the staleness clock until the first pass, which bounds the
+    /// startup grace. Without it "never passed" would have to mean "never stalled".
+    started: u64,
+    /// Unix seconds of the last completed pass; 0 until the first.
     last_pass: AtomicU64,
     /// Unix seconds of the last landed unit of work; 0 until the first — never a lie about work
     /// that did not happen, so alerting on `now - task_last_success` stays honest.
@@ -58,12 +66,13 @@ impl Heartbeat {
         let heartbeat = Arc::new(Self {
             task,
             period,
-            last_pass: AtomicU64::new(now_ticks()),
+            started: now_ticks(),
+            last_pass: AtomicU64::new(0),
             last_success: AtomicU64::new(0),
         });
         // Publish both series up front. `get_or_create` inside the setters alone would leave them
         // absent exactly when a task never succeeds — the case the alert exists for.
-        heartbeat.publish(&crate::metrics::TASK_LAST_PASS, heartbeat.last_pass());
+        heartbeat.publish(&crate::metrics::TASK_LAST_PASS, 0);
         heartbeat.publish(&crate::metrics::TASK_LAST_SUCCESS, 0);
         heartbeat
     }
@@ -90,17 +99,16 @@ impl Heartbeat {
             .set(value);
     }
 
-    fn last_pass(&self) -> i64 {
-        self.last_pass.load(Ordering::Relaxed) as i64
-    }
-
     /// `Some(age)` once the loop has not come round for [`STALL_PERIODS`] of its period — a wedge,
     /// the one failure a restart resolves. A task looping on failed dependencies is *not* stalled;
     /// its staleness shows up in `task_last_success_seconds` instead.
     fn stalled_for(&self, now: u64) -> Option<Duration> {
         let last = self.last_pass.load(Ordering::Relaxed);
+        // Before the first pass the clock runs from construction, so the startup grace is bounded
+        // by process start rather than open-ended.
+        let since = if last == 0 { self.started } else { last };
         let budget = self.period * STALL_PERIODS;
-        let age = Duration::from_secs(now.saturating_sub(last));
+        let age = Duration::from_secs(now.saturating_sub(since));
         (age > budget).then_some(age)
     }
 }
@@ -164,8 +172,9 @@ async fn metrics(State(ops): State<Arc<Ops>>) -> Response {
     }
 }
 
-/// 503 once any task has stopped completing work for [`STALL_PERIODS`] of its period: the
-/// orchestrator restarts us, which is the only way out of a wedged uncancellable call.
+/// 503 once any task's loop has not come round for [`STALL_PERIODS`] of its period: the orchestrator
+/// restarts us, which is the only way out of a wedged uncancellable call. Deliberately silent about
+/// work that is failing rather than wedged — see the module docs.
 async fn health(State(ops): State<Arc<Ops>>) -> Response {
     let now = now_ticks();
     let stalled: Vec<_> = ops
@@ -204,12 +213,20 @@ mod tests {
     #[test]
     fn a_task_that_never_finished_anything_stalls_on_its_own_clock() {
         let hb = Heartbeat::new("test", PERIOD);
-        let started = hb.last_pass.load(Ordering::Relaxed);
         let budget = PERIOD.as_secs() * u64::from(STALL_PERIODS);
-        assert_eq!(hb.stalled_for(started + budget), None, "still starting up");
+        assert_eq!(
+            hb.stalled_for(hb.started + budget),
+            None,
+            "still starting up"
+        );
         assert!(
-            hb.stalled_for(started + budget + 1).is_some(),
+            hb.stalled_for(hb.started + budget + 1).is_some(),
             "a task that never completed a pass must not stay green forever"
+        );
+        assert_eq!(
+            hb.last_pass.load(Ordering::Relaxed),
+            0,
+            "the bounded grace comes from `started`, not from a pass nobody ran"
         );
     }
 
@@ -263,9 +280,11 @@ mod tests {
             encoded.contains(r#"task_last_success_seconds{network="test",task="published"} 0"#),
             "missing zeroed success series:\n{encoded}"
         );
+        // Zero, not the process time: a task that has not completed a pass must not export one, or
+        // `now - task_last_pass` reads healthy through the whole startup grace.
         assert!(
-            encoded.contains(r#"task_last_pass_seconds{network="test",task="published"}"#),
-            "missing pass series:\n{encoded}"
+            encoded.contains(r#"task_last_pass_seconds{network="test",task="published"} 0"#),
+            "the pass series must start at 0, not at construction time:\n{encoded}"
         );
     }
 
