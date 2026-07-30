@@ -27,9 +27,8 @@ fn ingester_scope() -> std::collections::BTreeSet<String> {
         .collect()
 }
 
-/// Disk-backed: these tests hold no more than a database each, and nothing here needs the tmpfs
-/// the scheduler's simulations run on.
-const PGDATA: PgData = PgData::Disk;
+/// In RAM: each case holds one small database and drops it, so the cap is never approached.
+const PGDATA: PgData = PgData::Tmpfs { size: "2g" };
 
 pub struct TestApp {
     pub router: Router,

@@ -34,6 +34,5 @@ sha2 = "0.10"
 tower-http = { version = "0.6", features = ["timeout"] }
 
 [dev-dependencies]
-# The shared Postgres harness; a dev-dependency, so the shipped image sees no docker client.
 pg-testkit = { path = "../pg-testkit" }
 tower = { version = "0.5", features = ["util"] }   # ServiceExt::oneshot
