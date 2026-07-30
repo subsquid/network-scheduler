@@ -3,6 +3,8 @@
 
 pub mod dataset_schema;
 pub mod error;
+/// `SIM_SQL_EXPLAIN` plumbing, off unless a dependant asks for it.
+#[cfg(feature = "explain")]
 pub mod explain;
 pub mod ids;
 pub mod ingest_api;

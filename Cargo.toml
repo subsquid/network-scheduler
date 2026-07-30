@@ -18,7 +18,10 @@ mvcc-chunks = ["dep:sqlx", "dep:bit-vec", "dep:humantime", "dep:scheduler-metada
 # Exposes the Postgres testcontainer harness (`scheduler_storage::test_harness::pg_harness`) to other
 # crates — e.g. reshuffle-sim. Implies the Postgres backend. The crate's own tests get the harness via
 # `cfg(test)` + dev-dependencies, so they don't need this feature.
-pg-testkit = ["mvcc-chunks", "dep:pg-testkit"]
+pg-testkit = ["mvcc-chunks", "dep:pg-testkit", "explain"]
+# `SIM_SQL_EXPLAIN` support: off in a production build, so the scheduling cycle carries no
+# auto_explain machinery and reads no environment.
+explain = ["mvcc-chunks", "scheduler-metadata/explain"]
 
 [dependencies]
 anyhow = "1.0.98"

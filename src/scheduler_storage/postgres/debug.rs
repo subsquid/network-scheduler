@@ -3,28 +3,33 @@ use sqlx::postgres::PgConnection;
 
 use crate::scheduler_storage::{ChunkPk, StorageError, WorkerPk};
 
-use super::{PostgresStorage, explain};
+use super::PostgresStorage;
 
-/// Run `run`. With `SIM_SQL_EXPLAIN` set, wrap it in `auto_explain` so the plans of the queries it
-/// issues (with ANALYZE timings) reach the postgres log — read via `docker logs` — without each call
-/// site writing the `SET`/`RESET` itself. Needs `auto_explain` loaded server-side (the sim harness
-/// does that). The `RESET` runs even if `run` fails, so it can't leak onto later queries. Off by
-/// default `run` runs untouched.
+/// Run `run`. Under the `explain` feature with `SIM_SQL_EXPLAIN` set, wrap it in `auto_explain` so
+/// the plans of the queries it issues (with ANALYZE timings) reach the postgres log — read via
+/// `docker logs` — without each call site writing the `SET`/`RESET` itself. Needs `auto_explain`
+/// loaded server-side (the sim harness does that). The `RESET` runs even if `run` fails, so it
+/// can't leak onto later queries.
+///
+/// Without the feature this compiles to `run` alone: a production build does not carry the
+/// machinery, nor read the environment on a path the scheduling cycle takes.
 pub(super) async fn with_explain<R>(
     conn: &mut PgConnection,
     run: impl AsyncFnOnce(&mut PgConnection) -> sqlx::Result<R>,
 ) -> sqlx::Result<R> {
-    if !explain::enabled() {
-        return run(conn).await;
+    #[cfg(feature = "explain")]
+    if super::explain::enabled() {
+        sqlx::raw_sql("SET auto_explain.log_analyze = on; SET auto_explain.log_min_duration = 0")
+            .execute(&mut *conn)
+            .await?;
+        let result = run(&mut *conn).await;
+        let _ =
+            sqlx::raw_sql("RESET auto_explain.log_min_duration; RESET auto_explain.log_analyze")
+                .execute(&mut *conn)
+                .await;
+        return result;
     }
-    sqlx::raw_sql("SET auto_explain.log_analyze = on; SET auto_explain.log_min_duration = 0")
-        .execute(&mut *conn)
-        .await?;
-    let result = run(&mut *conn).await;
-    let _ = sqlx::raw_sql("RESET auto_explain.log_min_duration; RESET auto_explain.log_analyze")
-        .execute(&mut *conn)
-        .await;
-    result
+    run(conn).await
 }
 
 const SCHEDULER_TABLES: &[&str] = &[

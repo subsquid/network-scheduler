@@ -9,8 +9,7 @@
 
 mod admission;
 mod debug;
-/// `SIM_SQL_EXPLAIN` plumbing. Lives in `scheduler-metadata` so the shared test harness can read it
-/// without depending on this crate; re-exported here, where its callers already look for it.
+#[cfg(feature = "explain")]
 pub use scheduler_metadata::explain;
 mod nonoverlap;
 mod rows;
