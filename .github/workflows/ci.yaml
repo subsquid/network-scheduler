@@ -96,4 +96,11 @@ jobs:
         run: git lfs fetch --all && git lfs checkout
       - uses: dsherret/rust-toolchain-file@v1
       - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy --workspace --all-targets --all-features -- -D clippy::correctness -D clippy::suspicious -D perf
+      # Lint levels live in `[workspace.lints.clippy]`; `-D warnings` promotes the rest
+      # (and rustc's own warnings) to errors. The toolchain is pinned, so this is stable.
+      - name: Clippy (all features)
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+      # Default features is what the Docker image builds, and it's the only config that
+      # compiles the `cfg(not(feature = "mvcc-chunks"))` branches.
+      - name: Clippy (default features)
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings

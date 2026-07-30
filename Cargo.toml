@@ -1,6 +1,13 @@
 [workspace]
 members = ["crates/scheduler-metadata", "crates/metadata-service", "crates/pg-testkit", "tools/compare_fb", "tools/reshuffle_sim"]
 
+# Inherited by every member via `[lints] workspace = true`, so a local `cargo clippy`
+# denies what CI denies.
+[workspace.lints.clippy]
+correctness = { level = "deny", priority = -1 }
+suspicious = { level = "deny", priority = -1 }
+perf = { level = "deny", priority = -1 }
+
 [workspace.dependencies]
 bit-vec = "0.8"
 prometheus-client = "0.23.1"
@@ -77,3 +84,6 @@ pg-testkit = { path = "crates/pg-testkit" }
 # `defnull/iterative-runner-2` branch. Both crates share the rev so they use one `proptest` build.
 proptest = { git = "https://github.com/define-null/proptest", rev = "253a26e9a6e4ac7c75d6265b441b1be00cf1e2c6" }
 proptest-state-machine = { git = "https://github.com/define-null/proptest", rev = "253a26e9a6e4ac7c75d6265b441b1be00cf1e2c6" }
+
+[lints]
+workspace = true

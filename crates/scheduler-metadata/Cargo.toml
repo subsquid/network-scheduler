@@ -22,3 +22,6 @@ tracing = "0.1.41"
 [features]
 openapi = ["dep:utoipa"]
 auto_explain = []
+
+[lints]
+workspace = true

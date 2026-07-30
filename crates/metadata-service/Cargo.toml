@@ -36,3 +36,6 @@ tower-http = { version = "0.6", features = ["timeout"] }
 [dev-dependencies]
 pg-testkit = { path = "../pg-testkit" }
 tower = { version = "0.5", features = ["util"] }   # ServiceExt::oneshot
+
+[lints]
+workspace = true

@@ -27,3 +27,6 @@ tabled = "0.21"
 # Heap-profile a run with dhat instead of the default jemalloc allocator, e.g.
 #   cargo run --release --features dhat-heap -- --dhat <args>
 dhat-heap = ["dep:dhat"]
+
+[lints]
+workspace = true

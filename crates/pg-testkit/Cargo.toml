@@ -14,3 +14,6 @@ sqlx = { workspace = true }
 testcontainers = { version = "0.27.2", features = ["watchdog"] }
 testcontainers-modules = { version = "0.15", features = ["postgres"] }
 tokio = { version = "1.45.0", features = ["rt", "net", "time"] }
+
+[lints]
+workspace = true

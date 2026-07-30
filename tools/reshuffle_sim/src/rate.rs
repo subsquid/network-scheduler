@@ -151,7 +151,7 @@ impl ChunkRate {
                 until,
             } => {
                 let within = until.is_none_or(|u| step <= u);
-                if within && step % every == 0 {
+                if within && step.is_multiple_of(*every) {
                     *size
                 } else {
                     *base
