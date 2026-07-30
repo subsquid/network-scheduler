@@ -1,6 +1,7 @@
-//! `SIM_SQL_EXPLAIN` plumbing shared by the Postgres test harness, the reshuffle-sim tool, and the
-//! production [`super::debug::with_explain`] wrapper. Testcontainers-free — env checks and config
-//! strings only — so it lives in the library API rather than test-only code.
+//! `SIM_SQL_EXPLAIN` plumbing shared by [`crate::pg_harness`], the reshuffle-sim tool, and the
+//! scheduler's `postgres::debug::with_explain` wrapper. Testcontainers-free — env checks and config
+//! strings only — so it lives in the library API rather than test-only code, and here rather than in
+//! `network-scheduler` so the harness can read it without depending on the scheduler.
 //!
 //! When set, the container loads `auto_explain` (see [`SESSION_SETTINGS`]) and is left running after
 //! the run so its log survives for `docker logs`. The module is loaded but off; a query opts in within
@@ -12,7 +13,7 @@
 //! SET LOCAL auto_explain.log_min_duration = 0;    -- log this statement's plan
 //! ```
 //!
-//! [`super::debug::with_explain`] does exactly this for the queries it wraps.
+//! The scheduler's `with_explain` does exactly this for the queries it wraps.
 
 /// Whether `SIM_SQL_EXPLAIN` is set.
 pub fn enabled() -> bool {

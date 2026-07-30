@@ -1,5 +1,5 @@
-//! One Postgres container per test binary (never-dropped static, reaped by the `watchdog` feature);
-//! a fresh migrated database per test; router mounted and driven via tower oneshot.
+//! A database per test from the shared harness in [`scheduler_metadata::pg_harness`]; router
+//! mounted and driven via tower oneshot.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -8,15 +8,12 @@ use axum::body::Body;
 use axum::http::{Request, Response, StatusCode};
 use secrecy::SecretString;
 use serde_json::{Value, json};
-use sqlx::{Connection, PgConnection, postgres::PgPoolOptions};
-use tokio::sync::OnceCell;
+use sqlx::postgres::PgPoolOptions;
 
 use metadata_service::config::{IngesterConfig, TokensConfig};
 use metadata_service::{AppState, TokenStore, build_router};
 use scheduler_metadata::PgIngest;
-use scheduler_metadata::pg::MIGRATOR;
-use testcontainers_modules::postgres::Postgres;
-use testcontainers_modules::testcontainers::{ContainerAsync, ImageExt, runners::AsyncRunner};
+use scheduler_metadata::pg_harness::{CaseDb, PgData};
 
 pub const ADMIN_TOKEN: &str = "admin-secret";
 pub const INGESTER_TOKEN: &str = "ingester-secret";
@@ -30,66 +27,24 @@ fn ingester_scope() -> std::collections::BTreeSet<String> {
         .collect()
 }
 
-struct SharedPg {
-    _container: ContainerAsync<Postgres>, // never dropped; watchdog reaps at process exit
-    admin_url: String,
-}
-static PG: OnceCell<SharedPg> = OnceCell::const_new();
-
-async fn shared_pg() -> &'static SharedPg {
-    PG.get_or_init(|| async {
-        let container = Postgres::default()
-            .with_tag("18.4-alpine")
-            .start()
-            .await
-            .expect("start postgres");
-        let port = container.get_host_port_ipv4(5432).await.expect("host port");
-        let admin_url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
-        SharedPg {
-            _container: container,
-            admin_url,
-        }
-    })
-    .await
-}
-
-fn url_with_db(url: &str, db: &str) -> String {
-    let base = url.rsplit_once('/').expect("url has a db segment").0;
-    format!("{base}/{db}")
-}
-
-/// Fresh migrated database; unique name per call. Small pools so parallel tests don't exhaust PG.
-async fn fresh_db() -> String {
-    static N: AtomicU64 = AtomicU64::new(0);
-    let pg = shared_pg().await;
-    let name = format!("md_{}", N.fetch_add(1, Ordering::Relaxed));
-
-    let mut admin = PgConnection::connect(&pg.admin_url)
-        .await
-        .expect("admin connect");
-    // In-crate DDL, never user input.
-    sqlx::query(sqlx::AssertSqlSafe(format!("CREATE DATABASE {name}")))
-        .execute(&mut admin)
-        .await
-        .expect("create db");
-
-    let url = url_with_db(&pg.admin_url, &name);
-    let pool = PgPoolOptions::new()
-        .max_connections(2)
-        .connect(&url)
-        .await
-        .expect("connect");
-    MIGRATOR.run(&pool).await.expect("migrate");
-    pool.close().await;
-    url
-}
+/// Disk-backed: these tests hold no more than a database each, and nothing here needs the tmpfs
+/// the scheduler's simulations run on.
+const PGDATA: PgData = PgData::Disk;
 
 pub struct TestApp {
     pub router: Router,
+    /// Declared last so the database outlives the router's pool.
+    _db: CaseDb,
 }
 
 pub async fn test_app() -> TestApp {
-    let db_url = fresh_db().await;
+    static N: AtomicU64 = AtomicU64::new(0);
+    let (db_url, _db) = scheduler_metadata::pg_harness::fresh_db_url(
+        PGDATA,
+        "md",
+        N.fetch_add(1, Ordering::Relaxed),
+    );
+    // Small pool so parallel tests don't exhaust PG.
     let pool = PgPoolOptions::new()
         .max_connections(4)
         .connect(&db_url)
@@ -107,6 +62,7 @@ pub async fn test_app() -> TestApp {
     let state = AppState::new(ingest, tokens);
     TestApp {
         router: build_router(state, 20 * 1024 * 1024, std::time::Duration::from_secs(30)),
+        _db,
     }
 }
 

@@ -9,7 +9,9 @@
 
 mod admission;
 mod debug;
-pub mod explain;
+/// `SIM_SQL_EXPLAIN` plumbing. Lives in `scheduler-metadata` so the shared test harness can read it
+/// without depending on this crate; re-exported here, where its callers already look for it.
+pub use scheduler_metadata::explain;
 mod nonoverlap;
 mod rows;
 mod scheduling_cycle;
@@ -58,7 +60,7 @@ pub struct PostgresStorage {
     /// Declared last so it drops after `conn`: the harness can only drop a database once this
     /// storage's connection to it is gone.
     #[cfg(any(test, feature = "pg-testkit"))]
-    case_db: Option<crate::scheduler_storage::test_harness::pg_harness::CaseDb>,
+    case_db: Option<scheduler_metadata::pg_harness::CaseDb>,
 }
 
 impl PostgresStorage {
@@ -108,10 +110,7 @@ impl PostgresStorage {
 
     /// Tie a harness database to this storage, so the case's database goes when the storage does.
     #[cfg(any(test, feature = "pg-testkit"))]
-    pub(crate) fn owning(
-        mut self,
-        db: crate::scheduler_storage::test_harness::pg_harness::CaseDb,
-    ) -> Self {
+    pub(crate) fn owning(mut self, db: scheduler_metadata::pg_harness::CaseDb) -> Self {
         self.case_db = Some(db);
         self
     }

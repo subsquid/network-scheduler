@@ -3,11 +3,16 @@
 
 pub mod dataset_schema;
 pub mod error;
+pub mod explain;
 pub mod ids;
 pub mod ingest_api;
 pub mod metrics;
 pub mod new_chunk;
 pub mod new_dataset;
+
+/// The Postgres test harness, shared by every crate that tests against this schema.
+#[cfg(feature = "pg-testkit")]
+pub mod pg_harness;
 
 pub use dataset_schema::{DatasetSchema, TableSchema};
 pub use error::{IngestError, StorageError};
