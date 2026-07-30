@@ -465,7 +465,10 @@ impl SchedulerStorage for PostgresStorage {
                     ids.extend(ideal_mappings.iter().filter_map(|(pk, _)| {
                         published_chunks.get(pk).map(|chunk| chunk.schema_id)
                     }));
-                    ids.into_iter().collect()
+                    let mut ids: Vec<SchemaId> = ids.into_iter().collect();
+                    // Sorted for a deterministic bind and sequential inserts into the PK index.
+                    ids.sort_unstable();
+                    ids
                 };
             phase::persist_assignment_schemas(&mut tx, &published_schema_ids).await?;
 

@@ -1,13 +1,13 @@
 //! Phase helpers for [`PostgresStorage::run_scheduling_cycle`], run inside the
 //! cycle's transaction, plus the post-commit [`build_worker_assignment`] read.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
 use anyhow::{Context, Result};
 use futures::TryStreamExt;
 use itertools::Itertools as _;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use semver::Version;
 use sqlx::postgres::PgConnection;
 use sqlx::{Postgres, Transaction};
@@ -170,7 +170,9 @@ pub(super) struct ActiveChunks {
     pub(super) published: FxHashMap<ChunkPk, WorkerAssignmentChunk>,
     /// schema_ids of every chunk that has entered a worker assignment and is not yet tombstoned
     /// (ADR 0002) — the input, with the new ideal's ids, to the persisted assignment-schema set.
-    pub(super) bundle_schema_ids: BTreeSet<SchemaId>,
+    /// Hashed, not ordered: millions of per-row inserts, a few hundred distinct ids, no reader of
+    /// the order.
+    pub(super) bundle_schema_ids: FxHashSet<SchemaId>,
 }
 
 /// Reads every active chunk — registered, and neither `rejected` nor removed (tombstoned) — spanning
@@ -209,7 +211,7 @@ pub(super) async fn fetch_active_chunks_with_placement(
         current_placement: CurrentPlacement::default(),
         committed_placement: CurrentPlacement::default(),
         published: FxHashMap::default(),
-        bundle_schema_ids: BTreeSet::new(),
+        bundle_schema_ids: FxHashSet::default(),
     };
     let mut count = 0u64;
     while let Some(mut row) = stream
