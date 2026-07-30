@@ -815,7 +815,7 @@ impl SchedulerStorage for InMemoryStorage {
     }
 
     fn generate_schema_bundle(&self) -> Result<SchemaBundle, StorageError> {
-        // Postgres `generate_bundle` semantics, verbatim: the persisted set covers the window.
+        // Contract on the trait; parity twin of postgres' `generate_bundle`.
         let mut schemas: BTreeMap<SchemaId, DatasetSchema> = BTreeMap::new();
         let mut datasets: BTreeSet<Dataset> = BTreeSet::new();
         for id in self.worker_assignment_schemas.iter().copied() {

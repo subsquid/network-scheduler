@@ -62,12 +62,10 @@ pub(super) async fn read_schemas_by_id(
     Ok(rows.into_iter().map(|(id, json)| (id, json.0)).collect())
 }
 
-/// One bundle from committed rows alone — identical under success, shortage, and on a fresh
-/// process. Write section: the persisted set of the last successful cycle, which by construction
-/// equals the routable window at that commit and always covers it afterwards (window entry requires
-/// a stamp only a successful cycle writes; tombstoning only shrinks it). Read section: the CURRENT
-/// read schema of every referenced dataset. One `REPEATABLE READ, READ ONLY` snapshot; strict
-/// loads — a referenced id with no `schemas` row is an error, never a silent shrink.
+/// Postgres body of `SchedulerStorage::generate_schema_bundle` (contract there). One
+/// `REPEATABLE READ, READ ONLY` snapshot, so the persisted set and both loads cannot skew against
+/// each other. Covering proof: window entry requires a stamp only a successful cycle writes, and
+/// tombstoning only shrinks it.
 pub(super) async fn generate_bundle(conn: &mut PgConnection) -> Result<SchemaBundle> {
     let _timer = crate::metrics::Timer::new("generate_schema_bundle");
     let mut tx = conn.begin().await.context("generate_bundle: begin")?;

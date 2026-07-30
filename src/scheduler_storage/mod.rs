@@ -179,7 +179,8 @@ pub trait SchedulerStorage {
     /// process restarts don't change it. Write section: the persisted set of the last successful
     /// cycle, frozen until the next success; the live window only shrinks in between, so the set
     /// always covers it. Read section: the CURRENT read pointer of each dataset that write section
-    /// references — read live, never persisted, so a promote reaches the very next bundle.
+    /// references — read live, never persisted, so a promote reaches the very next bundle. A
+    /// referenced id whose schema row is missing is an error, never a silent shrink.
     fn generate_schema_bundle(&self) -> Result<SchemaBundle, StorageError>;
 
     /// Advance the confirmation watermark and replay pending routing diffs
