@@ -12,7 +12,8 @@ pub(super) fn standard_preconditions<D: super::SimStorage>(
         Action::AddChunks(_)
         | Action::NoOp
         | Action::WorkerJoined(_)
-        | Action::SetDatasetSchema { .. } => true,
+        | Action::SetDatasetSchema { .. }
+        | Action::PromoteReadSchema { .. } => true,
         Action::AdvanceClock(_) => {
             sut.has_stale_mappings() || sut.has_published_portal_assignment()
         }

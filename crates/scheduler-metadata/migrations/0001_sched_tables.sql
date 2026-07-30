@@ -77,8 +77,8 @@ CREATE INDEX IF NOT EXISTS chunks_dataset_range_gist ON chunks USING gist (
     int8range(first_block, first_block + last_block_delta, '[]')
 );
 
--- Drives active_schema_bundle's per-schema "does any live chunk still use this schema?" probe.
--- chunk_pk is included so the nested-loop scan stays index-only.
+-- Drives the per-schema "does any live chunk still use this schema?" probe (LIVE_CHUNK_EXISTS,
+-- the `active` flag of list_write_schemas). chunk_pk is included so the scan stays index-only.
 CREATE INDEX IF NOT EXISTS chunks_schema_id ON chunks (schema_id, chunk_pk);
 
 -- Drives head()'s resume-point probe. Within a dataset, admitted chunks are non-overlapping with
@@ -131,6 +131,14 @@ CREATE TABLE IF NOT EXISTS sched_chunk_metadata (
     -- Tick at which the chunk was tombstoned (pulled from the worker layer), m_ticks after its
     -- portal drop. NULL = not tombstoned.
     dropped_from_worker_assignment_at BIGINT
+);
+
+-- Write-schema ids of the last successful cycle's bundle, replaced wholesale in the transaction
+-- that commits the assignment — a shortage never reaches the write, freezing the set with the
+-- assignment it describes. Keeps a shortage-round bundle covering the frozen published assignment;
+-- the FK also blocks hard-deleting a schema row that assignment still references.
+CREATE TABLE IF NOT EXISTS sched_worker_assignment_schemas (
+    schema_id INTEGER PRIMARY KEY REFERENCES schemas(id)
 );
 
 -- What the scheduler currently wants; published worker assignment = this ∪ sched_stale_mappings.

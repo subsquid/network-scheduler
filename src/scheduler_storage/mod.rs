@@ -9,7 +9,7 @@ use crate::weight::SchedulingChunk;
 /// The id newtypes, ingest input types, and the error enum now live in `scheduler-metadata`; the
 /// scheduler keeps its historical `scheduler_storage::{…}` surface via this re-export.
 pub use scheduler_metadata::{
-    ChunkPk, DatasetPk, NewChunk, NewDataset, SchemaId, StorageError, WorkerPk,
+    ChunkPk, DatasetPk, NewChunk, NewDataset, ReadSchemaId, SchemaId, StorageError, WorkerPk,
 };
 
 /// Lower a discovered [`Chunk`](crate::types::Chunk) to a [`NewChunk`] pinned to `schema_id`.
@@ -117,12 +117,6 @@ pub struct WorkerAssignment {
     pub replication_by_weight: BTreeMap<u16, u16>,
 }
 
-impl WorkerAssignment {
-    pub(crate) fn schema_ids(&self) -> BTreeSet<SchemaId> {
-        self.chunks.values().map(|chunk| chunk.schema_id).collect()
-    }
-}
-
 /// The published portal assignment: confirmed routing for portal-visible chunks.
 #[derive(Debug, Clone)]
 pub struct PortalAssignment {
@@ -130,6 +124,21 @@ pub struct PortalAssignment {
     pub chunk_workers: BTreeMap<ChunkPk, Vec<WorkerPk>>,
     pub chunks: BTreeMap<ChunkPk, WorkerAssignmentChunk>,
     pub workers: BTreeMap<WorkerPk, AssignmentWorker>,
+    /// The read-schema id a portal validates each dataset's queries under, resolved against the
+    /// published [`SchemaBundle`]. Total over the datasets `chunks` names and no wider, so it
+    /// retires with the last visible chunk. `None` = never promoted — distinct from a missing key,
+    /// which would be a resolution failure rather than an answer.
+    pub read_schemas: BTreeMap<DatasetId, Option<ReadSchemaId>>,
+}
+
+impl PortalAssignment {
+    /// The scope `read_schemas` is total over.
+    pub(crate) fn named_datasets(&self) -> BTreeSet<DatasetId> {
+        self.chunks
+            .values()
+            .map(|chunk| chunk.dataset.clone())
+            .collect()
+    }
 }
 
 /// Storage backend for the MVCC scheduler lifecycle.
@@ -152,18 +161,27 @@ pub trait SchedulerStorage {
     /// Run one full scheduling cycle: tombstone expired chunks, expire stale
     /// mappings, run `algorithm` in-process, diff + commit results.
     ///
-    /// Returns the published `WorkerAssignment` (ideal ∪ stale) with the [`SchemaBundle`] frozen
-    /// with it — the schemas its chunks reference — so the two stay paired. On `Shortage` neither
-    /// advances.
+    /// Returns the published `WorkerAssignment` (ideal ∪ stale); call
+    /// [`Self::generate_schema_bundle`] after every cycle, success or `Shortage`. Success also
+    /// persists the round's write-schema ids atomically with the assignment — what keeps a
+    /// shortage-round bundle covering the frozen assignment.
     fn run_scheduling_cycle<Algo>(
         &mut self,
         algorithm: &Algo,
         config: &Algo::Config,
         now: Tick,
         m_ticks: u64,
-    ) -> Result<(WorkerAssignment, SchemaBundle), StorageError>
+    ) -> Result<WorkerAssignment, StorageError>
     where
         Algo: crate::scheduler_storage::algorithm::SchedulingAlgorithm + Send + Sync;
+
+    /// The schema bundle — a function of committed rows only, so the last cycle's outcome and
+    /// process restarts don't change it. Write section: the persisted set of the last successful
+    /// cycle, frozen until the next success; the live window only shrinks in between, so the set
+    /// always covers it. Read section: the CURRENT read pointer of each dataset that write section
+    /// references — read live, never persisted, so a promote reaches the very next bundle. A
+    /// referenced id whose schema row is missing is an error, never a silent shrink.
+    fn generate_schema_bundle(&self) -> Result<SchemaBundle, StorageError>;
 
     /// Advance the confirmation watermark and replay pending routing diffs
     fn confirm_worker_assignment(
@@ -181,9 +199,10 @@ pub trait SchedulerStorage {
     fn mark_for_removal(&mut self, chunk_pk: ChunkPk, now: Tick) -> Result<(), StorageError>;
 
     // Seeding/ingestion entry points (production ingestion and the offline tools). Each dataset
-    // carries its identity and storage location plus an initial WRITE schema (the read schema is a
-    // PG/ingest-only concern — see PgIngest); `NewDataset::new` derives the name from the location
-    // (scheme stripped), or `with_name` sets an explicit one.
+    // carries its identity and storage location plus an initial WRITE schema — deliberately no read
+    // pointer, so the read registry keeps exactly one writer (see `promote_read_schema`).
+    // `NewDataset::new` derives the name from the location (scheme stripped), or `with_name` sets
+    // an explicit one.
     fn insert_new_datasets(&mut self, datasets: Vec<NewDataset>) -> Result<(), StorageError>;
     fn insert_new_chunks(&mut self, chunks: Vec<NewChunk>) -> Result<(), StorageError>;
 
@@ -196,17 +215,23 @@ pub trait SchedulerStorage {
         schema: DatasetSchema,
     ) -> Result<(), StorageError>;
 
-    /// Decode schemas for assignment construction: all of them, or those in `schema_ids`.
-    /// Missing ids are omitted.
+    /// Test-only passthrough to the metadata crate's loader; missing ids are omitted (the
+    /// characterization the schema tests pin).
+    #[cfg(test)]
     fn load_schemas(
         &self,
         schema_ids: Option<&[SchemaId]>,
     ) -> Result<BTreeMap<SchemaId, DatasetSchema>, StorageError>;
 
-    /// Schemas of every chunk currently in play — held by workers or served by the portal (see
-    /// [`SchemaBundle`]). One round-trip; independent of the published `WorkerAssignment`/
-    /// `PortalAssignment`, which can lag or fail on their own.
-    fn active_schema_bundle(&self) -> Result<BTreeMap<SchemaId, DatasetSchema>, StorageError>;
+    /// Make `schema` the dataset's current read schema, returning its content-deduped id. Test-only
+    /// by construction: in production the metadata service is the read registry's ONE writer, and
+    /// the read path's concurrency argument rests on that.
+    #[cfg(test)]
+    fn promote_read_schema(
+        &mut self,
+        dataset: &str,
+        schema: DatasetSchema,
+    ) -> Result<ReadSchemaId, StorageError>;
 
     /// Register a new chunk replacement for an old chunk. New chunk must have the same block range
     /// as the old chunk. A production path now — reorgs drive it.

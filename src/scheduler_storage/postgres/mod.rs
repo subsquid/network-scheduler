@@ -260,6 +260,7 @@ impl SchedulerStorage for PostgresStorage {
         })
     }
 
+    #[cfg(test)]
     fn load_schemas(
         &self,
         schema_ids: Option<&[crate::scheduler_storage::SchemaId]>,
@@ -269,13 +270,39 @@ impl SchedulerStorage for PostgresStorage {
         })
     }
 
-    fn active_schema_bundle(
-        &self,
-    ) -> Result<BTreeMap<crate::scheduler_storage::SchemaId, DatasetSchema>, StorageError> {
+    fn generate_schema_bundle(&self) -> Result<SchemaBundle, StorageError> {
         self.with_conn_ref(async move |conn| {
-            schema::active_schema_bundle(conn)
+            schema::generate_bundle(conn)
                 .await
                 .map_err(StorageError::from)
+        })
+    }
+
+    #[cfg(test)]
+    fn promote_read_schema(
+        &mut self,
+        dataset: &str,
+        schema: DatasetSchema,
+    ) -> Result<crate::scheduler_storage::ReadSchemaId, StorageError> {
+        let dataset = dataset.to_owned();
+        self.with_conn(async move |conn| {
+            let mut tx = conn.begin().await.context("promote_read_schema: begin")?;
+            let dataset_id: crate::scheduler_storage::DatasetPk =
+                sqlx::query_scalar("SELECT id FROM datasets WHERE name = $1")
+                    .bind(&dataset)
+                    .fetch_optional(&mut *tx)
+                    .await
+                    .context("promote_read_schema: resolve dataset")?
+                    .ok_or_else(|| {
+                        StorageError::Database(anyhow::anyhow!(
+                            "promote_read_schema: dataset {dataset} not found"
+                        ))
+                    })?;
+            let id =
+                scheduler_metadata::pg::schema::promote_read_schema(&mut tx, dataset_id, &schema)
+                    .await?;
+            tx.commit().await.context("promote_read_schema: commit")?;
+            Ok(id)
         })
     }
 
@@ -354,7 +381,7 @@ impl SchedulerStorage for PostgresStorage {
         config: &A::Config,
         now: Tick,
         m_ticks: u64,
-    ) -> Result<(WorkerAssignment, SchemaBundle), StorageError>
+    ) -> Result<WorkerAssignment, StorageError>
     where
         A: SchedulingAlgorithm + Send + Sync,
     {
@@ -431,6 +458,25 @@ impl SchedulerStorage for PostgresStorage {
             phase::write_future_ideal(&mut tx, &ideal_mappings, batch_size).await?;
             phase::apply_deltas_and_swap(&mut tx, new_wa_id, &evicted).await?;
 
+            // The round's bundle write ids — the routable window as of this commit, which is what
+            // the generator publishes until the next success. Scanned window plus the new ideal's
+            // chunks: the scan ran before this cycle stamped first-placed chunks, so those come
+            // from the in-memory mapping. Deliberately wider than the new assignment — a chunk the
+            // ideal just dropped is still routable while draining (ADR 0002), so its schema stays
+            // until it tombstones and the next success's scan sheds it.
+            let published_schema_ids: Vec<SchemaId> =
+                {
+                    let mut ids = bundle_schema_ids;
+                    ids.extend(ideal_mappings.iter().filter_map(|(pk, _)| {
+                        published_chunks.get(pk).map(|chunk| chunk.schema_id)
+                    }));
+                    let mut ids: Vec<SchemaId> = ids.into_iter().collect();
+                    // Sorted for a deterministic bind and sequential inserts into the PK index.
+                    ids.sort_unstable();
+                    ids
+                };
+            phase::persist_assignment_schemas(&mut tx, &published_schema_ids).await?;
+
             tx.commit().await.context("run_scheduling_cycle: commit")?;
 
             let wa = phase::build_worker_assignment(
@@ -442,19 +488,7 @@ impl SchedulerStorage for PostgresStorage {
                 published_chunks,
             )
             .await?;
-
-            // Bundle covers the assignment's chunks (ideal ∪ stale) plus every chunk in its
-            // routable window — entered a worker assignment, not yet tombstoned — so a chunk the
-            // latest assignment dropped but an earlier confirmed entry still routes to keeps its
-            // schema (ADR 0002). Only the content load hits the DB, and schema content is
-            // immutable per id, so the by-id read is safe under concurrent writers.
-            let mut schema_ids: BTreeSet<SchemaId> = wa.schema_ids();
-            schema_ids.extend(bundle_schema_ids);
-            let schema_ids: Vec<SchemaId> = schema_ids.into_iter().collect();
-            let bundle = SchemaBundle::from_schemas(
-                scheduler_metadata::pg::schema::load_schemas(conn, Some(&schema_ids)).await?,
-            );
-            Ok::<_, StorageError>((wa, bundle))
+            Ok::<_, StorageError>(wa)
         })
     }
 
@@ -507,22 +541,33 @@ impl SchedulerStorage for PostgresStorage {
             phase::promote_eligible_chunks(&mut tx, new_pa_id, confirmed_up_to).await?;
             phase::drop_marked_chunks(&mut tx, new_pa_id).await?;
 
-            tx.commit().await.context("run_visibility_cycle: commit")?;
-
-            let mut chunks = phase::fetch_portal_visible_chunks(conn).await?;
+            // Assembled inside the transaction so the chunk set, the eviction that trims it, its
+            // routing and its read references share one commit — which also makes the eviction's
+            // un-promotes transactional, closing a crash window that left chunks promoted after the
+            // assignment dropped them.
+            let mut chunks = phase::fetch_portal_visible_chunks(&mut tx).await?;
             // Settle overlaps in memory over the visible set we just fetched (see
             // `evict_portal_overlaps`), keeping the assignment disjoint without a per-promotion probe.
-            // The eviction's un-promotes are written back before the routing fetch, so its
-            // server-side visibility predicate sees the same set as `chunks`.
-            phase::evict_portal_overlaps(conn, &mut chunks).await?;
-            let chunk_workers = phase::fetch_confirmed_routing(conn).await?;
-            let workers = phase::fetch_portal_workers(conn).await?;
+            phase::evict_portal_overlaps(&mut tx, &mut chunks).await?;
+            // From the post-eviction set, so the reference needs no pruning to match what is named.
+            let named: Vec<&str> = chunks
+                .values()
+                .map(|chunk| chunk.dataset.as_str())
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect();
+            let read_schemas = schema::read_schema_ids_by_dataset(&mut tx, &named).await?;
+            let chunk_workers = phase::fetch_confirmed_routing(&mut tx).await?;
+            let workers = phase::fetch_portal_workers(&mut tx).await?;
+
+            tx.commit().await.context("run_visibility_cycle: commit")?;
 
             Ok::<_, StorageError>(phase::assemble_portal_assignment(
                 new_pa_id,
                 chunks,
                 chunk_workers,
                 workers,
+                read_schemas,
             ))
         })
     }

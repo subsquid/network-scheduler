@@ -1,6 +1,8 @@
-//! Captured regressions — shrunk action sequences, each pinning one scheduler property. Chunks
-//! carry their own key/size/weight/dataset, so each sequence replays deterministically with no
-//! seed. The replay *is* the assertion: it panics iff the property is violated.
+//! Deterministic action sequences, each pinning one scheduler property. Chunks carry their own
+//! key/size/weight/dataset, so a sequence replays with no seed.
+//!
+//! Every case is captured: shrunk (or delta-debugged) from a walk that actually failed, and the
+//! replay *is* the assertion — it panics iff the property is violated.
 
 use super::sut::{Action, ConvergenceCheck, NewChunk, SimConfig, SimUnderTest};
 use super::utils::{
@@ -1416,4 +1418,46 @@ fn churn_knife_edge_false_shortage_is_excused() {
             Action::CheckConverged(ConvergenceCheck::FloorLocallyFeasible),
         ],
     );
+}
+
+/// A read schema promoted while the fleet is over-subscribed must still resolve for the portal told
+/// to use it. Captured from `in_memory::churn_simulation` (proptest-shrunk) when the bundle still
+/// froze with the assignment under a shortage; the strict oracle now enforces the fix during
+/// `replay`. The shortage is real capacity pressure, not a floor above the worker count.
+fn portal_read_schema_under_shortage_case() -> (SimConfig, Vec<Action>) {
+    let config = SimConfig {
+        worker_count: 4,
+        min_replication: 4,
+        saturation: 0.8,
+        confirm_threshold_pct: 89,
+        gc_ticks: 15,
+        ..base_config()
+    };
+    let nc = |key: u64, weight: u16, dataset: &str| {
+        new_chunk((mint_key(key), CHUNK_SIZE, weight, format!("s3://{dataset}")))
+    };
+    #[rustfmt::skip]
+    let actions = vec![
+        Action::AddChunks(vec![nc(54268, 1, "sim-0")]),
+        Action::CheckConverged(ConvergenceCheck::FloorLocallyFeasible),
+        Action::AddChunks(vec![nc(53944, 1, "sim-0"), nc(52853, 12, "sim-1"), nc(45551, 12, "sim-2"), nc(61969, 4, "sim-0")]),
+        Action::PromoteReadSchema { dataset: "s3://sim-0".into(), schema: SCHEMA_POOL[0].clone() },
+        Action::AddChunks(vec![nc(17181, 12, "sim-2"), nc(1608, 12, "sim-2"), nc(27218, 4, "sim-0"), nc(37183, 1, "sim-1")]),
+        Action::PortalFetchAssignment { succeeds: true },
+        Action::SetDatasetSchema { dataset: "s3://sim-0".into(), schema: SCHEMA_POOL[0].clone() },
+    ];
+    (config, actions)
+}
+
+#[test]
+fn portal_read_schema_resolves_under_shortage() {
+    let (config, actions) = portal_read_schema_under_shortage_case();
+    replay(&config, actions);
+}
+
+/// Postgres twin: the same case on the real backend, keeping the shortage-round bundle at parity.
+#[test]
+fn portal_read_schema_resolves_under_shortage_pg() {
+    let (config, actions) = portal_read_schema_under_shortage_case();
+    replay_pg(&config, actions);
 }

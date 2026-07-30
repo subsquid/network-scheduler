@@ -239,7 +239,7 @@ impl MultistepScheduler {
             self.clock,
             M_TICKS,
         ) {
-            Ok((assignment, _bundle)) => assignment,
+            Ok(assignment) => assignment,
             Err(StorageError::Shortage) => {
                 return Ok(CycleResult::Shortage(
                     "scheduling shortage: worker capacity cannot satisfy all replication floors \

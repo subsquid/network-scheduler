@@ -57,7 +57,7 @@ impl DrainFixture {
             ignore_reliability: true,
         };
         self.storage.register_new_chunks().unwrap();
-        let (wa, _) = self
+        let wa = self
             .storage
             .run_scheduling_cycle(
                 &MultistepAlgorithm::new(UniformWeight),

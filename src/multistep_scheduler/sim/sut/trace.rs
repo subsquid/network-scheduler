@@ -289,6 +289,7 @@ pub(super) fn action_label(action: &Action) -> String {
                 if *succeeds { "ok" } else { "missed" }
             )
         }
+        Action::PromoteReadSchema { dataset, .. } => format!("PromoteReadSchema({dataset})"),
         Action::PortalFetchAssignment { succeeds } => {
             format!("PortalFetch({})", if *succeeds { "ok" } else { "missed" })
         }

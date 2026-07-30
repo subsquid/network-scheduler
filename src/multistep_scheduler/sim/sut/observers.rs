@@ -6,8 +6,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::scheduler_storage::{
-    AssignmentId, ChunkPk, PortalAssignment, Tick, WorkerAssignment, WorkerPk,
+    AssignmentId, ChunkPk, PortalAssignment, SchemaBundle, Tick, WorkerAssignment, WorkerPk,
 };
+use crate::types::DatasetSchema;
 
 /// One worker's observed local state.
 #[derive(Debug, Default)]
@@ -121,6 +122,17 @@ pub(super) struct Portal {
     pub(super) snapshot: Option<PortalAssignment>,
     pub(super) fetched_at: Tick,
     pub(super) watermark: AssignmentId,
+    /// The publication `snapshot` came from, captured at publish time.
+    pub(super) publication: Option<PortalPublication>,
+}
+
+/// What was published alongside a portal assignment, captured at that instant.
+#[derive(Debug, Clone)]
+pub(super) struct PortalPublication {
+    /// What a portal holding this assignment resolves against; `None` before the first round.
+    pub(super) bundle: Option<SchemaBundle>,
+    /// The sim's promote log at publication.
+    pub(super) promoted: BTreeMap<String, (DatasetSchema, u64)>,
 }
 
 impl Portal {
@@ -130,11 +142,13 @@ impl Portal {
         &mut self,
         assignment: &PortalAssignment,
         watermark: AssignmentId,
+        publication: PortalPublication,
         now: Tick,
     ) {
         self.snapshot = Some(assignment.clone());
         self.fetched_at = now;
         self.watermark = watermark;
+        self.publication = Some(publication);
     }
 }
 
@@ -255,8 +269,17 @@ mod tests {
             chunk_workers: BTreeMap::new(),
             chunks: BTreeMap::new(),
             workers: BTreeMap::new(),
+            read_schemas: BTreeMap::new(),
         };
-        portal.observer_assignment(&pa, 2, 12);
+        portal.observer_assignment(
+            &pa,
+            2,
+            PortalPublication {
+                bundle: None,
+                promoted: BTreeMap::new(),
+            },
+            12,
+        );
         assert_eq!(portal.fetched_at, 12);
         assert_eq!(portal.watermark, 2);
         assert_eq!(portal.snapshot_age(20), 8);

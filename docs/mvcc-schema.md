@@ -275,6 +275,21 @@ CREATE TABLE sched_worker_confirmations (
 );
 ```
 
+### sched_worker_assignment_schemas
+
+Write-schema ids of the last successful cycle's bundle, replaced wholesale in the transaction that
+commits the assignment — a shortage never reaches the write, freezing the set with the assignment
+it describes. `generate_schema_bundle` builds the bundle's write section from it (and derives the
+read section's dataset scope through `schemas.dataset_id`), so a shortage-round bundle keeps
+covering the frozen published assignment. A few hundred rows, computed in Rust from the cycle's own
+scan, never derived from the placement tables.
+
+```sql
+CREATE TABLE sched_worker_assignment_schemas (
+    schema_id INTEGER PRIMARY KEY REFERENCES schemas(id)
+);
+```
+
 ### sched_ideal_chunk_workers / sched_confirmed_chunk_workers
 
 The two routing tables behind the two-gate model. `sched_ideal_chunk_workers` is what the

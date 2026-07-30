@@ -10,22 +10,13 @@ use crate::scheduler_storage::algorithm::IdealMapping;
 use crate::scheduler_storage::postgres::PostgresStorage;
 use crate::scheduler_storage::test_harness::inspect::StorageInspect;
 use crate::scheduler_storage::test_harness::utils::{
-    StaticSchedulingAlgorithm, dataset, new_dataset, worker,
+    StaticSchedulingAlgorithm, dataset, new_dataset, schema_with_tables, worker,
 };
 use crate::scheduler_storage::{
     BundleId, ChunkPk, SchedulerStorage, SchemaBundle, SchemaId, StorageError, WorkerAssignment,
     WorkerPk,
 };
 use crate::types::{DatasetSchema, TableSchema};
-
-fn schema_with_tables(tables: &[&str]) -> DatasetSchema {
-    DatasetSchema::new(
-        tables
-            .iter()
-            .map(|t| ((*t).to_owned(), TableSchema::default()))
-            .collect(),
-    )
-}
 
 fn schema_one_table(table: &str, fields: &[&str], default_fields: &[&str]) -> DatasetSchema {
     let mut tables = BTreeMap::new();
@@ -111,7 +102,18 @@ fn schedule(
     storage
         .run_scheduling_cycle(&algorithm, &(), at, 60)
         .expect("scheduling succeeds")
-        .0
+}
+
+/// [`schedule`], also generating the bundle the round would publish.
+fn schedule_with_bundle(
+    storage: &mut PostgresStorage,
+    chunk_pks: &[ChunkPk],
+    worker_ids: &[WorkerPk],
+    at: u64,
+) -> (WorkerAssignment, SchemaBundle) {
+    let wa = schedule(storage, chunk_pks, worker_ids, at);
+    let bundle = storage.generate_schema_bundle().expect("generate bundle");
+    (wa, bundle)
 }
 
 fn one_worker(storage: &mut PostgresStorage) -> Vec<WorkerPk> {
@@ -152,11 +154,10 @@ fn chunk_tables_present_is_returned_with_schema_id() {
     );
 }
 
-/// `active_schema_bundle` (the DB predicate) holds exactly the in-play schemas: a worker-held
-/// (then portal-served) chunk's schema is included, an unplaced chunk's is excluded, and the id is
-/// content-addressed over that set.
+/// The bundle holds exactly the in-play schemas: a worker-held (then portal-served) chunk's schema
+/// is included, an unplaced chunk's is excluded, and the id is content-addressed over that set.
 #[test]
-fn active_schema_bundle_holds_only_in_play_schemas() {
+fn bundle_holds_only_in_play_schemas() {
     let mut storage = fresh_storage("active_bundle");
     storage
         .insert_new_datasets(vec![
@@ -171,21 +172,95 @@ fn active_schema_bundle_holds_only_in_play_schemas() {
 
     // Place only "a"; "b" stays registered but unplaced (in no worker or portal assignment).
     let wa = schedule(&mut storage, &[a_pk], &workers, 100);
-    let bundle = SchemaBundle::generate(&storage).unwrap();
+    let bundle = storage.generate_schema_bundle().unwrap();
     // Whole-bundle content: exactly a's schema decoded from jsonb; b's is excluded, unplaced.
     assert_eq!(
         bundle.schemas(),
         &BTreeMap::from([(a_schema, schema_with_tables(&["blocks"]))]),
     );
-    assert_eq!(bundle.id(), BundleId::from_schema_ids([a_schema]));
+    // No read schema promoted, so the read section is empty.
+    assert_eq!(bundle.id(), BundleId::from_sections([a_schema], []));
 
     // Promote "a" to the portal — still in play, so the set is unchanged.
     storage.confirm_worker_assignment(wa.id, 100).unwrap();
     storage.run_visibility_cycle(150).unwrap();
     assert_eq!(
-        SchemaBundle::generate(&storage).unwrap().id(),
+        storage.generate_schema_bundle().unwrap().id(),
         bundle.id(),
         "portal-served keeps the same in-play schema set",
+    );
+}
+
+/// A promote lands in the bundle's read section and moves the fingerprint — without that movement a
+/// caching portal never invalidates.
+#[test]
+fn schema_bundle_carries_the_current_read_schema() {
+    let mut storage = fresh_storage("bundle_read_schema");
+    let write_schema = schema_with_tables(&["blocks"]);
+    storage
+        .insert_new_datasets(vec![new_dataset("ds", write_schema.clone())])
+        .expect("insert dataset");
+    let pk = register_chunk(&mut storage, "ds", 1, 100);
+    let write_schema_id = current_schema_id(&mut storage, dataset("ds"));
+    let workers = one_worker(&mut storage);
+
+    let (_, before) = schedule_with_bundle(&mut storage, &[pk], &workers, 100);
+    assert_eq!(
+        before.schemas(),
+        &BTreeMap::from([(write_schema_id, write_schema)]),
+        "the bundle starts as exactly the placed chunk's write schema",
+    );
+
+    // A table set no write schema has, so its presence is unambiguous.
+    let read_schema = schema_with_tables(&["blocks", "logs"]);
+    storage
+        .promote_read_schema(&dataset("ds"), read_schema.clone())
+        .expect("promote read schema");
+    let (_, after) = schedule_with_bundle(&mut storage, &[pk], &workers, 200);
+    assert_eq!(
+        after.read_schemas().values().collect::<Vec<_>>(),
+        vec![&read_schema],
+        "the bundle carries the current read schema, so a portal can resolve it",
+    );
+    assert_eq!(
+        after.schemas(),
+        before.schemas(),
+        "and the write section is untouched — the two are separate id spaces",
+    );
+    assert_ne!(
+        after.id(),
+        before.id(),
+        "the fingerprint moves, so a portal caching the bundle knows to re-fetch",
+    );
+}
+
+/// A dataset placed for the first time in a cycle must still reach that round's bundle. The order —
+/// promote, THEN first placement — is the point: the sibling test promotes after a cycle has
+/// stamped the chunk, so it cannot catch this. Found by the Postgres sim sweeps (empty read
+/// section); pinned here.
+#[test]
+fn first_placement_cycle_carries_the_read_schema() {
+    let mut storage = fresh_storage("bundle_first_placement");
+    storage
+        .insert_new_datasets(vec![new_dataset("ds", schema_with_tables(&["blocks"]))])
+        .expect("insert dataset");
+    let pk = register_chunk(&mut storage, "ds", 1, 100);
+    let read_schema = schema_with_tables(&["blocks", "logs"]);
+    storage
+        .promote_read_schema(&dataset("ds"), read_schema.clone())
+        .expect("promote read schema");
+    let workers = one_worker(&mut storage);
+
+    // Nothing has stamped this chunk as entered yet.
+    let (wa, bundle) = schedule_with_bundle(&mut storage, &[pk], &workers, 100);
+    assert!(
+        wa.chunks.contains_key(&pk),
+        "precondition: the assignment names the chunk on this very cycle",
+    );
+    assert_eq!(
+        bundle.read_schemas().values().collect::<Vec<_>>(),
+        vec![&read_schema],
+        "the dataset is named by this assignment, so its read schema must be in the paired bundle",
     );
 }
 

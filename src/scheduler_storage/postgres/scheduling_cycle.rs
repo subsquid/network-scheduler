@@ -1,13 +1,13 @@
 //! Phase helpers for [`PostgresStorage::run_scheduling_cycle`], run inside the
 //! cycle's transaction, plus the post-commit [`build_worker_assignment`] read.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
 use anyhow::{Context, Result};
 use futures::TryStreamExt;
 use itertools::Itertools as _;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use semver::Version;
 use sqlx::postgres::PgConnection;
 use sqlx::{Postgres, Transaction};
@@ -59,6 +59,30 @@ pub(super) async fn open_worker_assignment(
     .context("run_scheduling_cycle: insert worker assignment")?;
     timer.stmt(1);
     Ok(id)
+}
+
+/// Replace `sched_worker_assignment_schemas` with `schema_ids`, computed in Rust from data the
+/// cycle already holds — deriving them server-side from the placement tables would scan millions
+/// of rows for a few hundred ids. In the cycle's transaction, so a shortage freezes the previous
+/// set by never reaching this write.
+pub(super) async fn persist_assignment_schemas(
+    tx: &mut Transaction<'_, Postgres>,
+    schema_ids: &[SchemaId],
+) -> Result<()> {
+    let mut timer = PhaseTimer::new("run_scheduling_cycle:persist_assignment_schemas");
+    sqlx::query("DELETE FROM sched_worker_assignment_schemas")
+        .execute(&mut **tx)
+        .await
+        .context("persist_assignment_schemas: clear")?;
+    sqlx::query(
+        "INSERT INTO sched_worker_assignment_schemas (schema_id) SELECT * FROM UNNEST($1::int[])",
+    )
+    .bind(schema_ids)
+    .execute(&mut **tx)
+    .await
+    .context("persist_assignment_schemas: insert")?;
+    timer.stmt(schema_ids.len() as u64);
+    Ok(())
 }
 
 /// Tombstone chunks whose portal-drop landed at least `m_ticks` ago, stamping the drop tick.
@@ -144,8 +168,11 @@ pub(super) struct ActiveChunks {
     /// Full-column decode of the active rows, reused by the post-commit
     /// [`build_worker_assignment`] so it needn't re-read the chunks; shares `for_algo`'s `Arc`s.
     pub(super) published: FxHashMap<ChunkPk, WorkerAssignmentChunk>,
-    /// schema_ids of every chunk that has entered a worker assignment and is not yet tombstoned (ADR 0002)
-    pub(super) bundle_schema_ids: BTreeSet<SchemaId>,
+    /// schema_ids of every chunk that has entered a worker assignment and is not yet tombstoned
+    /// (ADR 0002) — the input, with the new ideal's ids, to the persisted assignment-schema set.
+    /// Hashed, not ordered: millions of per-row inserts, a few hundred distinct ids, no reader of
+    /// the order.
+    pub(super) bundle_schema_ids: FxHashSet<SchemaId>,
 }
 
 /// Reads every active chunk — registered, and neither `rejected` nor removed (tombstoned) — spanning
@@ -184,7 +211,7 @@ pub(super) async fn fetch_active_chunks_with_placement(
         current_placement: CurrentPlacement::default(),
         committed_placement: CurrentPlacement::default(),
         published: FxHashMap::default(),
-        bundle_schema_ids: BTreeSet::new(),
+        bundle_schema_ids: FxHashSet::default(),
     };
     let mut count = 0u64;
     while let Some(mut row) = stream

@@ -37,10 +37,12 @@ portal can name it, and it outlives every portal that might still name it.
 The bundle maps each schema to its definition, and carries a **content fingerprint** so a client can
 detect when the set of schemas changes.
 
-Its defining property: it is built from the worker assignment's **own chunks** — it holds exactly
-the schemas those chunks reference, and nothing else. So it matches the assignment by construction
-and can never drift from it (there is no separate storage scan that could disagree). The assignment
-and its bundle are frozen together as one pair.
+Its defining property: it is generated from **committed rows alone** — the persisted write-schema
+set of the last successful cycle (`sched_worker_assignment_schemas`, committed in the same
+transaction as the assignment it describes, and by construction the routable window of ADR 0002 at
+that commit) plus the current read schemas. It is therefore independent of whether the round's
+placement succeeded, and identical after a process restart: the same generator serves success,
+shortage, and visibility-driven refreshes.
 
 ## Lifecycle
 
@@ -59,15 +61,16 @@ chunk is retired from the worker assignment. A portal that is a little behind st
 not-yet-retired chunks, so it still resolves. Crucially this grace window is the **same clock** as
 the chunk's own retirement — there is no separate schema clock that could fall out of sync.
 
-**A capacity shortage freezes the assignment and its bundle together.** When the scheduler cannot
-place a full assignment, the last good assignment and its bundle stay frozen as a pair; neither
-advances. The frozen bundle still covers every chunk the current portal assignment can name —
-anything a portal still routes to was confirmed under that assignment, so its schema is in that
-bundle. Chunk retirement keeps running during a shortage, but it only retires chunks whose grace
-window has fully elapsed, never one a portal still routes to.
+**A capacity shortage freezes the assignment but not the bundle.** When the scheduler cannot place
+a full assignment, the last good assignment stays frozen — but the bundle keeps regenerating every
+round. Its write section cannot shrink below what the frozen assignment names (the persisted set is
+only replaced by the next successful cycle, atomically with the assignment that supersedes it), and
+its read section always carries the current read schemas — so a read schema promoted mid-shortage
+reaches portals immediately instead of waiting out the streak.
 
 In simulation, a consistency check confirms that every chunk the current worker and portal
-assignments name resolves under the frozen bundle.
+assignments name resolves under the round's bundle, and a strict oracle confirms every read schema
+a portal is told to use resolves in the bundle published with it.
 
 ## Limits
 
