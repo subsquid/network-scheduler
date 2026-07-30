@@ -51,6 +51,7 @@ use sqlx::Connection;
 use sqlx::postgres::PgConnection;
 
 use crate::metrics::{PhaseTimer, Timer};
+use crate::replication::ReplicationError;
 use crate::scheduler_storage::algorithm::{CurrentPlacement, ScheduleOutput, SchedulingAlgorithm};
 use crate::scheduler_storage::{
     AssignmentId, ChunkPk, DatasetPk, NewChunk, NewDataset, PortalAssignment, SchedulerStorage,
@@ -71,6 +72,17 @@ pub const DEFAULT_BATCH_SIZE: usize = 10_000;
 /// one for minutes) — the default the CLI's `--leadership-claim-timeout` takes, and what the tests
 /// connect with. Expiry surfaces as `AlreadyRunning`, i.e. "retry as a candidate".
 pub const DEFAULT_CLAIM_LOCK_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+
+/// The algorithm reports failures as `anyhow::Error`, so a capacity shortage has to be told apart
+/// from a genuine fault by downcast. Only the former is [`StorageError::Shortage`]: the service
+/// treats a shortage as a non-failure that leaves the fleet under-provisioned but the cycle
+/// committed, so anything else must stay a real error instead of being reported as missing capacity.
+fn classify_schedule_error(error: anyhow::Error) -> StorageError {
+    match error.downcast_ref::<ReplicationError>() {
+        Some(ReplicationError::NotEnoughCapacity) => StorageError::Shortage,
+        None => StorageError::Database(error),
+    }
+}
 
 /// Session memory GUCs (`work_mem`/`maintenance_work_mem`) for one connection.
 #[derive(Clone, Copy, Debug)]
@@ -713,7 +725,7 @@ impl SchedulerStorage for PostgresStorage {
                         &confirmed_routing,
                         config,
                     )
-                    .map_err(|_| StorageError::Shortage)?;
+                    .map_err(classify_schedule_error)?;
                 timer.items(chunk_count);
                 out
             };

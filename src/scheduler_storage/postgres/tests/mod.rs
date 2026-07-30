@@ -75,3 +75,21 @@ fn current_schema_id(storage: &mut PostgresStorage, ds: String) -> SchemaId {
         })
         .unwrap()
 }
+
+/// A capacity shortage is a first-class outcome the service treats as a non-failure (it does not
+/// stop the heartbeat), so an unrelated algorithm fault must not arrive wearing the same label.
+#[test]
+fn only_a_capacity_shortage_classifies_as_shortage() {
+    use crate::replication::ReplicationError;
+    use crate::scheduler_storage::postgres::classify_schedule_error;
+
+    assert!(matches!(
+        classify_schedule_error(ReplicationError::NotEnoughCapacity.into()),
+        StorageError::Shortage
+    ));
+    let other = classify_schedule_error(anyhow::anyhow!("routing table is corrupt"));
+    assert!(
+        matches!(other, StorageError::Database(_)),
+        "an unrelated fault must not read as missing capacity, got {other:?}"
+    );
+}
