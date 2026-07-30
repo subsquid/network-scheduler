@@ -10,10 +10,6 @@ pub mod metrics;
 pub mod new_chunk;
 pub mod new_dataset;
 
-/// The Postgres test harness, shared by every crate that tests against this schema.
-#[cfg(feature = "pg-testkit")]
-pub mod pg_harness;
-
 pub use dataset_schema::{DatasetSchema, TableSchema};
 pub use error::{IngestError, StorageError};
 pub use ids::{ChunkPk, DatasetPk, ReadSchemaId, SchemaId, WorkerPk};

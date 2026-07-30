@@ -18,19 +18,6 @@ sqlx = { workspace = true }
 thiserror = "2.0.12"
 utoipa = { version = "5", optional = true }
 tracing = "0.1.41"
-# `pg-testkit` only — a container-backed test harness, never in a production build.
-dtor = { version = "1.0.5", optional = true }
-testcontainers = { version = "0.27.2", features = ["watchdog"], optional = true }
-testcontainers-modules = { version = "0.15", features = ["postgres"], optional = true }
-tokio = { version = "1.45.0", features = ["rt", "net", "time"], optional = true }
 
 [features]
 openapi = ["dep:utoipa"]
-# The shared Postgres test harness ([`pg_harness`]). Dependants turn it on through their
-# dev-dependencies, so it never reaches a production build.
-pg-testkit = [
-    "dep:dtor",
-    "dep:testcontainers",
-    "dep:testcontainers-modules",
-    "dep:tokio",
-]

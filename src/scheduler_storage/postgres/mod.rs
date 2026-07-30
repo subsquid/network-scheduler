@@ -60,7 +60,7 @@ pub struct PostgresStorage {
     /// Declared last so it drops after `conn`: the harness can only drop a database once this
     /// storage's connection to it is gone.
     #[cfg(any(test, feature = "pg-testkit"))]
-    case_db: Option<scheduler_metadata::pg_harness::CaseDb>,
+    case_db: Option<pg_testkit::CaseDb>,
 }
 
 impl PostgresStorage {
@@ -110,7 +110,7 @@ impl PostgresStorage {
 
     /// Tie a harness database to this storage, so the case's database goes when the storage does.
     #[cfg(any(test, feature = "pg-testkit"))]
-    pub(crate) fn owning(mut self, db: scheduler_metadata::pg_harness::CaseDb) -> Self {
+    pub(crate) fn owning(mut self, db: pg_testkit::CaseDb) -> Self {
         self.case_db = Some(db);
         self
     }

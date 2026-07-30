@@ -1,9 +1,16 @@
 //! One Postgres container per test binary, a migrated template database, and a fresh per-case
 //! database cloned from it.
 //!
-//! Here rather than in a dependent crate so every suite that tests against this schema shares one
-//! harness: the scheduler's storage tests and simulations, the reshuffle-sim, and the metadata
-//! service. Each is a separate process, so each gets its own container.
+//! Its own crate so every suite that tests against this schema shares one harness — the scheduler's
+//! storage tests and simulations, the reshuffle-sim, and the metadata service. Each is a separate
+//! process, so each gets its own container.
+//!
+//! A crate and not a feature of `scheduler-metadata`: Cargo unifies features across workspace
+//! members built together, so a feature there would put a docker client in `metadata-service`, which
+//! ships as an image. Nothing can unify a crate on.
+//!
+//! It migrates its template with this workspace's `MIGRATOR`, so it is this project's harness, not a
+//! general-purpose one.
 //!
 //! It hands out URLs, not connections. The scheduler wants one `PgConnection` holding its advisory
 //! lock; the metadata service wants several pools; a URL is all they have in common — and keeping
@@ -20,7 +27,7 @@ use testcontainers_modules::testcontainers::core::Mount;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use testcontainers_modules::testcontainers::{ContainerAsync, ImageExt};
 
-use crate::explain;
+use scheduler_metadata::explain;
 
 /// Run `f` on a thread that is inside no runtime, and block until it finishes.
 ///
@@ -153,7 +160,7 @@ fn build_shared(pgdata: PgData) -> Shared {
         let mut conn = sqlx::PgConnection::connect(&template_url)
             .await
             .expect("connect template");
-        crate::pg::MIGRATOR
+        scheduler_metadata::pg::MIGRATOR
             .run(&mut conn)
             .await
             .expect("migrate template");

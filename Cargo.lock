@@ -2909,6 +2909,7 @@ dependencies = [
  "bytesize",
  "clap",
  "humantime",
+ "pg-testkit",
  "prometheus-client",
  "scheduler-metadata",
  "secrecy",
@@ -3017,6 +3018,7 @@ dependencies = [
  "multihash",
  "parking_lot",
  "parquet",
+ "pg-testkit",
  "prometheus-client",
  "proptest",
  "proptest-state-machine",
@@ -3379,6 +3381,19 @@ checksum = "b4c5cc86750666a3ed20bdaf5ca2a0344f9c67674cae0515bec2da16fbaa47db"
 dependencies = [
  "fixedbitset",
  "indexmap 2.14.0",
+]
+
+[[package]]
+name = "pg-testkit"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "dtor",
+ "scheduler-metadata",
+ "sqlx",
+ "testcontainers",
+ "testcontainers-modules",
+ "tokio",
 ]
 
 [[package]]
@@ -4109,17 +4124,13 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "bit-vec",
- "dtor",
  "lazy_static",
  "prometheus-client",
  "serde",
  "serde_json",
  "sha2 0.10.9",
  "sqlx",
- "testcontainers",
- "testcontainers-modules",
  "thiserror 2.0.18",
- "tokio",
  "tracing",
  "utoipa",
 ]

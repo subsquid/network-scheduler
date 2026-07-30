@@ -1,10 +1,10 @@
-//! The scheduler's view of the shared harness in [`scheduler_metadata::pg_harness`]: a case
+//! The scheduler's view of the shared harness in [`pg_testkit`]: a case
 //! database, connected as a [`PostgresStorage`] that owns it and drops it when it drops.
 //!
 //! `PostgresStorage::connect` `block_on`s its own runtime and nested `block_on` panics, so it runs
 //! from plain sync context — the harness's own admin SQL is already behind its runtime.
 
-pub use scheduler_metadata::pg_harness::{CaseDb, PgData};
+pub use pg_testkit::{CaseDb, PgData};
 
 use crate::scheduler_storage::postgres::PostgresStorage;
 
@@ -25,14 +25,14 @@ pub(crate) fn fresh_db(prefix: &str, id: u64) -> PostgresStorage {
 /// database lives until the returned [`CaseDb`] drops, so hold it for as long as the URL is used.
 #[cfg(test)]
 pub(crate) fn fresh_db_url(prefix: &str, id: u64) -> (String, CaseDb) {
-    scheduler_metadata::pg_harness::fresh_db_url(TEST_PGDATA, prefix, id)
+    pg_testkit::fresh_db_url(TEST_PGDATA, prefix, id)
 }
 
 /// [`fresh_db`] with an explicit container backing, for callers whose DB won't fit the test tmpfs —
 /// the mainnet-scale reshuffle-sim passes [`PgData::Disk`]. The first call in a process fixes the
 /// backing for the shared container; later calls reuse it.
 pub fn fresh_db_with(pgdata: PgData, prefix: &str, id: u64) -> PostgresStorage {
-    let (url, db) = scheduler_metadata::pg_harness::fresh_db_url(pgdata, prefix, id);
+    let (url, db) = pg_testkit::fresh_db_url(pgdata, prefix, id);
     PostgresStorage::connect(&url)
         .expect("connect fresh db")
         .owning(db)

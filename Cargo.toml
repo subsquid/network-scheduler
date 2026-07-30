@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/scheduler-metadata", "crates/metadata-service", "tools/compare_fb", "tools/clear_block_hash", "tools/reshuffle_sim"]
+members = ["crates/scheduler-metadata", "crates/metadata-service", "crates/pg-testkit", "tools/compare_fb", "tools/clear_block_hash", "tools/reshuffle_sim"]
 
 [workspace.dependencies]
 bit-vec = "0.8"
@@ -18,7 +18,7 @@ mvcc-chunks = ["dep:sqlx", "dep:bit-vec", "dep:humantime", "dep:scheduler-metada
 # Exposes the Postgres testcontainer harness (`scheduler_storage::test_harness::pg_harness`) to other
 # crates — e.g. reshuffle-sim. Implies the Postgres backend. The crate's own tests get the harness via
 # `cfg(test)` + dev-dependencies, so they don't need this feature.
-pg-testkit = ["mvcc-chunks", "scheduler-metadata/pg-testkit"]
+pg-testkit = ["mvcc-chunks", "dep:pg-testkit"]
 
 [dependencies]
 anyhow = "1.0.98"
@@ -42,6 +42,8 @@ parking_lot = "0.12.3"
 parquet = "54.2"
 prometheus-client = { workspace = true }
 scheduler-metadata = { path = "crates/scheduler-metadata", optional = true }
+# Hands the harness to reshuffle-sim, which starts its own Postgres when given no --database-url.
+pg-testkit = { path = "crates/pg-testkit", optional = true }
 rand = "0.9.1"
 rayon = "1.10.0"
 seahash = "4.1.0"
@@ -65,9 +67,9 @@ rustc-hash = "2"
 [dev-dependencies]
 claims = "0.8"
 maplit = "1.0.2"
-# The crate's own tests get the harness here rather than through `pg-testkit`, which exists only to
-# hand it to downstream crates.
-scheduler-metadata = { path = "crates/scheduler-metadata", features = ["pg-testkit"] }
+# The crate's own tests get the harness here rather than through the `pg-testkit` feature, which
+# exists only to hand it to downstream crates.
+pg-testkit = { path = "crates/pg-testkit" }
 # The iterative state-machine runner — whose generator can read the live SUT — lives in
 # `proptest-state-machine::iterative_runner`. Pinned to the HEAD of define-null/proptest's
 # `defnull/iterative-runner-2` branch. Both crates share the rev so they use one `proptest` build.

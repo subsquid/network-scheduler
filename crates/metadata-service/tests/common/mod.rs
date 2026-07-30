@@ -1,4 +1,4 @@
-//! A database per test from the shared harness in [`scheduler_metadata::pg_harness`]; router
+//! A database per test from the shared harness in [`pg_testkit`]; router
 //! mounted and driven via tower oneshot.
 
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -12,8 +12,8 @@ use sqlx::postgres::PgPoolOptions;
 
 use metadata_service::config::{IngesterConfig, TokensConfig};
 use metadata_service::{AppState, TokenStore, build_router};
+use pg_testkit::{CaseDb, PgData};
 use scheduler_metadata::PgIngest;
-use scheduler_metadata::pg_harness::{CaseDb, PgData};
 
 pub const ADMIN_TOKEN: &str = "admin-secret";
 pub const INGESTER_TOKEN: &str = "ingester-secret";
@@ -39,11 +39,7 @@ pub struct TestApp {
 
 pub async fn test_app() -> TestApp {
     static N: AtomicU64 = AtomicU64::new(0);
-    let (db_url, _db) = scheduler_metadata::pg_harness::fresh_db_url(
-        PGDATA,
-        "md",
-        N.fetch_add(1, Ordering::Relaxed),
-    );
+    let (db_url, _db) = pg_testkit::fresh_db_url(PGDATA, "md", N.fetch_add(1, Ordering::Relaxed));
     // Small pool so parallel tests don't exhaust PG.
     let pool = PgPoolOptions::new()
         .max_connections(4)
