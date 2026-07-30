@@ -27,43 +27,81 @@ use tokio_util::sync::CancellationToken;
 use super::now_ticks;
 
 /// How far past its own period a task may go before it counts as stalled. Generous because the
-/// action is a process restart: a cycle running 3x its interval is wedged, one running 1.5x is a
+/// action is a process restart: a pass running 3x its interval is wedged, one running 1.5x is a
 /// big database. A placeholder like the intervals themselves — the exported timestamps are what
 /// alerting should be tuned on.
 const STALL_PERIODS: u32 = 3;
 
-/// One task's last completed unit of work.
+/// One task's liveness and freshness, which are deliberately separate signals:
+///
+/// * `last_pass` — the loop came round again, whether or not its work landed. This is what
+///   `/health` reads, because the only thing a restart fixes is a wedged uncancellable call. A
+///   ClickHouse or S3 outage is not that: killing the process cannot reach the dependency, and the
+///   replacement has to redo startup against the same outage.
+/// * `last_success` — work actually landed. Exported as `task_last_success_seconds` and left to
+///   alerting, which can page a human instead of restarting a process that is doing its best.
+///
+/// Both start at process construction, so a task that never succeeds still goes stale on its own
+/// clock rather than staying green forever behind an unbounded startup grace.
 pub struct Heartbeat {
     task: &'static str,
     period: Duration,
-    /// Unix seconds; 0 until the first success.
+    /// Unix seconds of the last completed pass; process start until the first one.
+    last_pass: AtomicU64,
+    /// Unix seconds of the last landed unit of work; 0 until the first — never a lie about work
+    /// that did not happen, so alerting on `now - task_last_success` stays honest.
     last_success: AtomicU64,
 }
 
 impl Heartbeat {
     pub fn new(task: &'static str, period: Duration) -> Arc<Self> {
-        Arc::new(Self {
+        let heartbeat = Arc::new(Self {
             task,
             period,
+            last_pass: AtomicU64::new(now_ticks()),
             last_success: AtomicU64::new(0),
-        })
+        });
+        // Publish both series up front. `get_or_create` inside the setters alone would leave them
+        // absent exactly when a task never succeeds — the case the alert exists for.
+        heartbeat.publish(&crate::metrics::TASK_LAST_PASS, heartbeat.last_pass());
+        heartbeat.publish(&crate::metrics::TASK_LAST_SUCCESS, 0);
+        heartbeat
     }
 
-    /// Record a completed unit of work.
+    /// Record a completed pass: the loop returned instead of wedging. Says nothing about whether
+    /// the work landed — that is [`Self::beat`].
+    pub fn still_running(&self) {
+        let now = now_ticks();
+        self.last_pass.store(now, Ordering::Relaxed);
+        self.publish(&crate::metrics::TASK_LAST_PASS, now as i64);
+    }
+
+    /// Record a landed unit of work. Also a completed pass, so callers never need both.
     pub fn beat(&self) {
         let now = now_ticks();
         self.last_success.store(now, Ordering::Relaxed);
-        crate::metrics::TASK_LAST_SUCCESS
-            .get_or_create(&vec![("task", self.task.to_string())])
-            .set(now as i64);
+        self.publish(&crate::metrics::TASK_LAST_SUCCESS, now as i64);
+        self.still_running();
     }
 
-    /// `None` while the task has not completed anything yet — startup, not a stall.
+    fn publish(&self, family: &crate::metrics::TaskGauges, value: i64) {
+        family
+            .get_or_create(&vec![("task", self.task.to_string())])
+            .set(value);
+    }
+
+    fn last_pass(&self) -> i64 {
+        self.last_pass.load(Ordering::Relaxed) as i64
+    }
+
+    /// `Some(age)` once the loop has not come round for [`STALL_PERIODS`] of its period — a wedge,
+    /// the one failure a restart resolves. A task looping on failed dependencies is *not* stalled;
+    /// its staleness shows up in `task_last_success_seconds` instead.
     fn stalled_for(&self, now: u64) -> Option<Duration> {
-        let last = self.last_success.load(Ordering::Relaxed);
+        let last = self.last_pass.load(Ordering::Relaxed);
         let budget = self.period * STALL_PERIODS;
         let age = Duration::from_secs(now.saturating_sub(last));
-        (last != 0 && age > budget).then_some(age)
+        (age > budget).then_some(age)
     }
 }
 
@@ -160,17 +198,42 @@ mod tests {
 
     const PERIOD: Duration = Duration::from_secs(60);
 
+    /// A task still inside its first pass is not stalled — but the grace is bounded by process
+    /// start, not open-ended. The old rule ("no success yet" ⇒ never stalled) meant a task that
+    /// failed from its very first pass stayed green forever.
     #[test]
-    fn a_task_that_never_finished_anything_is_not_stalled() {
-        // Startup: `/health` must not kill an instance still running its first pass.
+    fn a_task_that_never_finished_anything_stalls_on_its_own_clock() {
         let hb = Heartbeat::new("test", PERIOD);
-        assert_eq!(hb.stalled_for(1_000_000), None);
+        let started = hb.last_pass.load(Ordering::Relaxed);
+        let budget = PERIOD.as_secs() * u64::from(STALL_PERIODS);
+        assert_eq!(hb.stalled_for(started + budget), None, "still starting up");
+        assert!(
+            hb.stalled_for(started + budget + 1).is_some(),
+            "a task that never completed a pass must not stay green forever"
+        );
+    }
+
+    /// Liveness follows passes, not successes: a task retrying a failed dependency is running, and
+    /// restarting it would not reach the dependency. Freshness is `task_last_success`'s job.
+    #[test]
+    fn a_task_looping_without_success_is_not_stalled() {
+        let hb = Heartbeat::new("test", PERIOD);
+        let budget = PERIOD.as_secs() * u64::from(STALL_PERIODS);
+        hb.last_pass.store(1_000, Ordering::Relaxed);
+        assert!(hb.stalled_for(1_000 + budget + 1).is_some(), "wedged");
+        hb.still_running();
+        assert_eq!(hb.stalled_for(now_ticks()), None);
+        assert_eq!(
+            hb.last_success.load(Ordering::Relaxed),
+            0,
+            "a pass is not a success"
+        );
     }
 
     #[test]
     fn stall_is_reported_only_past_the_budget() {
         let hb = Heartbeat::new("test", PERIOD);
-        hb.last_success.store(1_000, Ordering::Relaxed);
+        hb.last_pass.store(1_000, Ordering::Relaxed);
         let budget = PERIOD.as_secs() * u64::from(STALL_PERIODS);
         assert_eq!(hb.stalled_for(1_000 + budget), None, "at the budget");
         assert_eq!(
@@ -180,12 +243,30 @@ mod tests {
     }
 
     #[test]
-    fn a_beat_clears_a_stall() {
+    fn a_beat_clears_a_stall_and_counts_as_a_pass() {
         let hb = Heartbeat::new("test", PERIOD);
-        hb.last_success.store(1_000, Ordering::Relaxed);
+        hb.last_pass.store(1_000, Ordering::Relaxed);
         assert!(hb.stalled_for(1_000_000).is_some());
         hb.beat();
         assert_eq!(hb.stalled_for(now_ticks()), None);
+        assert_ne!(hb.last_success.load(Ordering::Relaxed), 0);
+    }
+
+    /// Both series exist from construction. A `get_or_create` only in the setters would leave
+    /// `task_last_success` absent exactly when a task never succeeds — the case it is alerted on.
+    #[test]
+    fn both_series_are_published_before_any_work_lands() {
+        let registry = crate::metrics::register_metrics("test".to_string());
+        let _hb = Heartbeat::new("published", PERIOD);
+        let encoded = crate::metrics::encode_metrics(&registry).expect("encode");
+        assert!(
+            encoded.contains(r#"task_last_success_seconds{network="test",task="published"} 0"#),
+            "missing zeroed success series:\n{encoded}"
+        );
+        assert!(
+            encoded.contains(r#"task_last_pass_seconds{network="test",task="published"}"#),
+            "missing pass series:\n{encoded}"
+        );
     }
 
     /// The surface end to end: it serves before readiness is marked, `/ready` flips, `/metrics`
@@ -248,11 +329,15 @@ mod tests {
             assert_eq!(get("/ready").await.0, 200);
 
             assert_eq!(get("/health").await.0, 200, "no beat yet is not a stall");
-            hb.last_success.store(
+            // Liveness follows passes, not successes: only a loop that stopped coming round is a
+            // wedge a restart can fix.
+            hb.last_pass.store(
                 now_ticks() - PERIOD.as_secs() * u64::from(STALL_PERIODS) - 1,
                 Ordering::Relaxed,
             );
             assert_eq!(get("/health").await.0, 503, "a stalled task fails liveness");
+            hb.still_running();
+            assert_eq!(get("/health").await.0, 200, "a pass clears the stall");
             hb.beat();
             assert_eq!(get("/health").await.0, 200);
 

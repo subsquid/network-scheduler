@@ -44,10 +44,21 @@ lazy_static::lazy_static! {
 
     /// Service mode: per-task heartbeat and leadership, the signals a one-shot run has no use for.
     /// A task's timestamp stops advancing the moment its work stops completing, whatever the cause,
-    /// so `now - task_last_success` is the one number that makes a wedge visible.
+    /// so `now - task_last_success` is what makes a task that is running but getting nowhere
+    /// visible. It is deliberately not what `/health` reads: see `multistep_controller::ops`.
+    /// `0` means the task has never completed a unit of work.
     pub static ref TASK_LAST_SUCCESS: Family<Labels, Gauge> = Default::default();
+    /// Service mode: the loop came round, whether or not its work landed. `now - task_last_pass`
+    /// past a few periods means wedged, which is the one state a restart resolves.
+    pub static ref TASK_LAST_PASS: Family<Labels, Gauge> = Default::default();
     pub static ref LEADERSHIP_EPOCH: Gauge = Default::default();
+    /// Service mode: `1` while the last cycle could not satisfy the replication floors. A capacity
+    /// verdict, not a failure — the cycle still commits — so it needs its own signal.
+    pub static ref SCHEDULING_SHORTAGE: Gauge = Default::default();
 }
+
+/// The per-task gauge families in this module, so `ops` can publish to either one.
+pub type TaskGauges = Family<Labels, Gauge>;
 
 // Without the `mvcc-chunks` crate there is no `PhaseTimer`, so `exec_times` is a root-local family
 // fed only by `Timer`. (With the feature it's the crate's, re-exported above.)
@@ -294,14 +305,25 @@ pub fn register_metrics(network: String) -> Registry {
     );
     registry.register_with_unit(
         "task_last_success",
-        "Unix time of a service task's last completed unit of work",
+        "Unix time of a service task's last completed unit of work (0 if never)",
         Unit::Seconds,
         TASK_LAST_SUCCESS.clone(),
+    );
+    registry.register_with_unit(
+        "task_last_pass",
+        "Unix time a service task's loop last came round, successfully or not",
+        Unit::Seconds,
+        TASK_LAST_PASS.clone(),
     );
     registry.register(
         "leadership_epoch",
         "Leadership epoch this instance claimed at startup",
         LEADERSHIP_EPOCH.clone(),
+    );
+    registry.register(
+        "scheduling_shortage",
+        "1 while worker capacity cannot satisfy the configured replication floors",
+        SCHEDULING_SHORTAGE.clone(),
     );
 
     registry

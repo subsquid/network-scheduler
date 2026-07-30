@@ -68,6 +68,9 @@ impl WorkerStatusTask {
         .is_continue()
         {
             self.tick(&mut storage, &mut gate)?;
+            // Liveness: the pass returned rather than wedging, whatever its outcome. A ClickHouse
+            // outage leaves `task_last_success` behind without asking for a restart.
+            self.heartbeat.still_running();
         }
         Ok(())
     }

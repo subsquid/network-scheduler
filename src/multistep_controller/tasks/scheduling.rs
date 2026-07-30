@@ -20,7 +20,7 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     cli, metrics,
     scheduler_storage::{
-        AssignmentId, SchedulerStorage,
+        AssignmentId, SchedulerStorage, StorageError,
         algorithm::MultistepAlgorithm,
         postgres::{Epoch, PostgresStorage},
     },
@@ -94,8 +94,9 @@ impl SchedulingTask {
             return Ok(());
         }
         loop {
-            // Beat only once the whole tick landed: a task looping on retryable failures has to
-            // look stalled, not healthy.
+            // Beat only once the whole tick landed: `task_last_success` has to stop advancing while
+            // work is not landing. Liveness is a separate signal (`still_running` below) — a task
+            // retrying a failed dependency is not wedged, and restarting it fixes nothing.
             let mut done = true;
             let cycle = {
                 let _timer = metrics::Timer::new("multistep:schedule");
@@ -113,6 +114,20 @@ impl SchedulingTask {
                     );
                     // Bounds the confirmation gate's trust in worker-echoed ids.
                     latest_published.send_replace(assignment.id);
+                    metrics::SCHEDULING_SHORTAGE.set(0);
+                }
+                // Not a failure: the fleet cannot hold the configured replication floors, phase A
+                // still committed, and GC and visibility below still run. Adding workers or
+                // removing chunks clears it. Treating it as a failure would stop
+                // `task_last_success` advancing and, once `/health` keyed off that, have the
+                // orchestrator restart the process every few periods for a capacity problem no
+                // restart can fix.
+                Err(StorageError::Shortage) => {
+                    tracing::warn!(
+                        "Scheduling shortage: worker capacity cannot satisfy all replication \
+                         floors; add workers or remove chunks"
+                    );
+                    metrics::SCHEDULING_SHORTAGE.set(1);
                 }
                 Err(e) => {
                     retry_or_die(&mut storage, ping_timeout, e, "scheduling cycle")?;
@@ -159,6 +174,8 @@ impl SchedulingTask {
             if done {
                 heartbeat.beat();
             }
+            // Liveness: the pass returned rather than wedging, whatever its outcome.
+            heartbeat.still_running();
             if wait_for_next_tick(&handle, &token, period, probe_interval, || {
                 Ok(storage.ping(ping_timeout)?)
             })?
