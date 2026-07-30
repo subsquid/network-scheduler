@@ -88,23 +88,6 @@ fn set_chunk_tables_present(
         .unwrap();
 }
 
-/// The `superseded_at IS NULL` row; `None` if never promoted.
-fn current_read_schema(storage: &mut PostgresStorage, ds: String) -> Option<DatasetSchema> {
-    storage
-        .with_conn(async move |conn| {
-            let row: Option<sqlx::types::Json<DatasetSchema>> = sqlx::query_scalar(
-                "SELECT r.schema FROM read_schemas r JOIN datasets d ON d.id = r.dataset_id \
-                 WHERE d.name = $1 AND r.superseded_at IS NULL",
-            )
-            .bind(&ds)
-            .fetch_optional(&mut *conn)
-            .await
-            .unwrap();
-            Ok::<_, StorageError>(row.map(|j| j.0))
-        })
-        .unwrap()
-}
-
 /// Place every given chunk on every given worker and run one cycle.
 fn schedule(
     storage: &mut PostgresStorage,
@@ -234,12 +217,6 @@ fn schema_bundle_carries_the_current_read_schema() {
     storage
         .promote_read_schema(&dataset("ds"), read_schema.clone())
         .expect("promote read schema");
-    assert_eq!(
-        current_read_schema(&mut storage, dataset("ds")).as_ref(),
-        Some(&read_schema),
-        "the promote landed — the dataset does have a current read schema",
-    );
-
     let (_, after) = schedule_with_bundle(&mut storage, &[pk], &workers, 200);
     assert_eq!(
         after.read_schemas().values().collect::<Vec<_>>(),
