@@ -176,8 +176,9 @@ pub trait SchedulerStorage {
         Algo: crate::scheduler_storage::algorithm::SchedulingAlgorithm + Send + Sync;
 
     /// The schema bundle, from committed rows alone — identical under success, shortage, and after
-    /// a restart. Write section: routable window (ADR 0002) ∪ the persisted set. Read section: the
-    /// CURRENT read schema of every referenced dataset, so a promote reaches the very next bundle.
+    /// a restart. Write section: the persisted set of the last successful cycle (≡ the routable
+    /// window at that commit, which only shrinks until the next success). Read section: the CURRENT
+    /// read schema of every referenced dataset, so a promote reaches the very next bundle.
     fn generate_schema_bundle(&self) -> Result<SchemaBundle, StorageError>;
 
     /// Advance the confirmation watermark and replay pending routing diffs

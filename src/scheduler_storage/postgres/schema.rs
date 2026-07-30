@@ -63,10 +63,11 @@ pub(super) async fn read_schemas_by_id(
 }
 
 /// One bundle from committed rows alone — identical under success, shortage, and on a fresh
-/// process. Write section: routable window ∪ the persisted set (the window alone can shrink below
-/// what the frozen assignment names — Phase A keeps tombstoning during a shortage). Read section:
-/// the CURRENT read schema of every referenced dataset. One `REPEATABLE READ, READ ONLY` snapshot;
-/// strict loads — a referenced id with no `schemas` row is an error, never a silent shrink.
+/// process. Write section: the persisted set of the last successful cycle, which by construction
+/// equals the routable window at that commit and always covers it afterwards (window entry requires
+/// a stamp only a successful cycle writes; tombstoning only shrinks it). Read section: the CURRENT
+/// read schema of every referenced dataset. One `REPEATABLE READ, READ ONLY` snapshot; strict
+/// loads — a referenced id with no `schemas` row is an error, never a silent shrink.
 pub(super) async fn generate_bundle(conn: &mut PgConnection) -> Result<SchemaBundle> {
     let _timer = crate::metrics::Timer::new("generate_schema_bundle");
     let mut tx = conn.begin().await.context("generate_bundle: begin")?;
@@ -75,17 +76,10 @@ pub(super) async fn generate_bundle(conn: &mut PgConnection) -> Result<SchemaBun
         .await
         .context("generate_bundle: set isolation")?;
 
-    // (schema id, dataset name) over window ∪ persisted; the persisted arm resolves its dataset
-    // through the schema row (`chunks_schema_same_dataset` makes that the chunk's own dataset).
+    // A few hundred rows by PK joins; the dataset comes through the schema row
+    // (`chunks_schema_same_dataset` makes that the chunk's own dataset).
     let refs: Vec<(SchemaId, String)> = sqlx::query_as(
-        "SELECT DISTINCT c.schema_id, d.name \
-         FROM sched_chunk_metadata m \
-         JOIN chunks c ON c.chunk_pk = m.chunk_pk \
-         JOIN datasets d ON d.id = c.dataset_id \
-         WHERE m.applied_at_worker_assignment_id IS NOT NULL \
-           AND m.dropped_from_worker_assignment_at IS NULL \
-         UNION \
-         SELECT w.schema_id, d.name \
+        "SELECT w.schema_id, d.name \
          FROM sched_worker_assignment_schemas w \
          JOIN schemas s ON s.id = w.schema_id \
          JOIN datasets d ON d.id = s.dataset_id",
@@ -94,12 +88,7 @@ pub(super) async fn generate_bundle(conn: &mut PgConnection) -> Result<SchemaBun
     .await
     .context("generate_bundle: collect refs")?;
 
-    let schema_ids: Vec<SchemaId> = refs
-        .iter()
-        .map(|(id, _)| *id)
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect();
+    let schema_ids: Vec<SchemaId> = refs.iter().map(|(id, _)| *id).collect();
     let datasets: BTreeSet<&str> = refs.iter().map(|(_, d)| d.as_str()).collect();
     let dataset_refs: Vec<&str> = datasets.into_iter().collect();
 

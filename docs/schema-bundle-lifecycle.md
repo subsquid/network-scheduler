@@ -37,12 +37,12 @@ portal can name it, and it outlives every portal that might still name it.
 The bundle maps each schema to its definition, and carries a **content fingerprint** so a client can
 detect when the set of schemas changes.
 
-Its defining property: it is generated from **committed chunk rows alone** — the routable window
-(ADR 0002) plus the persisted write-schema set of the last successful assignment
-(`sched_worker_assignment_schemas`, committed in the same transaction as the assignment it
-describes). It is therefore independent of whether the round's placement succeeded, and identical
-after a process restart: the same generator serves success, shortage, and visibility-driven
-refreshes.
+Its defining property: it is generated from **committed rows alone** — the persisted write-schema
+set of the last successful cycle (`sched_worker_assignment_schemas`, committed in the same
+transaction as the assignment it describes, and by construction the routable window of ADR 0002 at
+that commit) plus the current read schemas. It is therefore independent of whether the round's
+placement succeeded, and identical after a process restart: the same generator serves success,
+shortage, and visibility-driven refreshes.
 
 ## Lifecycle
 

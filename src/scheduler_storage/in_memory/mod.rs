@@ -815,15 +815,10 @@ impl SchedulerStorage for InMemoryStorage {
     }
 
     fn generate_schema_bundle(&self) -> Result<SchemaBundle, StorageError> {
-        // Postgres `generate_bundle` semantics, verbatim.
-        let mut ids: BTreeSet<SchemaId> = self.worker_assignment_schemas.clone();
-        let mut datasets: BTreeSet<Dataset> = BTreeSet::new();
-        for chunk in self.routable_window_chunks() {
-            ids.insert(chunk.schema_id);
-            datasets.insert((*chunk.dataset).clone());
-        }
+        // Postgres `generate_bundle` semantics, verbatim: the persisted set covers the window.
         let mut schemas: BTreeMap<SchemaId, DatasetSchema> = BTreeMap::new();
-        for id in ids {
+        let mut datasets: BTreeSet<Dataset> = BTreeSet::new();
+        for id in self.worker_assignment_schemas.iter().copied() {
             // A referenced id missing from `schemas` is an error, never a silent shrink.
             let schema = self.schemas.get(&id).ok_or_else(|| {
                 StorageError::Database(anyhow::anyhow!(
