@@ -2988,6 +2988,7 @@ dependencies = [
  "anyhow",
  "aws-config",
  "aws-sdk-s3",
+ "axum",
  "bit-vec",
  "bytesize",
  "chrono",
@@ -3028,6 +3029,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-util",
  "tracing",
  "tracing-subscriber",
 ]

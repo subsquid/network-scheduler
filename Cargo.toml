@@ -14,7 +14,7 @@ edition = "2024"
 [features]
 default = []
 # The MVCC chunk-lifecycle storage / multi-step scheduler (Postgres backend + sim tests).
-mvcc-chunks = ["dep:sqlx", "dep:bit-vec", "dep:humantime", "dep:scheduler-metadata", "sqd-assignments/mvcc-chunks"]
+mvcc-chunks = ["dep:sqlx", "dep:bit-vec", "dep:humantime", "dep:scheduler-metadata", "dep:tokio-util", "dep:axum", "sqd-assignments/mvcc-chunks"]
 # Exposes the Postgres testcontainer harness (`scheduler_storage::test_harness::pg_harness`) to other
 # crates — e.g. reshuffle-sim. Implies the Postgres backend. The crate's own tests get the harness via
 # `cfg(test)` + dev-dependencies, so they don't need this feature.
@@ -60,6 +60,8 @@ sqd-assignments = { git = "https://github.com/subsquid/sqd-network.git", rev = "
 tempfile = "3.20.0"
 thiserror = "2.0.12"
 tokio = { version = "1.45.0", features = ["full"] }
+tokio-util = { version = "0.7", optional = true }
+axum = { version = "0.8", optional = true }
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.19", features = ["env-filter", "parking_lot"] }
 secrecy = { version = "0.10.3", features = ["serde"] }

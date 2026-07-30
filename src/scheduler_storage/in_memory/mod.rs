@@ -526,6 +526,66 @@ impl InMemoryStorage {
             .retain(|(_, worker_id), _| !evicted.contains(worker_id));
     }
 
+    /// Drop stale mappings held by inactive (or evicted) workers. State-based, like the Postgres
+    /// phase-A delete: departures detected by any earlier `update_worker_set` are settled here.
+    fn delete_inactive_stale_mappings(&mut self) {
+        let workers = &self.sched_workers;
+        self.sched_stale_mappings.retain(|(_, worker_id), _| {
+            workers
+                .get(worker_id)
+                .is_some_and(|entry| entry.inactive_since.is_none())
+        });
+    }
+
+    /// Give a drain back its committed-holder status when every worker it was handing off to has
+    /// departed. Confirmation is a quorum of *active* workers, so a recipient's departure lets
+    /// the handoff count as "confirmed" without any download (a vacuous confirmation — Invariant
+    /// 2, docs/mvcc-storage.md); the drain's expiry clock would then delete the fleet's last real
+    /// copy. Promotion takes the copy off the expiry clock and under the retention floor. Excess
+    /// copies become ordinary drains in later cycles; departed ideal rows fall out with the next
+    /// cycle's diff.
+    ///
+    /// Runs after [`Self::delete_inactive_stale_mappings`] (every leftover stale row belongs to an
+    /// active worker) and before the drain expiry — rescue before reaper.
+    fn promote_orphaned_drains(&mut self) {
+        // handoff_void: ideal rows with holders, none of them active.
+        let handoff_void: HashSet<ChunkPk> = self
+            .sched_ideal_chunk_workers
+            .iter()
+            .filter(|(_, holders)| {
+                !holders.is_empty()
+                    && holders.iter().all(|w| {
+                        self.sched_workers
+                            .get(w)
+                            .is_none_or(|entry| entry.inactive_since.is_some())
+                    })
+            })
+            .map(|(pk, _)| *pk)
+            .collect();
+        let promoted: Vec<(ChunkPk, WorkerPk)> = self
+            .sched_stale_mappings
+            .keys()
+            .filter(|(pk, worker_id)| {
+                handoff_void.contains(pk)
+                    && self
+                        .sched_workers
+                        .get(worker_id)
+                        .is_some_and(|entry| entry.inactive_since.is_none())
+            })
+            .copied()
+            .collect();
+        for (pk, worker_id) in promoted {
+            self.sched_stale_mappings.remove(&(pk, worker_id));
+            let holders = self
+                .sched_ideal_chunk_workers
+                .get_mut(&pk)
+                .expect("promoted chunk came from the ideal");
+            if !holders.contains(&worker_id) {
+                holders.push(worker_id);
+            }
+        }
+    }
+
     /// True if `dropped_at_portal` names a portal assignment created at or before `cutoff` — i.e.
     /// its M-tick grace has elapsed. `None` (never dropped) is not elapsed.
     fn portal_drop_elapsed(
@@ -903,22 +963,19 @@ impl SchedulerStorage for InMemoryStorage {
         &mut self,
         active_workers: &[Worker],
         now: Tick,
-        gc_ticks: u64,
     ) -> Result<(), StorageError> {
         let mut remaining: HashMap<PeerId, &Worker> =
             active_workers.iter().map(|w| (w.id, w)).collect();
 
-        // Workers that go inactive this call, collected to drop their stale mappings below.
-        let mut departed: Vec<WorkerPk> = Vec::new();
-
+        // Status columns only, like the Postgres backend: a departure's mapping-table
+        // consequences are settled by the next scheduling cycle, keyed on `inactive_since`.
         // Matched peers are drained from `remaining`; leftovers are new.
-        for (id, entry) in self.sched_workers.iter_mut() {
+        for entry in self.sched_workers.values_mut() {
             if let Some(worker) = remaining.remove(&entry.peer_id) {
                 entry.inactive_since = None;
                 entry.version = worker.version.clone();
             } else if entry.inactive_since.is_none() {
                 entry.inactive_since = Some(now);
-                departed.push(*id);
             }
         }
 
@@ -934,62 +991,17 @@ impl SchedulerStorage for InMemoryStorage {
             );
         }
 
-        if !departed.is_empty() {
-            let departed_set: HashSet<WorkerPk> = departed.iter().copied().collect();
-            self.sched_stale_mappings
-                .retain(|(_, worker_id), _| !departed_set.contains(worker_id));
-
-            // Give a drain back its committed-holder status when every worker it was handing
-            // off to has departed. Confirmation is a quorum of *active* workers, so a
-            // recipient's departure lets the handoff count as "confirmed" without any download
-            // (a vacuous confirmation — Invariant 2, docs/mvcc-storage.md); the drain's expiry
-            // clock would then delete the fleet's last real copy. Promotion takes the copy off
-            // the expiry clock and under the retention floor. Excess copies become ordinary
-            // drains in later cycles; departed ideal rows fall out with the next cycle's diff.
-            let handoff_void: HashSet<ChunkPk> = self
-                .sched_ideal_chunk_workers
-                .iter()
-                .filter(|(_, holders)| {
-                    !holders.is_empty()
-                        && holders.iter().all(|w| {
-                            self.sched_workers
-                                .get(w)
-                                .is_none_or(|entry| entry.inactive_since.is_some())
-                        })
-                })
-                .map(|(pk, _)| *pk)
-                .collect();
-            let promoted: Vec<(ChunkPk, WorkerPk)> = self
-                .sched_stale_mappings
-                .keys()
-                .filter(|(pk, worker_id)| {
-                    handoff_void.contains(pk)
-                        && self
-                            .sched_workers
-                            .get(worker_id)
-                            .is_some_and(|entry| entry.inactive_since.is_none())
-                })
-                .copied()
-                .collect();
-            for (pk, worker_id) in promoted {
-                self.sched_stale_mappings.remove(&(pk, worker_id));
-                let holders = self
-                    .sched_ideal_chunk_workers
-                    .get_mut(&pk)
-                    .expect("promoted chunk came from the ideal");
-                if !holders.contains(&worker_id) {
-                    holders.push(worker_id);
-                }
-            }
-        }
-
-        self.evict_stale_workers(now.saturating_sub(gc_ticks));
-
         Ok(())
     }
 
-    /// Run one scheduling cycle: tombstone expired chunks, expire stale mappings, run `algorithm`,
-    /// then diff + commit the result. Returns the published worker assignment.
+    fn gc_inactive_workers(&mut self, now: Tick, gc_ticks: u64) -> Result<(), StorageError> {
+        self.evict_stale_workers(now.saturating_sub(gc_ticks));
+        Ok(())
+    }
+
+    /// Run one scheduling cycle: clean up departed workers' state, tombstone expired chunks,
+    /// expire stale mappings, run `algorithm`, then diff + commit the result. Returns the
+    /// published worker assignment.
     fn run_scheduling_cycle<Algo>(
         &mut self,
         algorithm: &Algo,
@@ -1000,7 +1012,10 @@ impl SchedulerStorage for InMemoryStorage {
     where
         Algo: SchedulingAlgorithm + Send + Sync,
     {
-        // Clock-driven GC runs first; it persists even through the shortage below.
+        // Departed-worker cleanup, then clock-driven GC; the promotion must run before the expiry
+        // (rescue before reaper). All of it persists even through the shortage below.
+        self.delete_inactive_stale_mappings();
+        self.promote_orphaned_drains();
         self.tombstone_expired_chunks(now, m_ticks);
         self.expire_drained_stale_mappings(now, m_ticks);
 

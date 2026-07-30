@@ -29,12 +29,12 @@ pub(crate) fn is_unique_violation(err: &sqlx::Error) -> bool {
 }
 
 /// SQLSTATE `40001` (`serialization_failure`); `sqlx::ErrorKind` has no variant for it, so match the code directly.
-pub(crate) fn is_serialization_failure(err: &sqlx::Error) -> bool {
+pub fn is_serialization_failure(err: &sqlx::Error) -> bool {
     err.as_database_error().and_then(|db| db.code()).as_deref() == Some("40001")
 }
 
 /// SQLSTATE `55P03` (`lock_not_available`): a `lock_timeout` expiry, matched by code like `40001` above.
-pub(crate) fn is_lock_timeout(err: &sqlx::Error) -> bool {
+pub fn is_lock_timeout(err: &sqlx::Error) -> bool {
     err.as_database_error().and_then(|db| db.code()).as_deref() == Some("55P03")
 }
 

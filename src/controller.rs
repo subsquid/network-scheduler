@@ -252,12 +252,7 @@ impl WithScheduledChunks {
             scheduling::schedule(
                 &scheduled_chunks,
                 &self.workers,
-                scheduling::SchedulingConfig {
-                    worker_capacity: self.config.worker_storage_bytes,
-                    saturation: self.config.saturation,
-                    min_replication: self.config.min_replication,
-                    ignore_reliability: self.config.ignore_reliability,
-                },
+                self.config.scheduling.clone(),
             )
             .context("Can't schedule chunks")?
         };

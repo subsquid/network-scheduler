@@ -23,7 +23,7 @@ mod util;
 
 use anyhow::Context;
 use clap::Parser;
-use network_scheduler::{cli::Config, scheduling::SchedulingConfig};
+use network_scheduler::cli::Config;
 use rand::prelude::*;
 
 use crate::profile::Scheduler;
@@ -65,12 +65,7 @@ fn main() -> anyhow::Result<()> {
         simulation::register_copy_dataset(plan, &baseline, &mut config.datasets)?;
     }
 
-    let scheduling_config = SchedulingConfig {
-        worker_capacity: config.worker_storage_bytes,
-        saturation: config.saturation,
-        min_replication: config.min_replication,
-        ignore_reliability: config.ignore_reliability,
-    };
+    let scheduling_config = config.scheduling.clone();
 
     // Copies are scheduler-specific: multistep clones them from Postgres, stateless replays them.
     let mut sim_copies = Vec::new();

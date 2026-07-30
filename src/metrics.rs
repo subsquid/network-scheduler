@@ -41,6 +41,12 @@ lazy_static::lazy_static! {
 
     pub static ref FAILURE: Family<Labels, Gauge> = Default::default();
     pub static ref ASSIGNMENT_TIMESTAMP: Gauge = Default::default();
+
+    /// Service mode: per-task heartbeat and leadership, the signals a one-shot run has no use for.
+    /// A task's timestamp stops advancing the moment its work stops completing, whatever the cause,
+    /// so `now - task_last_success` is the one number that makes a wedge visible.
+    pub static ref TASK_LAST_SUCCESS: Family<Labels, Gauge> = Default::default();
+    pub static ref LEADERSHIP_EPOCH: Gauge = Default::default();
 }
 
 // Without the `mvcc-chunks` crate there is no `PhaseTimer`, so `exec_times` is a root-local family
@@ -285,6 +291,17 @@ pub fn register_metrics(network: String) -> Registry {
         "Timestamp of the last assignment",
         Unit::Seconds,
         ASSIGNMENT_TIMESTAMP.clone(),
+    );
+    registry.register_with_unit(
+        "task_last_success",
+        "Unix time of a service task's last completed unit of work",
+        Unit::Seconds,
+        TASK_LAST_SUCCESS.clone(),
+    );
+    registry.register(
+        "leadership_epoch",
+        "Leadership epoch this instance claimed at startup",
+        LEADERSHIP_EPOCH.clone(),
     );
 
     registry

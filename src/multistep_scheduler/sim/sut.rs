@@ -112,7 +112,7 @@ pub(super) struct SimConfig {
     /// active workers have applied; 100 = all workers confirm; 0 = watermark skips to latest
     /// published assignment (no fetch required).
     pub(super) confirm_threshold_pct: u32,
-    /// Ticks a departed worker's row survives before a membership sync deletes it.
+    /// Ticks a departed worker's row survives before a cycle's GC deletes it.
     pub(super) gc_ticks: Tick,
 }
 
@@ -359,6 +359,10 @@ pub(super) struct SimUnderTest<D: SimStorage> {
     /// watermark passes it, the oracles hold the worker to nothing (see
     /// [`routing_has_caught_up_with_departure`](Self::routing_has_caught_up_with_departure)).
     placed_until_departure: BTreeMap<WorkerPk, AssignmentId>,
+    /// Workers that departed since the last cycle: their stale mappings legally survive until
+    /// that cycle's phase-A cleanup ([`Self::assert_no_orphaned_stale_mappings`]'s only
+    /// tolerance). Cleared by [`Self::run_cycle`]; a rejoin removes the worker again.
+    departed_awaiting_cycle: BTreeSet<WorkerPk>,
     /// X% confirmation quorum.
     confirm_threshold_pct: u32,
     /// Converged latch: set by a terminal convergence check or one under a recorded shortage;
@@ -830,31 +834,25 @@ impl<D: SimStorage> SimUnderTest<D> {
         true
     }
 
-    /// Hand the active fleet to the storage registry — departure marking and departed-worker
-    /// deletion run inside.
+    /// Hand the active fleet to the storage registry — status only: departure marking and revival
+    /// run inside, a departed worker's cleanup and deletion wait for the next cycle.
     fn sync_worker_set(&mut self) {
-        let mut registered_before: BTreeSet<WorkerPk> = BTreeSet::new();
         let mut inactive_before: BTreeSet<WorkerPk> = BTreeSet::new();
         for view in self.storage.get_workers(|_| true) {
-            registered_before.insert(view.worker_id);
             if view.inactive_since.is_some() {
                 inactive_before.insert(view.worker_id);
             }
         }
         let active: Vec<Worker> = self.active_workers().into_iter().cloned().collect();
         self.storage
-            .update_worker_set(&active, self.now, self.gc_ticks)
+            .update_worker_set(&active, self.now)
             .expect("worker set update succeeds");
         let latest_assignment = self
             .latest_worker_assignment
             .as_ref()
             .map_or(0, |assignment| assignment.id);
-        let mut survivors = 0usize;
         let mut any_departed = false;
         for view in self.storage.get_workers(|_| true) {
-            if registered_before.contains(&view.worker_id) {
-                survivors += 1;
-            }
             if view.inactive_since.is_some() {
                 any_departed = true;
                 // Edge-triggered: only on the active -> inactive transition, so the bound stays the
@@ -862,26 +860,25 @@ impl<D: SimStorage> SimUnderTest<D> {
                 if !inactive_before.contains(&view.worker_id) {
                     self.placed_until_departure
                         .insert(view.worker_id, latest_assignment);
+                    // Its stale rows legally survive until the next cycle's phase-A cleanup.
+                    self.departed_awaiting_cycle.insert(view.worker_id);
                 }
             } else if inactive_before.contains(&view.worker_id) {
                 // Rejoined (inactive -> active, same pk): the worker is placeable again, so its stale
                 // departure bound no longer applies — clear it, or coverage would keep treating this
                 // active holder as an unscrubbed departed route.
                 self.placed_until_departure.remove(&view.worker_id);
+                self.departed_awaiting_cycle.remove(&view.worker_id);
             }
         }
-        statistics::classify(
-            survivors < registered_before.len(),
-            "churn: worker deleted this sync",
-        );
         statistics::classify(any_departed, "churn: departed worker still registered");
         let active_pks = self.active_worker_pks();
         self.workers_state.sync_active_workers(&active_pks);
     }
 
-    /// Every stale mapping must reference an *active* worker. A departed one serves nothing, so
-    /// departure purges its mappings and the mint skips it; a deleted one takes its mappings with
-    /// it. Either way a mapping naming a non-active worker can never drain.
+    /// Every stale mapping must reference an *active* worker, except in the window between a
+    /// departure and the next cycle, which is what clears it (`departed_awaiting_cycle`). Past
+    /// that window a mapping naming a departed or deleted worker can never drain.
     fn assert_no_orphaned_stale_mappings(&self) {
         let mappings = self.storage.get_stale_mappings(|_| true);
         if mappings.is_empty() {
@@ -895,12 +892,15 @@ impl<D: SimStorage> SimUnderTest<D> {
             .collect();
         let orphaned: Vec<_> = mappings
             .into_iter()
-            .filter(|mapping| !active.contains(&mapping.worker_id))
+            .filter(|mapping| {
+                !active.contains(&mapping.worker_id)
+                    && !self.departed_awaiting_cycle.contains(&mapping.worker_id)
+            })
             .map(|mapping| (mapping.chunk_pk, mapping.worker_id))
             .collect();
         assert!(
             orphaned.is_empty(),
-            "stale mappings held by departed or deleted workers: {orphaned:?}",
+            "stale mappings held by cycled-over departed or deleted workers: {orphaned:?}",
         );
     }
 
@@ -1141,15 +1141,18 @@ impl<D: SimStorage> SimUnderTest<D> {
         id
     }
 
-    /// One storage cycle: schedule, advance the clock, run visibility, assert per-step safety.
-    /// Does not confirm — confirmation comes from worker fetches. On a shortage nothing is
-    /// committed; the shortage is recorded.
+    /// One storage cycle: schedule, GC inactive workers, advance the clock, run visibility,
+    /// assert per-step safety. Does not confirm — confirmation comes from worker fetches. On a
+    /// shortage nothing is committed; the shortage is recorded.
     ///
     /// The clock and portal visibility advance even on a shortage: skipping them would freeze
     /// draining forever.
     fn run_cycle(&mut self) {
         self.with_step_safety(|sim| {
             let scheduled = sim.run_scheduler();
+            // The cycle's phase-A cleanup ran (it commits even on a shortage): pending
+            // departures are settled, so their stale rows may no longer linger.
+            sim.departed_awaiting_cycle.clear();
             // Sync against the freshly published worker set so a departed-then-rejoined worker
             // starts from empty holdings.
             let active_workers = sim.active_worker_pks();
@@ -1162,6 +1165,15 @@ impl<D: SimStorage> SimUnderTest<D> {
                 sim.refresh_confirmation(&active_workers);
             }
             sim.now += CLOCK_STEP;
+            // GC after the cycle, so its cleanup settles a departure before the row goes.
+            let registered_before = sim.storage.get_workers(|_| true).len();
+            sim.storage
+                .gc_inactive_workers(sim.now, sim.gc_ticks)
+                .expect("worker gc succeeds");
+            statistics::classify(
+                sim.storage.get_workers(|_| true).len() < registered_before,
+                "churn: worker deleted by cycle GC",
+            );
             let portal_assignment = sim
                 .storage
                 .run_visibility_cycle(sim.now)
@@ -1868,6 +1880,7 @@ impl<D: SimStorage> SimUnderTest<D> {
             latest_portal_watermark: 0,
             latest_portal_publication: None,
             placed_until_departure: BTreeMap::new(),
+            departed_awaiting_cycle: BTreeSet::new(),
             confirm_threshold_pct: config.confirm_threshold_pct,
             converge_checked: false,
             real_steps: 0,

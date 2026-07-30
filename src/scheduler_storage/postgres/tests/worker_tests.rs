@@ -29,16 +29,12 @@ fn resyncing_an_unchanged_worker_set_consumes_no_ids() {
     let mut storage = fresh_storage("worker_seq");
     let active: Vec<Worker> = (1..=8).map(|seed| worker(seed, Some("2.8.0"))).collect();
 
-    storage
-        .update_worker_set(&active, 1, 100)
-        .expect("first sync");
+    storage.update_worker_set(&active, 1).expect("first sync");
     let after_first = ids_consumed(&mut storage);
     assert_eq!(after_first, 8, "one id per worker on first registration");
 
     for tick in 2..=10 {
-        storage
-            .update_worker_set(&active, tick, 100)
-            .expect("re-sync");
+        storage.update_worker_set(&active, tick).expect("re-sync");
     }
     assert_eq!(
         ids_consumed(&mut storage),

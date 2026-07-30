@@ -11,7 +11,9 @@ use semver::Version;
 use serde::{Deserialize, Serialize};
 use serde_with::{DurationSeconds, serde_as};
 
-use crate::types::ChunkWeight;
+#[cfg(feature = "mvcc-chunks")]
+use crate::scheduler_storage::postgres::{DEFAULT_BATCH_SIZE, DEFAULT_CLAIM_LOCK_TIMEOUT};
+use crate::types::{ChunkWeight, SchedulingConfig};
 
 #[derive(Parser, Debug)]
 #[command(name = "SQD Network Scheduler")]
@@ -26,8 +28,9 @@ pub struct Args {
     )]
     pub config: PathBuf,
 
-    /// Run mode: prod (with ClickHouse) or cli (with state file)
-    /// Take into account that both modes utilise S3
+    /// Run mode: prod (with ClickHouse), cli (with state file), or service (long-running
+    /// multistep scheduler; `mvcc-chunks` builds only).
+    /// Take into account that all modes utilise S3
     #[arg(short, long, default_value = "prod")]
     pub mode: RunMode,
 
@@ -51,9 +54,9 @@ pub struct Args {
     #[arg(
         long,
         env = "DATABASE_URL",
-        required_if_eq("multistep_scheduler", "true")
+        required_if_eq_any([("multistep_scheduler", "true"), ("mode", "service")])
     )]
-    pub database_url: Option<String>,
+    pub database_url: Option<Secret>,
 
     /// Multistep drain window (the MVCC "M"): how long a dropped `(chunk, worker)` pair keeps being
     /// served after leaving the portal assignment.
@@ -66,6 +69,59 @@ pub struct Args {
     #[cfg(feature = "mvcc-chunks")]
     #[arg(long, env = "MULTISTEP_WORKER_GC", default_value = "24h", value_parser = humantime::parse_duration)]
     pub multistep_worker_gc: Duration,
+
+    /// Service mode: interval between scheduling cycles.
+    #[cfg(feature = "mvcc-chunks")]
+    #[arg(long, env = "MULTISTEP_SCHEDULE_INTERVAL", default_value = "20m", value_parser = humantime::parse_duration)]
+    pub schedule_interval: Duration,
+
+    /// Service mode: interval between worker-set refreshes from ClickHouse.
+    #[cfg(feature = "mvcc-chunks")]
+    #[arg(long, env = "MULTISTEP_WORKER_UPDATE_INTERVAL", default_value = "7m", value_parser = humantime::parse_duration)]
+    pub worker_update_interval: Duration,
+
+    /// Service mode: interval between S3 chunk-discovery passes.
+    #[cfg(feature = "mvcc-chunks")]
+    #[arg(long, env = "MULTISTEP_CHUNK_DISCOVERY_INTERVAL", default_value = "10m", value_parser = humantime::parse_duration)]
+    pub chunk_discovery_interval: Duration,
+
+    /// Service mode: how often an idle task checks that its Postgres connection is still alive,
+    /// so a connection that dies between ticks is caught in seconds rather than at the next tick.
+    /// 0 disables the check.
+    #[cfg(feature = "mvcc-chunks")]
+    #[arg(long, env = "MULTISTEP_CONNECTION_PROBE_INTERVAL", default_value = "30s", value_parser = humantime::parse_duration)]
+    pub connection_probe_interval: Duration,
+
+    /// Service mode: cap on one connection liveness round trip. Exceeding it means the connection
+    /// is gone, which is fatal to the task, so it must comfortably clear a healthy round trip.
+    #[cfg(feature = "mvcc-chunks")]
+    #[arg(long, env = "MULTISTEP_CONNECTION_PING_TIMEOUT", default_value = "5s", value_parser = humantime::parse_duration)]
+    pub connection_ping_timeout: Duration,
+
+    /// Cap on a leadership claim's wait for an in-flight fenced transaction to commit (see
+    /// `DEFAULT_CLAIM_LOCK_TIMEOUT`). Exceeding it surfaces as "already running", i.e. retry as a
+    /// candidate — a hung startup hides worse than a retryable failure.
+    #[cfg(feature = "mvcc-chunks")]
+    #[arg(long, env = "MULTISTEP_LEADERSHIP_CLAIM_TIMEOUT", default_value_t = DEFAULT_CLAIM_LOCK_TIMEOUT.into())]
+    pub leadership_claim_timeout: humantime::Duration,
+
+    /// Rows per batched write to Postgres — bounds the memory and statement size of the scheduler's
+    /// bulk writes (see `DEFAULT_BATCH_SIZE`).
+    #[cfg(feature = "mvcc-chunks")]
+    #[arg(long, env = "MULTISTEP_BATCH_SIZE", default_value_t = DEFAULT_BATCH_SIZE)]
+    pub batch_size: usize,
+
+    /// Service mode: address for the ops surface (`/metrics`, `/health`, `/ready`).
+    #[cfg(feature = "mvcc-chunks")]
+    #[arg(long, env = "MULTISTEP_OPS_ADDR", default_value = "0.0.0.0:9090")]
+    pub ops_addr: std::net::SocketAddr,
+
+    /// Service mode: percentage of online workers that must echo an assignment id in their pings
+    /// before the confirmation watermark advances to it. 0 confirms the latest assignment
+    /// unconditionally (no worker acks — dev/bootstrap only).
+    #[cfg(feature = "mvcc-chunks")]
+    #[arg(long, env = "MULTISTEP_CONFIRMATION_QUORUM_PCT", default_value_t = 90, value_parser = clap::value_parser!(u8).range(..=100))]
+    pub confirmation_quorum_pct: u8,
 }
 
 #[derive(Debug, Clone, Copy, clap::ValueEnum)]
@@ -74,6 +130,9 @@ pub enum RunMode {
     Prod,
     /// CLI mode with static configuration file
     Cli,
+    /// Long-running multistep (MVCC) scheduler service
+    #[cfg(feature = "mvcc-chunks")]
+    Service,
 }
 
 #[derive(clap::Args, Debug)]
@@ -85,7 +144,7 @@ pub struct S3Args {
     aws_access_key_id: String,
 
     #[arg(env, hide = true)]
-    aws_secret_access_key: String,
+    aws_secret_access_key: Secret,
 
     #[arg(env, hide = true, default_value = "auto")]
     aws_region: String,
@@ -93,14 +152,14 @@ pub struct S3Args {
 
 #[derive(clap::Args, Debug)]
 pub struct ClickhouseArgs {
-    #[arg(long, env, required_if_eq("mode", "prod"))]
+    #[arg(long, env, required_if_eq_any([("mode", "prod"), ("mode", "service")]))]
     pub clickhouse_url: Option<String>,
-    #[arg(long, env, required_if_eq("mode", "prod"))]
+    #[arg(long, env, required_if_eq_any([("mode", "prod"), ("mode", "service")]))]
     pub clickhouse_database: Option<String>,
-    #[arg(long, env, required_if_eq("mode", "prod"))]
+    #[arg(long, env, required_if_eq_any([("mode", "prod"), ("mode", "service")]))]
     pub clickhouse_user: Option<String>,
-    #[arg(long, env, required_if_eq("mode", "prod"))]
-    pub clickhouse_password: Option<String>,
+    #[arg(long, env, required_if_eq_any([("mode", "prod"), ("mode", "service")]))]
+    pub clickhouse_password: Option<Secret>,
 }
 
 impl S3Args {
@@ -123,20 +182,12 @@ pub struct Config {
     #[serde(rename = "worker_inactive_timeout_sec")]
     pub worker_inactive_timeout: Duration,
 
-    #[serde(default)]
-    pub ignore_reliability: bool,
-
-    pub worker_storage_bytes: u64,
+    /// Knobs for both scheduler generations; flattened, so the config-file keys stay top-level
+    /// (`worker_storage_bytes`, `saturation`, `min_replication`, `ignore_reliability`).
+    #[serde(flatten)]
+    pub scheduling: SchedulingConfig,
 
     pub worker_stale_bytes: u64,
-
-    pub min_replication: u16,
-
-    /// The fraction of the worker storage that is actually filled (on average).
-    /// The closer it gets to 1, the less consistent the distribution is.
-    /// Corresponds to `1 / (1 + epsilon)` from this paper:
-    /// https://research.google/blog/consistent-hashing-with-bounded-loads/
-    pub saturation: f64,
 
     pub network: String,
 
@@ -151,7 +202,7 @@ pub struct Config {
     pub scheduler_state_bucket: String,
 
     #[serde(skip_serializing)]
-    pub cloudflare_storage_secret: CloudflareSecret,
+    pub cloudflare_storage_secret: Secret,
 
     #[serde(default = "default_min_worker_version")]
     pub min_supported_worker_version: Version,
@@ -278,25 +329,44 @@ fn default_concurrent_downloads() -> usize {
     20
 }
 
-/// Newtype to give `SecretString` a `Clone` impl, so `Config` can derive `Clone`.
+/// Secret-bearing CLI/config value: `Debug` prints redacted, so it cannot leak into logs.
+/// Newtype over `SecretString` for the `Clone`, serde, and clap integrations it lacks.
 #[derive(Debug, Deserialize)]
 #[serde(transparent)]
-pub struct CloudflareSecret(SecretString);
+pub struct Secret(SecretString);
 
-impl Clone for CloudflareSecret {
+impl Clone for Secret {
     fn clone(&self) -> Self {
         Self(SecretString::from(self.0.expose_secret().to_owned()))
     }
 }
 
-impl CloudflareSecret {
+impl Secret {
     pub fn expose_secret(&self) -> &str {
         self.0.expose_secret()
     }
 }
 
-impl From<String> for CloudflareSecret {
+impl From<String> for Secret {
     fn from(s: String) -> Self {
         Self(SecretString::from(s))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Pins the deployed config-file schema: the scheduling knobs are flattened top-level keys,
+    /// and `worker_storage_bytes` maps onto `SchedulingConfig::worker_capacity`.
+    #[test]
+    fn example_config_parses_with_flat_scheduling_keys() {
+        let config: Config =
+            serde_yaml::from_str(include_str!("../examples/scheduler_config.yaml"))
+                .expect("parse the example config");
+        assert_eq!(config.scheduling.worker_capacity, 483_183_820_800);
+        assert_eq!(config.scheduling.min_replication, 2);
+        assert_eq!(config.scheduling.saturation, 0.99);
+        assert!(config.scheduling.ignore_reliability);
     }
 }

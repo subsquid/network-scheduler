@@ -17,7 +17,9 @@ use scheduler_metadata::{
 };
 
 use crate::scheduler_storage::SchedulerStorage;
-use crate::scheduler_storage::postgres::PostgresStorage;
+use crate::scheduler_storage::postgres::{
+    DEFAULT_BATCH_SIZE, DEFAULT_CLAIM_LOCK_TIMEOUT, PostgresStorage,
+};
 use crate::scheduler_storage::test_harness::pg_harness::{CaseDb, fresh_db_url};
 
 // --- inputs -----------------------------------------------------------------------------------
@@ -98,7 +100,9 @@ impl IngestHarness {
     /// Run one scheduler registration sweep (admits/rejects the pending chunks). Sync context: it
     /// owns its own runtime, so calling it inside `block` would nest-panic.
     fn admit(&self) {
-        let mut store = PostgresStorage::connect(&self.url).expect("connect scheduler");
+        let (mut store, _) =
+            PostgresStorage::connect(&self.url, DEFAULT_CLAIM_LOCK_TIMEOUT, DEFAULT_BATCH_SIZE)
+                .expect("connect scheduler");
         store.register_new_chunks().expect("register_new_chunks");
     }
 
@@ -106,7 +110,9 @@ impl IngestHarness {
     /// overlapping *pending* chunk for the admission sweep to reject (the API path rejects it
     /// synchronously). Sync context, like [`Self::admit`].
     fn discovery_insert(&self, ds: &str, id: &str, first: u64, last: u64, s: SchemaId) {
-        let mut store = PostgresStorage::connect(&self.url).expect("connect scheduler");
+        let (mut store, _) =
+            PostgresStorage::connect(&self.url, DEFAULT_CLAIM_LOCK_TIMEOUT, DEFAULT_BATCH_SIZE)
+                .expect("connect scheduler");
         store
             .insert_new_chunks(vec![crate::scheduler_storage::NewChunk {
                 dataset: std::sync::Arc::new(ds.to_owned()),

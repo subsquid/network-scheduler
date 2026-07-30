@@ -110,7 +110,7 @@ fn register_correction_duplicate_completed() -> anyhow::Result<()> {
     let a_pk = storage.pk_of(&a);
 
     let w = worker(1, None);
-    storage.update_worker_set(&[w], 0, 1000)?;
+    storage.update_worker_set(&[w], 0)?;
     let wid = workers(&storage)[0].worker_id;
 
     let wa1 = run_cycle(&mut storage, &a_pk, vec![wid], CYCLE_INTERVAL);
@@ -219,7 +219,7 @@ fn correction_chain_link_held_until_producer_fires() -> anyhow::Result<()> {
     let pk_a = storage.pk_of(&chunk_a);
 
     let single_worker = worker(1, None);
-    storage.update_worker_set(&[single_worker], 0, 1000)?;
+    storage.update_worker_set(&[single_worker], 0)?;
     let worker_id = workers(&storage)[0].worker_id;
 
     // Make A visible at the portal so the chain has something to swap out of.
@@ -277,7 +277,7 @@ fn correction_independent_same_dataset_fires_without_waiting() -> anyhow::Result
     let c_pk = storage.pk_of(&c);
 
     let w = worker(1, None);
-    storage.update_worker_set(&[w], 0, 1000)?;
+    storage.update_worker_set(&[w], 0)?;
     let wid = workers(&storage)[0].worker_id;
 
     let wa1 = run_cycle_multi(
@@ -333,7 +333,7 @@ fn correction_audit_row_retained() -> anyhow::Result<()> {
     let a_pk = storage.pk_of(&a);
 
     let w = worker(1, None);
-    storage.update_worker_set(&[w], 0, 1000)?;
+    storage.update_worker_set(&[w], 0)?;
     let wid = workers(&storage)[0].worker_id;
 
     let wa1 = run_cycle(&mut storage, &a_pk, vec![wid], CYCLE_INTERVAL);
@@ -380,7 +380,7 @@ fn correction_old_chunk_removed_from_worker_after_m_ticks() -> anyhow::Result<()
     let a_pk = storage.pk_of(&a);
 
     let w = worker(1, None);
-    storage.update_worker_set(&[w], 0, 1000)?;
+    storage.update_worker_set(&[w], 0)?;
     let wid = workers(&storage)[0].worker_id;
 
     let wa1 = run_cycle(&mut storage, &a_pk, vec![wid], CYCLE_INTERVAL);
@@ -442,7 +442,7 @@ proptest! {
         let worker_list: Vec<Worker> = (0..n_workers).map(|i| worker(i + 1, None)).collect();
         let mut storage = storage_with(vec![orig_chunk.clone()]);
         let orig_pk = storage.pk_of(&orig_chunk);
-        storage.update_worker_set(&worker_list, 0, 1000).unwrap();
+        storage.update_worker_set(&worker_list, 0).unwrap();
         let all_wids: Vec<WorkerPk> = workers(&storage).iter().map(|v| v.worker_id).collect();
         let wid = all_wids[0];
 

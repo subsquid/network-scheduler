@@ -312,7 +312,7 @@ fn register_corrections_batch_registers_all_and_swaps() {
     let pk_b = insert_and_register_chunk(&mut storage, "ds", 2, 100);
 
     storage
-        .update_worker_set(&[worker(1, None)], 0, 1000)
+        .update_worker_set(&[worker(1, None)], 0)
         .expect("upsert worker");
     let worker_ids: Vec<WorkerPk> = storage
         .get_workers(|_| true)
@@ -401,7 +401,7 @@ fn correction_chain_link_held_until_producer_fires() {
     let pk_a = insert_and_register_chunk(&mut storage, "ds", 1, 100);
 
     storage
-        .update_worker_set(&[worker(1, None)], 0, 1000)
+        .update_worker_set(&[worker(1, None)], 0)
         .expect("upsert worker");
     let worker_ids: Vec<WorkerPk> = storage
         .get_workers(|_| true)
@@ -457,7 +457,7 @@ proptest! {
 
         let workers: Vec<Worker> = (1..=n_workers).map(|s| worker(s, None)).collect();
         storage
-            .update_worker_set(&workers, 0, 10000)
+            .update_worker_set(&workers, 0)
             .expect("upsert workers");
         let worker_ids: Vec<WorkerPk> = storage
             .get_workers(|_| true)

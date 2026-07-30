@@ -21,7 +21,7 @@ Responses:
 
 ## `POST /datasets/{name}/chunks`
 
-Report chunks the ingester has written to storage. A 2xx means durably accepted: the overlap decision happens in this call (see ADR 0003), so the ingester can safely resume past the reported range. Re-sending a batch is safe — already-present ids come back as duplicates.
+Report chunks the ingester has written to storage. A 2xx means durably accepted: the overlap decision happens in this call (see ADR 0003), so the ingester can safely resume past the reported range. Admission stays scheduler-side: the chunk is `pending` until the scheduler's own sweep gives it scheduling metadata. Re-sending a batch is safe — already-present ids come back as duplicates.
 
 Path parameters:
 - `name` (string) — Dataset name

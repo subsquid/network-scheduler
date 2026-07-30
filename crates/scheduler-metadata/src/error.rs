@@ -13,6 +13,10 @@ pub enum StorageError {
     #[error("another scheduler instance is already running for this database")]
     AlreadyRunning,
 
+    /// Lost leadership: a newer instance claimed the epoch. The connection is healthy; retrying is wrong.
+    #[error("fenced out: another scheduler instance claimed a newer leadership epoch")]
+    FencedOut,
+
     #[error("database error: {0:#}")]
     Database(anyhow::Error),
 
@@ -97,11 +101,13 @@ impl From<StorageError> for IngestError {
             StorageError::Database(err) => Self::Database(err),
             StorageError::LockTimeout => Self::DatasetBusy,
             // None of these arise on ingest paths: PgIngest runs no cycle, takes no singleton lock,
-            // inserts ON CONFLICT DO NOTHING, and Serialization is intercepted as ConcurrentSchemaChange
-            // in promote_read_schema's REPEATABLE READ tx. Folded to Database, but listed explicitly
-            // (not `_`) so a new StorageError variant breaks the build instead of silently 500ing.
+            // holds no leadership epoch, inserts ON CONFLICT DO NOTHING, and Serialization is
+            // intercepted as ConcurrentSchemaChange in promote_read_schema's REPEATABLE READ tx.
+            // Folded to Database, but listed explicitly (not `_`) so a new StorageError variant
+            // breaks the build instead of silently 500ing.
             e @ (StorageError::Shortage
             | StorageError::AlreadyRunning
+            | StorageError::FencedOut
             | StorageError::ChunkAlreadyExists
             | StorageError::Serialization) => Self::Database(anyhow::Error::new(e)),
         }

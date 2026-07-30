@@ -216,11 +216,13 @@ mod tests {
         cli::Config {
             datasets: BTreeMap::new(),
             worker_inactive_timeout: Duration::from_secs(600),
-            ignore_reliability: false,
-            worker_storage_bytes: 0,
+            scheduling: crate::types::SchedulingConfig {
+                worker_capacity: 0,
+                saturation: 0.99,
+                min_replication: 1,
+                ignore_reliability: false,
+            },
             worker_stale_bytes: 0,
-            min_replication: 1,
-            saturation: 0.99,
             network: "test".to_string(),
             storage_domain: "test.io".to_string(),
             network_state_name: "test.json".to_string(),

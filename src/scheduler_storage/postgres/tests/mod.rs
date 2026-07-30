@@ -5,6 +5,7 @@ mod correction_tests;
 mod drain_tests;
 mod ingest_tests;
 mod inspect;
+mod locks;
 mod registration_tests;
 mod schema;
 mod worker_tests;

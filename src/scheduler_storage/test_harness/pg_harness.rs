@@ -6,7 +6,9 @@
 
 pub use pg_testkit::{CaseDb, PgData};
 
-use crate::scheduler_storage::postgres::PostgresStorage;
+use crate::scheduler_storage::postgres::{
+    DEFAULT_BATCH_SIZE, DEFAULT_CLAIM_LOCK_TIMEOUT, PostgresStorage,
+};
 
 /// Backing the test suite uses: tiny per-case DBs in RAM.
 #[cfg(test)]
@@ -33,9 +35,10 @@ pub(crate) fn fresh_db_url(prefix: &str, id: u64) -> (String, CaseDb) {
 /// backing for the shared container; later calls reuse it.
 pub fn fresh_db_with(pgdata: PgData, prefix: &str, id: u64) -> PostgresStorage {
     let (url, db) = pg_testkit::fresh_db_url(pgdata, prefix, id);
-    PostgresStorage::connect(&url)
-        .expect("connect fresh db")
-        .owning(db)
+    let (storage, _epoch) =
+        PostgresStorage::connect(&url, DEFAULT_CLAIM_LOCK_TIMEOUT, DEFAULT_BATCH_SIZE)
+            .expect("connect fresh db");
+    storage.owning(db)
 }
 
 #[cfg(test)]

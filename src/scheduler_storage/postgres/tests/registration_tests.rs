@@ -53,7 +53,9 @@ fn concurrent_multi_dataset_inserts_do_not_deadlock() {
     use crate::scheduler_storage::{NewChunk, SchemaId};
     use sqlx::Connection;
 
-    use crate::scheduler_storage::postgres::PostgresStorage;
+    use crate::scheduler_storage::postgres::{
+        DEFAULT_BATCH_SIZE, DEFAULT_CLAIM_LOCK_TIMEOUT, PostgresStorage,
+    };
     use crate::scheduler_storage::test_harness::pg_harness::fresh_db_url;
 
     fn nc(ds: &str, id: String, schema_id: SchemaId) -> NewChunk {
@@ -78,7 +80,9 @@ fn concurrent_multi_dataset_inserts_do_not_deadlock() {
     // dataset's current schema id (chunks must pin one), then drop the storage so its scheduler
     // session lock is released before the raw writers connect.
     let (schema_a, schema_b) = {
-        let mut seed = PostgresStorage::connect(&url).expect("connect seed");
+        let (mut seed, _) =
+            PostgresStorage::connect(&url, DEFAULT_CLAIM_LOCK_TIMEOUT, DEFAULT_BATCH_SIZE)
+                .expect("connect seed");
         seed.insert_new_datasets(vec![
             new_dataset("a", DatasetSchema::default()),
             new_dataset("b", DatasetSchema::default()),
