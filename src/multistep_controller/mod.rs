@@ -1,8 +1,14 @@
-//! Multistep (MVCC) scheduling entry point (requires the `mvcc-chunks` feature): runs one
-//! scheduling cycle against Postgres instead of the ordinary `Controller` pipeline.
+//! Multistep (MVCC) scheduling entry points (requires the `mvcc-chunks` feature): the one-shot
+//! [`run`] runs one scheduling cycle against Postgres instead of the ordinary `Controller`
+//! pipeline; [`service`] wraps the same steps in a long-running service of three periodic tasks.
 //!
-//! Only [`SchedulerStorage::run_scheduling_cycle`] runs — no confirmation or visibility cycle yet
-//! (see `docs/README.md`). The resulting assignment is only computed and logged, not published.
+//! The one-shot path runs only [`SchedulerStorage::run_scheduling_cycle`]; the service also
+//! advances the confirmation watermark from worker-echoed ping ids and runs the visibility cycle
+//! (see `tasks`). Assignments are computed and logged, not published (`docs/README.md`).
+
+mod ops;
+pub mod service;
+mod tasks;
 
 use std::{
     collections::{BTreeMap, HashSet},
@@ -30,13 +36,17 @@ pub async fn run(
 ) -> anyhow::Result<()> {
     let database_url = args
         .database_url
-        .as_deref()
+        .as_ref()
         .context("--database-url is required with --multistep-scheduler")?;
 
     tracing::info!("Multistep: scheduling for {} workers", workers.len());
 
-    let mut storage = PostgresStorage::connect(database_url).context("connect to Postgres")?;
-    storage.migrate().context("run Postgres migrations")?;
+    // Its own leader; nothing else connects, so the epoch goes nowhere.
+    let (mut storage, _epoch) = PostgresStorage::connect(
+        database_url.expose_secret(),
+        args.leadership_claim_timeout.into(),
+        args.batch_size,
+    )?;
 
     let watermarks = bootstrap_datasets(&mut storage, config)?;
 
@@ -59,22 +69,19 @@ pub async fn run(
 
     let now = now_ticks();
     storage
-        .update_worker_set(&workers, now, args.multistep_worker_gc.as_secs())
+        .update_worker_set(&workers, now)
         .context("update worker set")?;
+    storage
+        .gc_inactive_workers(now, args.multistep_worker_gc.as_secs())
+        .context("gc inactive workers")?;
 
     let algorithm = MultistepAlgorithm::new(config.datasets.clone());
-    let multistep_config = crate::multistep_scheduler::SchedulingConfig {
-        worker_capacity: config.worker_storage_bytes,
-        saturation: config.saturation,
-        min_replication: config.min_replication,
-        ignore_reliability: config.ignore_reliability,
-    };
     let assignment = {
         let _timer = metrics::Timer::new("multistep:schedule");
         storage
             .run_scheduling_cycle(
                 &algorithm,
-                &multistep_config,
+                &config.scheduling,
                 now,
                 args.multistep_drain_window.as_secs(),
             )
@@ -86,14 +93,13 @@ pub async fn run(
         .context("generate schema bundle")?;
 
     tracing::info!(
-        "Multistep scheduling cycle done: assignment {}, {} chunks placed, replication_by_weight={:?}, \
-         bundle {} ({} write / {} read schemas)",
-        assignment.id,
-        assignment.chunk_workers.len(),
-        assignment.replication_by_weight,
-        bundle.id(),
-        bundle.schemas().len(),
-        bundle.read_schemas().len(),
+        assignment_id = %assignment.id,
+        chunks_placed = assignment.chunk_workers.len(),
+        replication_by_weight = ?assignment.replication_by_weight,
+        schema_bundle_id = %bundle.id(),
+        write_schemas = bundle.schemas().len(),
+        read_schemas = bundle.read_schemas().len(),
+        "Multistep scheduling cycle done"
     );
 
     Ok(())

@@ -1,8 +1,29 @@
 //! PostgreSQL-backed implementation of [`SchedulerStorage`].
 //!
-//! Single [`PgConnection`], no pool — the scheduler runs cycles sequentially.
-//! The connection holds an advisory lock for the struct's lifetime, so only one
-//! scheduler instance runs at a time; dropping the struct releases it.
+//! Single [`PgConnection`], no pool — each instance serves one loop, which runs
+//! its calls sequentially. [`PostgresStorage::connect`] is the leader: it holds a session advisory
+//! lock for the struct's lifetime (admission control, so a second instance fails fast), migrates,
+//! then claims the next leadership [`Epoch`]. [`PostgresStorage::connect_follower`] needs that
+//! epoch and covers the instance's secondary loops. Every mutating path re-reads the epoch inside
+//! its own transaction and fails with [`StorageError::FencedOut`] once a newer leader claimed one,
+//! so a demoted instance cannot commit no matter what its connections are still doing.
+//!
+//! # Ownership map
+//!
+//! The instance's connections interleave without any cross-connection lock because each table has
+//! exactly one writing connection:
+//!
+//! * **worker connection** — `sched_workers` status columns only, plus the confirmation tables it
+//!   solely owns (its diff replay consumes ids strictly below those a running cycle mints).
+//! * **ingest writers** — the chunk-discovery connection and metadata-service: append-only,
+//!   new-key rows. They never UPDATE/DELETE a row the cycle writes.
+//! * **scheduling connection** — every UPDATE/DELETE of existing `sched_*` rows: the scheduling
+//!   cycle (departed-worker cleanup included), the visibility cycle, worker GC, and — once wired —
+//!   the corrections consumer.
+//!
+//! No two connections write the same row, so the cycle tables need no advisory lock and the only
+//! 40001 reachable is the fence's own row lock, which maps to `FencedOut`. The cycle's transactions
+//! run at REPEATABLE READ only to give their reads one snapshot.
 //!
 //! `Tick` values are logical integer timestamps stored in `BIGINT` columns;
 //! `m_ticks`/`gc_ticks` are raw tick counts used in integer arithmetic.
@@ -23,6 +44,7 @@ mod workers;
 mod tests;
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::time::Duration;
 
 use anyhow::Context;
 use sqlx::Connection;
@@ -39,10 +61,38 @@ use crate::types::{Dataset, DatasetSchema, DatasetWatermark, Worker};
 use nonoverlap::Candidate;
 use rows::tick_to_i64;
 
-/// Rows per batched write. Caps the jsonb payload and keeps a single statement under Postgres'
-/// per-value / message-size limits. The cycle's writes also need whole chunks to stay within one
-/// batch, or `array_agg` would split a chunk's holder set across statements.
-const DEFAULT_BATCH_SIZE: usize = 10_000;
+/// Rows per batched write, the default the CLI's `--batch-size` takes. Caps the jsonb payload and
+/// keeps a single statement under Postgres' per-value / message-size limits; the cycle's writes also
+/// need whole chunks to stay within one batch, or `array_agg` would split a chunk's holder set
+/// across statements.
+pub const DEFAULT_BATCH_SIZE: usize = 10_000;
+
+/// Cap on a leadership claim's wait for an in-flight fenced transaction (a scheduling cycle holds
+/// one for minutes) — the default the CLI's `--leadership-claim-timeout` takes, and what the tests
+/// connect with. Expiry surfaces as `AlreadyRunning`, i.e. "retry as a candidate".
+pub const DEFAULT_CLAIM_LOCK_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+
+/// Session memory GUCs (`work_mem`/`maintenance_work_mem`) for one connection.
+#[derive(Clone, Copy, Debug)]
+pub enum SessionMemory {
+    /// 512MB, for the scheduling cycle's routing reads and the visibility queries.
+    Raised,
+    /// Server default, for connections running only small statements (chunk ingest).
+    ServerDefault,
+}
+
+/// Leadership fencing token. Only the claim in [`PostgresStorage::connect`] mints one, so a
+/// follower connection cannot be constructed without a leader's epoch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Epoch(i64);
+
+impl Epoch {
+    /// The raw counter, for reporting it. Not a constructor: an epoch still only comes from a
+    /// successful claim.
+    pub fn get(self) -> i64 {
+        self.0
+    }
+}
 
 /// Synchronous facade over a Postgres connection: owns a current-thread tokio
 /// runtime and drives all sqlx queries via `block_on`.
@@ -55,6 +105,7 @@ pub struct PostgresStorage {
     rt: tokio::runtime::Runtime,
     conn: std::cell::RefCell<PgConnection>,
     batch_size: usize,
+    fence: Epoch,
     /// Declared last so it drops after `conn`: the harness can only drop a database once this
     /// storage's connection to it is gone.
     #[cfg(any(test, feature = "pg-testkit"))]
@@ -62,48 +113,60 @@ pub struct PostgresStorage {
 }
 
 impl PostgresStorage {
-    /// Connect and acquire the scheduler advisory lock. Errors if another
-    /// scheduler already holds the lock.
-    pub fn connect(database_url: &str) -> Result<Self, StorageError> {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .context("build current-thread runtime")?;
-        let (conn, locked) = rt.block_on(async {
-            let mut conn = PgConnection::connect(database_url)
-                .await
-                .context("failed to connect to Postgres")?;
-            // Session-scoped GUCs, held for this connection's lifetime: raise sort/hash
-            // memory for the cycle's heavy routing and visibility queries.
-            for stmt in [
-                "SET work_mem = '512MB'",
-                "SET maintenance_work_mem = '512MB'",
-            ] {
-                sqlx::query(stmt)
-                    .execute(&mut conn)
-                    .await
-                    .with_context(|| format!("failed to run {stmt}"))?;
+    /// Connect as the leader: take the scheduler advisory lock, run the migrations, then claim the
+    /// next leadership epoch — the fence every write of this instance carries. Errors with
+    /// [`StorageError::AlreadyRunning`] if another scheduler holds the lock. `claim_lock_timeout`
+    /// caps how long the claim waits behind an in-flight fenced transaction before giving up as a
+    /// candidate; `batch_size` is the rows-per-batch cap this instance's batched writes use.
+    pub fn connect(
+        database_url: &str,
+        claim_lock_timeout: Duration,
+        batch_size: usize,
+    ) -> Result<(Self, Epoch), StorageError> {
+        let (rt, mut conn) = open(database_url, SessionMemory::Raised)?;
+        let epoch = rt.block_on(async {
+            if !try_acquire_scheduler_lock(&mut conn).await? {
+                return Err(StorageError::AlreadyRunning);
             }
-            // Advisory locks are cluster-wide, not per-database; scope the key to the
-            // current database, or per-test databases on one cluster collide on the lock.
-            let locked: bool = sqlx::query_scalar(
-                "SELECT pg_try_advisory_lock(hashtext('network-scheduler:' || current_database()))",
-            )
-            .fetch_one(&mut conn)
-            .await
-            .context("failed to acquire advisory lock")?;
-            Ok::<_, anyhow::Error>((conn, locked))
+            // Before the claim, since the claim needs the leadership row: a real schema change
+            // therefore runs while a demoted instance may still be writing, and serializes against
+            // it on the table locks its DDL takes.
+            scheduler_metadata::pg::MIGRATOR
+                .run(&mut conn)
+                .await
+                .context("migration failed")?;
+            claim_leadership(&mut conn, claim_lock_timeout).await
         })?;
-        if !locked {
-            return Err(StorageError::AlreadyRunning);
-        }
-        Ok(Self {
+        Ok((Self::fenced_by(rt, conn, epoch, batch_size), epoch))
+    }
+
+    /// An extra connection of the *same* instance (the service's secondary loops), fenced by the
+    /// leader's `epoch`: no advisory lock, no migrations. Its writes fail with
+    /// [`StorageError::FencedOut`] once a newer leader claims the epoch.
+    pub fn connect_follower(
+        database_url: &str,
+        memory: SessionMemory,
+        epoch: Epoch,
+        batch_size: usize,
+    ) -> Result<Self, StorageError> {
+        let (rt, conn) = open(database_url, memory)?;
+        Ok(Self::fenced_by(rt, conn, epoch, batch_size))
+    }
+
+    fn fenced_by(
+        rt: tokio::runtime::Runtime,
+        conn: PgConnection,
+        fence: Epoch,
+        batch_size: usize,
+    ) -> Self {
+        Self {
             rt,
             conn: std::cell::RefCell::new(conn),
-            batch_size: DEFAULT_BATCH_SIZE,
+            batch_size,
+            fence,
             #[cfg(any(test, feature = "pg-testkit"))]
             case_db: None,
-        })
+        }
     }
 
     /// Tie a harness database to this storage, so the case's database goes when the storage does.
@@ -111,17 +174,6 @@ impl PostgresStorage {
     pub(crate) fn owning(mut self, db: pg_testkit::CaseDb) -> Self {
         self.case_db = Some(db);
         self
-    }
-
-    /// Run pending sqlx migrations. Call once on startup before the scheduling loop.
-    pub fn migrate(&mut self) -> Result<(), StorageError> {
-        self.with_conn(async move |conn| {
-            scheduler_metadata::pg::MIGRATOR
-                .run(&mut *conn)
-                .await
-                .context("migration failed")?;
-            Ok::<_, StorageError>(())
-        })
     }
 
     /// Existing datasets, each with the S3-discovery watermark for its last chunk (its id and end
@@ -165,6 +217,37 @@ impl PostgresStorage {
         })
     }
 
+    /// Current confirmation watermark, 0 when nothing is confirmed — seeds the service's gate
+    /// across restarts.
+    pub fn worker_confirmation_watermark(&mut self) -> Result<AssignmentId, StorageError> {
+        self.with_conn(async move |conn| {
+            let watermark = sqlx::query_scalar(
+                "SELECT COALESCE(MAX(assignment_id), 0) FROM sched_worker_confirmations",
+            )
+            .fetch_one(&mut *conn)
+            .await
+            .context("fetch confirmation watermark")?;
+            Ok(watermark)
+        })
+    }
+
+    /// Liveness probe: round-trips the connection. An error means the connection (and with it the
+    /// advisory lock) is gone — this storage is unusable and the process must not keep retrying.
+    ///
+    /// `timeout` is required rather than defaulted: the failure this exists to catch includes a socket
+    /// that accepts writes and never answers: an unbounded probe would hang exactly where the
+    /// operation it is vouching for already hung. A timed-out probe leaves a request in flight, so
+    /// its verdict has to be final — which it is, since every caller treats a failure as fatal.
+    pub fn ping(&mut self, timeout: Duration) -> Result<(), StorageError> {
+        self.with_conn(async move |conn| {
+            tokio::time::timeout(timeout, conn.ping())
+                .await
+                .map_err(|_| anyhow::anyhow!("timed out after {timeout:?}"))?
+                .context("ping Postgres connection")?;
+            Ok(())
+        })
+    }
+
     /// Run an async query closure on the owned runtime with exclusive
     /// connection access. The `AsyncFnOnce` bound lets the future borrow the
     /// `&mut PgConnection` argument, which `FnOnce(_) -> Fut` cannot express.
@@ -193,14 +276,19 @@ impl PostgresStorage {
             return Ok(Vec::new());
         }
         let batch_size = self.batch_size;
+        let fence = self.fence;
         self.with_conn(async move |conn| {
-            scheduler_metadata::pg::correction::register_corrections(
-                conn,
+            // The shared helper opens its own transaction, which nests as a savepoint here.
+            let mut tx = begin_fenced(conn, fence, Isolation::ServerDefault).await?;
+            let pks = scheduler_metadata::pg::correction::register_corrections(
+                &mut tx,
                 &corrections,
                 now,
                 batch_size,
             )
-            .await
+            .await?;
+            tx.commit().await.context("register_corrections: commit")?;
+            Ok(pks)
         })
     }
 
@@ -208,15 +296,159 @@ impl PostgresStorage {
     /// `register_new_chunks` admits the clones. Returns the number of clones.
     #[cfg(any(test, feature = "pg-testkit"))]
     pub fn copy_dataset_chunks(&mut self, src: &str, dst: &str) -> Result<u64, StorageError> {
-        self.with_conn(async move |conn| testkit::copy_dataset_chunks(conn, src, dst).await)
+        let fence = self.fence;
+        self.with_conn(async move |conn| {
+            let mut tx = begin_fenced(conn, fence, Isolation::ServerDefault).await?;
+            let cloned = testkit::copy_dataset_chunks(&mut tx, src, dst).await?;
+            tx.commit().await.context("copy_dataset_chunks: commit")?;
+            Ok(cloned)
+        })
     }
+}
+
+/// A connection and the runtime driving it, with this connection's session GUCs applied.
+fn open(
+    database_url: &str,
+    memory: SessionMemory,
+) -> Result<(tokio::runtime::Runtime, PgConnection), StorageError> {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("build current-thread runtime")?;
+    let conn = rt.block_on(async {
+        let mut conn = PgConnection::connect(database_url)
+            .await
+            .context("failed to connect to Postgres")?;
+        if matches!(memory, SessionMemory::Raised) {
+            // Session-scoped GUCs, held for this connection's lifetime.
+            for stmt in [
+                "SET work_mem = '512MB'",
+                "SET maintenance_work_mem = '512MB'",
+            ] {
+                sqlx::query(stmt)
+                    .execute(&mut conn)
+                    .await
+                    .with_context(|| format!("failed to run {stmt}"))?;
+            }
+        }
+        Ok::<_, anyhow::Error>(conn)
+    })?;
+    Ok((rt, conn))
+}
+
+/// Take the singleton scheduler session lock, held for the connection's lifetime. `false` means
+/// another instance holds it — cheap admission control, so a second instance fails fast instead of
+/// stealing leadership from a healthy one. Advisory locks are cluster-wide, not per-database; the
+/// key is scoped to the current database, or per-test databases on one cluster would collide on it.
+async fn try_acquire_scheduler_lock(conn: &mut PgConnection) -> anyhow::Result<bool> {
+    sqlx::query_scalar(
+        "SELECT pg_try_advisory_lock(hashtext('network-scheduler:' || current_database()))",
+    )
+    .fetch_one(&mut *conn)
+    .await
+    .context("failed to acquire advisory lock")
+}
+
+/// Claim leadership by bumping the epoch. Blocks behind any in-flight fenced transaction's
+/// `FOR SHARE`, so the previous leader's last write either commits before this claim or is refused
+/// after it — bounded by `lock_timeout`, because a hung startup hides worse than a retryable
+/// `AlreadyRunning`.
+async fn claim_leadership(
+    conn: &mut PgConnection,
+    lock_timeout: Duration,
+) -> Result<Epoch, StorageError> {
+    let mut tx = conn.begin().await.context("begin leadership claim")?;
+    // `SET LOCAL`: the cap belongs to this claim, not to every later statement on the connection.
+    // A bare integer is milliseconds to Postgres' `lock_timeout`.
+    let lock_timeout_ms = lock_timeout.as_millis();
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "SET LOCAL lock_timeout = '{lock_timeout_ms}'"
+    )))
+    .execute(&mut *tx)
+    .await
+    .context("cap the leadership claim's wait")?;
+    let claim = sqlx::query_scalar(
+        "UPDATE sched_leadership SET epoch = epoch + 1, leader_pid = pg_backend_pid() \
+         WHERE only_row RETURNING epoch",
+    )
+    .fetch_one(&mut *tx)
+    .await;
+    let epoch: i64 = match claim {
+        Ok(epoch) => epoch,
+        // Someone else's write is still in flight; the caller retries as a fresh candidate.
+        Err(e) if scheduler_metadata::pg::rows::is_lock_timeout(&e) => {
+            return Err(StorageError::AlreadyRunning);
+        }
+        Err(e) => {
+            return Err(anyhow::Error::new(e)
+                .context("claim leadership epoch")
+                .into());
+        }
+    };
+    tx.commit().await.context("commit leadership claim")?;
+    Ok(Epoch(epoch))
+}
+
+/// Begin a transaction and check the fence, in one place because both matter to every write.
+///
+/// The `FOR SHARE` holds the leadership row for the transaction's lifetime, so a concurrent claim
+/// parks until we finish: no fenced write can commit after a new leader believes it is exclusive.
+/// It is also the transaction's first read, so it fixes the REPEATABLE READ snapshot — for which
+/// the isolation level must already be set (`SET TRANSACTION` only accepts a virgin transaction).
+async fn begin_fenced(
+    conn: &mut PgConnection,
+    fence: Epoch,
+    isolation: Isolation,
+) -> Result<sqlx::Transaction<'_, sqlx::Postgres>, StorageError> {
+    let mut tx = conn.begin().await.context("begin transaction")?;
+    if matches!(isolation, Isolation::RepeatableRead) {
+        sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+            .execute(&mut *tx)
+            .await
+            .context("set transaction isolation level")?;
+    }
+    let read = sqlx::query_scalar("SELECT epoch FROM sched_leadership WHERE only_row FOR SHARE")
+        .fetch_one(&mut *tx)
+        .await;
+    let current: i64 = match read {
+        Ok(epoch) => epoch,
+        // Under REPEATABLE READ, parking on a claim that then commits raises 40001 — the same event
+        // as a plain mismatch. The row lock is already released with the aborted transaction.
+        Err(e) if scheduler_metadata::pg::rows::is_serialization_failure(&e) => {
+            return Err(StorageError::FencedOut);
+        }
+        Err(e) => {
+            return Err(anyhow::Error::new(e)
+                .context("read leadership epoch")
+                .into());
+        }
+    };
+    if Epoch(current) != fence {
+        // Roll back explicitly: dropping a transaction only queues the `ROLLBACK` until the
+        // connection is next used, and a fenced-out caller never uses it again — the `FOR SHARE`
+        // would go on parking the new leader's claim.
+        tx.rollback().await.context("release the fence")?;
+        return Err(StorageError::FencedOut);
+    }
+    Ok(tx)
+}
+
+/// Isolation level for a fenced transaction.
+#[derive(Clone, Copy, Debug)]
+enum Isolation {
+    /// No `SET`: the session default (READ COMMITTED), which re-snapshots per statement.
+    ServerDefault,
+    /// One snapshot for the whole transaction, so the cycle's placement read, its stale-mint worker
+    /// filter, and its cleanup predicates see the same worker set.
+    RepeatableRead,
 }
 
 impl SchedulerStorage for PostgresStorage {
     fn insert_new_datasets(&mut self, datasets: Vec<NewDataset>) -> Result<(), StorageError> {
+        let fence = self.fence;
         self.with_conn(async move |conn| -> Result<(), StorageError> {
             let mut timer = PhaseTimer::new("insert_new_datasets");
-            let mut tx = conn.begin().await.context("insert_new_datasets: begin")?;
+            let mut tx = begin_fenced(conn, fence, Isolation::ServerDefault).await?;
             for NewDataset {
                 name,
                 location,
@@ -247,8 +479,9 @@ impl SchedulerStorage for PostgresStorage {
         dataset: &str,
         dataset_schema: DatasetSchema,
     ) -> Result<(), StorageError> {
+        let fence = self.fence;
         self.with_conn(async move |conn| -> Result<(), StorageError> {
-            let mut tx = conn.begin().await.context("set_dataset_schema: begin")?;
+            let mut tx = begin_fenced(conn, fence, Isolation::ServerDefault).await?;
             let dataset_id: Option<DatasetPk> =
                 sqlx::query_scalar("SELECT id FROM datasets WHERE name = $1")
                     .bind(dataset)
@@ -321,16 +554,25 @@ impl SchedulerStorage for PostgresStorage {
 
     fn insert_new_chunks(&mut self, chunks: Vec<NewChunk>) -> Result<(), StorageError> {
         let batch_size = self.batch_size;
+        let fence = self.fence;
         self.with_conn(async move |conn| {
-            scheduler_metadata::pg::registration::insert_chunks(conn, &chunks, batch_size).await
+            // The shared helper opens its own transaction, which nests as a savepoint here.
+            let mut tx = begin_fenced(conn, fence, Isolation::ServerDefault).await?;
+            scheduler_metadata::pg::registration::insert_chunks(&mut tx, &chunks, batch_size)
+                .await?;
+            tx.commit().await.context("insert_new_chunks: commit")?;
+            Ok(())
         })
     }
 
     fn register_new_chunks(&mut self) -> Result<Vec<ChunkPk>, StorageError> {
+        let fence = self.fence;
         self.with_conn(async move |conn| {
             let _timer = Timer::new("register_new_chunks");
+            // One transaction, so admission is atomic as well as fenced.
+            let mut tx = begin_fenced(conn, fence, Isolation::ServerDefault).await?;
 
-            let candidate_rows = admission::fetch_candidates(conn).await?;
+            let candidate_rows = admission::fetch_candidates(&mut tx).await?;
             let admission::Classified {
                 exempt,
                 candidates,
@@ -339,7 +581,7 @@ impl SchedulerStorage for PostgresStorage {
 
             // Reject candidates overlapping a live chunk in their dataset (indexed SQL probe), then
             // settle overlaps within the batch (two new chunks covering the same range).
-            let conflicting = nonoverlap::overlapping_live(&mut *conn, &candidates).await?;
+            let conflicting = nonoverlap::overlapping_live(&mut tx, &candidates).await?;
             let (clear, mut rejected): (Vec<Candidate>, Vec<Candidate>) = candidates
                 .into_iter()
                 .partition(|c| !conflicting.contains(&c.pk));
@@ -350,13 +592,14 @@ impl SchedulerStorage for PostgresStorage {
 
             let mut admitted = exempt;
             admitted.extend(&accepted);
-            admission::persist_admitted(conn, &admitted).await?;
+            admission::persist_admitted(&mut tx, &admitted).await?;
             let rejected_pks: Vec<ChunkPk> = rejected
                 .iter()
                 .chain(&range_rejected)
                 .map(|c| c.pk)
                 .collect();
-            admission::persist_rejected(conn, &rejected_pks).await?;
+            admission::persist_rejected(&mut tx, &rejected_pks).await?;
+            tx.commit().await.context("register_new_chunks: commit")?;
 
             Ok::<_, StorageError>(admitted)
         })
@@ -366,8 +609,8 @@ impl SchedulerStorage for PostgresStorage {
         &mut self,
         active_workers: &[Worker],
         now: Tick,
-        gc_ticks: u64,
     ) -> Result<(), StorageError> {
+        let fence = self.fence;
         self.with_conn(async move |conn| {
             let _timer = Timer::new("update_worker_set");
             let peer_ids: Vec<String> = active_workers.iter().map(|w| w.id.to_string()).collect();
@@ -376,14 +619,24 @@ impl SchedulerStorage for PostgresStorage {
                 .map(|w| w.version.as_ref().map(|v| v.to_string()))
                 .collect();
 
-            let mut tx = conn.begin().await.context("update_worker_set: begin")?;
+            // Status columns only (see the module's ownership map); a departure's mapping-table
+            // consequences are settled by the scheduling cycle, keyed on `inactive_since`.
+            let mut tx = begin_fenced(conn, fence, Isolation::ServerDefault).await?;
             workers::upsert_active(&mut tx, &peer_ids, &versions).await?;
-            let departed = workers::mark_departed(&mut tx, &peer_ids, now).await?;
-            workers::delete_stale_mappings(&mut tx, &departed).await?;
-            workers::promote_orphaned_drains(&mut tx, &departed).await?;
-            workers::gc_inactive(&mut tx, now, gc_ticks).await?;
+            workers::mark_departed(&mut tx, &peer_ids, now).await?;
             tx.commit().await.context("update_worker_set: commit")?;
 
+            Ok::<_, StorageError>(())
+        })
+    }
+
+    fn gc_inactive_workers(&mut self, now: Tick, gc_ticks: u64) -> Result<(), StorageError> {
+        let fence = self.fence;
+        self.with_conn(async move |conn| {
+            // Server default, not RR: the DELETE must re-snapshot (see `workers::gc_inactive_workers`).
+            let mut tx = begin_fenced(conn, fence, Isolation::ServerDefault).await?;
+            workers::gc_inactive_workers(&mut tx, now, gc_ticks).await?;
+            tx.commit().await.context("gc_inactive_workers: commit")?;
             Ok::<_, StorageError>(())
         })
     }
@@ -401,14 +654,15 @@ impl SchedulerStorage for PostgresStorage {
         use scheduling_cycle as phase;
 
         let batch_size = self.batch_size;
+        let fence = self.fence;
         self.with_conn(async move |conn| {
             let _timer = Timer::new("run_scheduling_cycle");
-            // Phase A — clock-driven GC, committed up front so it survives a Phase B
-            // shortage rollback; otherwise stale never drains under a sustained shortage.
-            let mut gc_tx = conn
-                .begin()
-                .await
-                .context("run_scheduling_cycle: begin gc")?;
+            // Phase A — departed-worker cleanup, then clock-driven GC, committed up front so it
+            // survives a Phase B shortage rollback; otherwise stale never drains under a
+            // sustained shortage. The promotion must run before the expiry — rescue before reaper.
+            let mut gc_tx = begin_fenced(conn, fence, Isolation::RepeatableRead).await?;
+            workers::delete_inactive_stale_mappings(&mut gc_tx).await?;
+            workers::promote_orphaned_drains(&mut gc_tx).await?;
             phase::tombstone_expired_chunks(&mut gc_tx, now, m_ticks).await?;
             phase::expire_drained_stale_mappings(&mut gc_tx, now, m_ticks).await?;
             gc_tx
@@ -417,7 +671,7 @@ impl SchedulerStorage for PostgresStorage {
                 .context("run_scheduling_cycle: commit gc")?;
 
             // Phase B — placement reconcile; rolls back on shortage, leaving Phase A committed.
-            let mut tx = conn.begin().await.context("run_scheduling_cycle: begin")?;
+            let mut tx = begin_fenced(conn, fence, Isolation::RepeatableRead).await?;
 
             // One streamed round-trip decoding the algorithm's inputs and the published chunk
             // columns together, so the post-commit assignment build needn't re-read them.
@@ -490,17 +744,20 @@ impl SchedulerStorage for PostgresStorage {
                 };
             phase::persist_assignment_schemas(&mut tx, &published_schema_ids).await?;
 
+            // Read before commit: the tx sees its own writes, so the published assignment is
+            // exactly what this commit makes live; a post-commit read takes a fresh snapshot.
+            let stale_holders = phase::fetch_stale_holders(&mut tx).await?;
+
             tx.commit().await.context("run_scheduling_cycle: commit")?;
 
             let wa = phase::build_worker_assignment(
-                conn,
                 new_wa_id,
                 workers_map,
                 replication_by_weight,
                 ideal_mappings,
                 published_chunks,
-            )
-            .await?;
+                stale_holders,
+            );
             Ok::<_, StorageError>(wa)
         })
     }
@@ -512,12 +769,10 @@ impl SchedulerStorage for PostgresStorage {
     ) -> Result<(), StorageError> {
         use visibility as phase;
 
+        let fence = self.fence;
         self.with_conn(async move |conn| {
             let _timer = Timer::new("confirm_worker_assignment");
-            let mut tx = conn
-                .begin()
-                .await
-                .context("confirm_worker_assignment: begin")?;
+            let mut tx = begin_fenced(conn, fence, Isolation::ServerDefault).await?;
 
             let prev = phase::confirmation_watermark(&mut tx).await?;
 
@@ -542,9 +797,10 @@ impl SchedulerStorage for PostgresStorage {
     fn run_visibility_cycle(&mut self, now: Tick) -> Result<PortalAssignment, StorageError> {
         use visibility as phase;
 
+        let fence = self.fence;
         self.with_conn(async move |conn| {
             let _timer = Timer::new("run_visibility_cycle");
-            let mut tx = conn.begin().await.context("run_visibility_cycle: begin")?;
+            let mut tx = begin_fenced(conn, fence, Isolation::ServerDefault).await?;
 
             // Watermark read first so the portal assignment records it (activates drains).
             let confirmed_up_to = phase::confirmation_watermark(&mut tx).await?;
@@ -586,16 +842,19 @@ impl SchedulerStorage for PostgresStorage {
     }
 
     fn mark_for_removal(&mut self, chunk_pk: ChunkPk, now: Tick) -> Result<(), StorageError> {
+        let fence = self.fence;
         self.with_conn(async move |conn| {
             let mut timer = PhaseTimer::new("mark_for_removal");
+            let mut tx = begin_fenced(conn, fence, Isolation::ServerDefault).await?;
             let res = sqlx::query(
                 "UPDATE sched_chunk_metadata SET marked_for_removal = $2 WHERE chunk_pk = $1",
             )
             .bind(chunk_pk)
             .bind(tick_to_i64(now))
-            .execute(&mut *conn)
+            .execute(&mut *tx)
             .await
             .context("mark_for_removal")?;
+            tx.commit().await.context("mark_for_removal: commit")?;
             timer.stmt(res.rows_affected());
             Ok::<_, StorageError>(())
         })

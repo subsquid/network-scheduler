@@ -1,6 +1,6 @@
 # MVCC storage — schema reference
 
-Table definitions live in `crates/scheduler-metadata/migrations/0001_sched_tables.sql`. The protocol these tables serve is
+Table definitions live in `crates/scheduler-metadata/migrations/`. The protocol these tables serve is
 described in [mvcc-storage.md](mvcc-storage.md).
 
 **Time is logical ticks, not wall-clock.** Every `created_at` / `marked_for_removal` /
@@ -23,7 +23,7 @@ a logical grace window, not minutes.
   climbs; narrowing it would save ~4% of what the other two do and puts an unrecoverable wrap at
   the end of the road.
 
-**Single scheduler.** Only one scheduler instance may operate at a time, enforced by a Postgres
+**Single scheduler.** Only one scheduler instance may operate at a time, admitted by a Postgres
 advisory lock acquired at startup:
 
 ```sql
@@ -33,10 +33,13 @@ SELECT pg_try_advisory_lock(hashtext('network-scheduler:' || current_database())
 `true` = acquired; `false` = another scheduler holds it (the backend returns
 `StorageError::AlreadyRunning`). Released automatically when the connection closes.
 
+The lock is admission, not enforcement: write exclusivity rests on the
+[sched_leadership](#sched_leadership) epoch, which every scheduler write transaction verifies.
+
 ## Shared tables
 
-Shared across the ingester, backfill process, and the scheduler. Chunk data is immutable after
-insertion.
+Shared between the ingestion write path (metadata-service) and the scheduler. Chunk data is
+immutable after insertion.
 
 ### datasets
 
@@ -79,10 +82,10 @@ CREATE TABLE schemas (
 
 ### chunks
 
-Chunk catalog. The ingester inserts new chunks here; the backfill process also inserts replacement
-chunks here atomically as part of `register_correction` (see [chunk_corrections](#chunk_corrections)
-below). `registered_at` is the only wall-clock column in the schema — set by the ingester at
-insertion time, outside the scheduler's logical-tick model.
+Chunk catalog. The ingestion write path inserts new chunks — reorg corrections insert replacement
+chunks atomically with their [chunk_corrections](#chunk_corrections) link — and the scheduler's
+chunk discovery inserts chunks found in S3. `registered_at` is the only wall-clock column in the
+schema — set at insertion time, outside the scheduler's logical-tick model.
 
 ```sql
 CREATE TABLE chunks (
@@ -125,10 +128,10 @@ future MVCC assignment builder needn't recover them from S3. `registered_at` is 
 
 ### chunk_corrections
 
-Written by the backfill process via the scheduler's `register_correction` API, which atomically
-inserts the replacement chunk into `chunks` and the correction record here. The scheduler reads
-pending rows during the visibility cycle and stamps `applied_at_portal_assignment_id` when the
-correction fires. See [mvcc-storage.md](mvcc-storage.md), "Corrections".
+Written by the ingestion write path, atomically with the replacement chunk's `chunks` row. The
+scheduler reads pending rows during the visibility cycle and stamps
+`applied_at_portal_assignment_id` when the correction fires. See
+[mvcc-storage.md](mvcc-storage.md), "Corrections".
 
 ```sql
 CREATE TABLE chunk_corrections (
@@ -172,8 +175,8 @@ with `CorrectionRejected` (see [nonoverlap-promotion-gate.md](nonoverlap-promoti
 
 ## Scheduler tables
 
-All `sched_*` tables are written exclusively by the scheduler. No external process reads or writes
-them directly.
+All `sched_*` tables are written exclusively by the scheduler; other processes may read some of
+the metadata for debugging purposes.
 
 **Two id sequences.** Worker and portal assignments are independent streams, so each has its own
 sequence and every referencing column targets exactly one of them. This makes the distinction
@@ -195,6 +198,24 @@ CREATE TABLE sched_portal_assignments (
     confirmed_up_to INT    NOT NULL
 );
 ```
+
+### sched_leadership
+
+The fencing token, one row, seeded by the migration. Each scheduler that wins the startup lock
+bumps `epoch`; every scheduler write transaction then re-reads it `FOR SHARE` and aborts
+(`StorageError::FencedOut`) if it no longer matches the epoch that transaction's writer started
+under. So a superseded instance cannot write behind a live leader's back, and the row lock makes a
+new leader's claim wait for in-flight writes. Reads are not fenced.
+
+```sql
+CREATE TABLE sched_leadership (
+    only_row   BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (only_row),  -- PK + CHECK: at most one row
+    epoch      BIGINT  NOT NULL DEFAULT 0,
+    leader_pid INTEGER
+);
+```
+
+`leader_pid` is diagnostics only — pids get reused, so it identifies nothing by itself.
 
 ### sched_chunk_metadata
 
@@ -247,11 +268,11 @@ scope and the anchor's storage differ:
 ### sched_workers
 
 Worker registry. The scheduler periodically syncs the active set from ClickHouse: new workers are
-inserted, returning workers reactivated (`inactive_since` → NULL), absent workers marked stale
-(`inactive_since` set), and workers stale past a GC horizon are deleted. When a worker is marked
-departed (absent from the active set) its `sched_stale_mappings` rows are deleted too (no point
-draining for a worker that no longer serves) — done on departure-detection in `update_worker_set`,
-ahead of the eventual GC of the worker row.
+inserted, returning workers reactivated (`inactive_since` → NULL), absent workers marked inactive
+(`inactive_since` set). Cleanup is keyed on that state: inactive workers' `sched_stale_mappings`
+rows are deleted by the next scheduling cycle (no point draining for a worker that no longer
+serves), and worker rows inactive past the GC horizon are deleted (leftover stale rows cascade
+with them).
 
 ```sql
 CREATE TABLE sched_workers (

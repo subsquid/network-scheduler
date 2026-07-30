@@ -150,15 +150,23 @@ pub trait SchedulerStorage {
     /// Create scheduling metadata for new chunks, and make them eligible for workers
     fn register_new_chunks(&mut self) -> Result<Vec<ChunkPk>, StorageError>;
 
-    /// Update the current view on the active workers
+    /// Update the current view on the active workers — status columns only. A departed worker's
+    /// mappings are cleaned up by [`run_scheduling_cycle`](Self::run_scheduling_cycle) and its row
+    /// deleted by [`gc_inactive_workers`](Self::gc_inactive_workers), so this never writes a table
+    /// the cycle writes and the two can run concurrently.
     fn update_worker_set(
         &mut self,
         active_workers: &[Worker],
         now: Tick,
-        gc_ticks: u64,
     ) -> Result<(), StorageError>;
 
-    /// Run one full scheduling cycle: tombstone expired chunks, expire stale
+    /// Delete workers inactive for longer than `gc_ticks` (their stale mappings go with them).
+    /// Runs after [`run_scheduling_cycle`](Self::run_scheduling_cycle), on the same connection, so
+    /// the cycle's cleanup settles a departure before the row disappears under it.
+    fn gc_inactive_workers(&mut self, now: Tick, gc_ticks: u64) -> Result<(), StorageError>;
+
+    /// Run one full scheduling cycle: clean up departed workers (drop the stale mappings of
+    /// inactive workers, promote orphaned drains), tombstone expired chunks, expire stale
     /// mappings, run `algorithm` in-process, diff + commit results.
     ///
     /// Returns the published `WorkerAssignment` (ideal ∪ stale); call
@@ -234,7 +242,8 @@ pub trait SchedulerStorage {
     ) -> Result<ReadSchemaId, StorageError>;
 
     /// Register a new chunk replacement for an old chunk. New chunk must have the same block range
-    /// as the old chunk. A production path now — reorgs drive it.
+    /// as the old chunk. Reorgs drive it, but in production through metadata-service, which writes
+    /// the same rows; this entry point has no service caller yet.
     fn register_correction(
         &mut self,
         old_pk: ChunkPk,

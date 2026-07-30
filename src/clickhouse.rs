@@ -3,6 +3,7 @@ use std::{collections::BTreeMap, str::FromStr, sync::Arc, time::Duration};
 use anyhow::{Context, Result};
 use clickhouse::{Client, Row};
 use itertools::Itertools;
+use libp2p_identity::PeerId;
 use semver::Version;
 use serde::{Deserialize, Serialize};
 use tracing::instrument;
@@ -64,6 +65,45 @@ fn worker_status(row: &PingRow, version: Option<&Version>, t: &StatusThresholds)
     status
 }
 
+/// [`PingRow`] plus the worker-echoed assignment id.
+#[cfg(feature = "mvcc-chunks")]
+#[derive(Row, Debug, Deserialize)]
+struct MvccPingRow {
+    worker_id: String,
+    version: String,
+    stored_bytes: u64,
+    timestamp: u64,
+    current_epoch: Option<u32>,
+    last_applied_assignment_id: Option<String>,
+}
+
+#[cfg(feature = "mvcc-chunks")]
+impl MvccPingRow {
+    /// Split off the shared ping fields so this path classifies through the same
+    /// [`worker_status`] rule as [`ClickhouseClient::get_active_workers`].
+    fn split(self) -> (PingRow, Option<String>) {
+        (
+            PingRow {
+                worker_id: self.worker_id,
+                version: self.version,
+                stored_bytes: self.stored_bytes,
+                timestamp: self.timestamp,
+                current_epoch: self.current_epoch,
+            },
+            self.last_applied_assignment_id,
+        )
+    }
+}
+
+/// A worker from the latest ping snapshot; `last_applied_assignment_id` is the id the worker
+/// echoed as applied, verbatim (interpreting it is the scheduler's concern).
+#[cfg(feature = "mvcc-chunks")]
+#[derive(Debug)]
+pub struct WorkerPing {
+    pub worker: Worker,
+    pub last_applied_assignment_id: Option<String>,
+}
+
 pub struct ClickhouseClient {
     client: Client,
 }
@@ -89,7 +129,8 @@ impl ClickhouseClient {
             .with_password(
                 args.clickhouse_password
                     .as_ref()
-                    .ok_or_else(|| anyhow::anyhow!("ClickHouse password is required"))?,
+                    .ok_or_else(|| anyhow::anyhow!("ClickHouse password is required"))?
+                    .expose_secret(),
             );
         let this = Self { client };
         this.create_tables().await?;
@@ -106,12 +147,6 @@ impl ClickhouseClient {
     ) -> Result<Vec<Worker>> {
         let _timer = crate::metrics::Timer::new("get_active_workers");
 
-        let inactive_threshold = (std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("Failed to get system time")
-            - inactive_timeout)
-            .as_millis() as u64;
-
         let query = format!(
             r"
             SELECT DISTINCT ON (worker_id) worker_id, version, stored_bytes, timestamp, current_epoch
@@ -126,19 +161,14 @@ impl ClickhouseClient {
         // Buffered, not classified inline: the epoch baseline needs every row first.
         let mut rows = Vec::new();
         while let Some(row) = cursor.next().await? {
-            let peer_id = match row.worker_id.parse() {
-                Ok(peer_id) => peer_id,
-                Err(e) => {
-                    tracing::warn!("Failed to parse worker ID \"{}\": {}", row.worker_id, e);
-                    crate::metrics::failure("invalid_peer_id");
-                    continue;
-                }
+            let Some(peer_id) = parse_peer_id(&row.worker_id) else {
+                continue;
             };
             rows.push((peer_id, row));
         }
 
         let thresholds = StatusThresholds {
-            inactive_threshold,
+            inactive_threshold: inactive_threshold(inactive_timeout),
             stale_threshold,
             min_version,
             max_epoch: rows.iter().filter_map(|(_, row)| row.current_epoch).max(),
@@ -171,6 +201,69 @@ impl ClickhouseClient {
         }
 
         crate::metrics::report_workers(&results);
+        Ok(results)
+    }
+
+    /// [`Self::get_active_workers`] plus each worker's echoed `last_applied_assignment_id` —
+    /// the confirmation-gate input. The column exists when the pings collector (see
+    /// subsquid/network-components) is also built with `mvcc-chunks`.
+    #[cfg(feature = "mvcc-chunks")]
+    #[instrument(skip_all)]
+    pub async fn active_worker_pings(&self, config: &Config) -> Result<Vec<WorkerPing>> {
+        let _timer = crate::metrics::Timer::new("active_worker_pings");
+
+        let query = format!(
+            r"
+            SELECT DISTINCT ON (worker_id)
+                worker_id, version, stored_bytes, timestamp, current_epoch,
+                last_applied_assignment_id
+            FROM {PINGS_TABLE}
+            WHERE timestamp >= (SELECT MAX(timestamp) FROM {PINGS_TABLE}) - INTERVAL 1 DAY
+            ORDER BY worker_id, timestamp DESC
+            "
+        );
+
+        let mut cursor = self.client.query(&query).fetch::<MvccPingRow>()?;
+
+        // Buffered, not classified inline: the epoch baseline needs every row first.
+        let mut rows = Vec::new();
+        while let Some(row) = cursor.next().await? {
+            let (ping, last_applied_assignment_id) = row.split();
+            let Some(peer_id) = parse_peer_id(&ping.worker_id) else {
+                continue;
+            };
+            rows.push((peer_id, ping, last_applied_assignment_id));
+        }
+
+        let thresholds = StatusThresholds {
+            inactive_threshold: inactive_threshold(config.worker_inactive_timeout),
+            stale_threshold: config.worker_stale_bytes,
+            min_version: &config.min_supported_worker_version,
+            max_epoch: rows
+                .iter()
+                .filter_map(|(_, ping, _)| ping.current_epoch)
+                .max(),
+            max_epoch_lag: config.max_worker_epoch_lag,
+        };
+
+        let results: Vec<WorkerPing> = rows
+            .into_iter()
+            .map(|(peer_id, ping, last_applied_assignment_id)| {
+                let version = Version::from_str(&ping.version).ok();
+                let status = worker_status(&ping, version.as_ref(), &thresholds);
+                WorkerPing {
+                    worker: Worker {
+                        id: peer_id,
+                        status,
+                        version,
+                    },
+                    last_applied_assignment_id,
+                }
+            })
+            .collect();
+
+        let workers: Vec<Worker> = results.iter().map(|ping| ping.worker.clone()).collect();
+        crate::metrics::report_workers(&workers);
         Ok(results)
     }
 
@@ -250,6 +343,27 @@ impl ClickhouseClient {
     }
 }
 
+/// Ping timestamps older than this (ms since epoch) mean the worker is offline.
+fn inactive_threshold(inactive_timeout: Duration) -> u64 {
+    (std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("Failed to get system time")
+        - inactive_timeout)
+        .as_millis() as u64
+}
+
+/// The peer id a ping names, or `None` if it doesn't parse (warned and counted).
+fn parse_peer_id(worker_id: &str) -> Option<PeerId> {
+    match worker_id.parse() {
+        Ok(peer_id) => Some(peer_id),
+        Err(e) => {
+            tracing::warn!("Failed to parse worker ID \"{worker_id}\": {e}");
+            crate::metrics::failure("invalid_peer_id");
+            None
+        }
+    }
+}
+
 #[derive(Row, Debug, Serialize, Deserialize)]
 struct ChunkRow {
     dataset: String,
@@ -323,7 +437,7 @@ mod test {
             clickhouse_url: Some("http://localhost:8123/".to_string()),
             clickhouse_database: Some("logs_db".to_string()),
             clickhouse_user: Some("user".to_string()),
-            clickhouse_password: Some("password".to_string()),
+            clickhouse_password: Some("password".to_string().into()),
         })
         .await
         .expect("Cannot connect to clickhouse");

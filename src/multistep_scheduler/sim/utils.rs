@@ -211,7 +211,7 @@ pub(super) const DEPARTURE_DETECTION_TICKS: Tick = 4 * M_TICKS;
 /// Retention longer than any run — departed workers are never deleted.
 pub(super) const NEVER_GC_TICKS: Tick = 1_000_000_000;
 
-/// Per-case departed-worker retention: deletion eligible at the next membership sync, racing the
+/// Per-case departed-worker retention: deletion eligible at the next cycle's GC, racing the
 /// drain window, production-shaped `retention > M`, or never.
 pub(super) fn gc_ticks() -> BoxedStrategy<Tick> {
     prop_oneof![

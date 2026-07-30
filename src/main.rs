@@ -21,6 +21,10 @@ async fn main() -> anyhow::Result<()> {
     match args.mode {
         cli::RunMode::Prod => run_prod_mode(&args, config).await?,
         cli::RunMode::Cli => run_cli_mode(&args, config).await?,
+        #[cfg(feature = "mvcc-chunks")]
+        cli::RunMode::Service => {
+            network_scheduler::multistep_controller::service::run(&args, config).await?
+        }
     }
 
     tracing::info!("Done");

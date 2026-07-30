@@ -115,7 +115,7 @@ fn update_worker_set_inserts_new_peer_with_version() {
     let mut storage = InMemoryStorage::default();
     let worker = worker(1, Some("2.8.0"));
     storage
-        .update_worker_set(std::slice::from_ref(&worker), 100, 60)
+        .update_worker_set(std::slice::from_ref(&worker), 100)
         .unwrap();
 
     let registry = workers(&storage);
@@ -130,11 +130,9 @@ fn update_worker_set_inserts_new_peer_with_version() {
 #[test]
 fn update_worker_set_marks_absent_peer_stale() {
     let mut storage = InMemoryStorage::default();
-    storage
-        .update_worker_set(&[worker(1, None)], 100, 60)
-        .unwrap();
+    storage.update_worker_set(&[worker(1, None)], 100).unwrap();
 
-    storage.update_worker_set(&[], 200, 60).unwrap();
+    storage.update_worker_set(&[], 200).unwrap();
     assert_eq!(
         workers(&storage).len(),
         1,
@@ -147,12 +145,12 @@ fn update_worker_set_marks_absent_peer_stale() {
 fn update_worker_set_revives_stale_and_refreshes_version() {
     let mut storage = InMemoryStorage::default();
     storage
-        .update_worker_set(&[worker(1, Some("2.7.0"))], 100, 60)
+        .update_worker_set(&[worker(1, Some("2.7.0"))], 100)
         .unwrap();
-    storage.update_worker_set(&[], 200, 60).unwrap(); // now stale
+    storage.update_worker_set(&[], 200).unwrap(); // now stale
 
     storage
-        .update_worker_set(&[worker(1, Some("2.8.0"))], 300, 60)
+        .update_worker_set(&[worker(1, Some("2.8.0"))], 300)
         .unwrap();
     let registry = workers(&storage);
     let view = &registry[0];
@@ -164,10 +162,10 @@ fn update_worker_set_revives_stale_and_refreshes_version() {
 fn update_worker_set_refreshes_version_for_continuously_active() {
     let mut storage = InMemoryStorage::default();
     storage
-        .update_worker_set(&[worker(1, Some("2.7.0"))], 100, 60)
+        .update_worker_set(&[worker(1, Some("2.7.0"))], 100)
         .unwrap();
     storage
-        .update_worker_set(&[worker(1, Some("2.8.0"))], 200, 60)
+        .update_worker_set(&[worker(1, Some("2.8.0"))], 200)
         .unwrap();
     let registry = workers(&storage);
     let view = &registry[0];
@@ -178,13 +176,11 @@ fn update_worker_set_refreshes_version_for_continuously_active() {
 #[test]
 fn update_worker_set_already_stale_is_idempotent() {
     let mut storage = InMemoryStorage::default();
-    storage
-        .update_worker_set(&[worker(1, None)], 100, 1000)
-        .unwrap();
-    storage.update_worker_set(&[], 200, 1000).unwrap();
+    storage.update_worker_set(&[worker(1, None)], 100).unwrap();
+    storage.update_worker_set(&[], 200).unwrap();
     let stale_at = workers(&storage)[0].inactive_since;
 
-    storage.update_worker_set(&[], 300, 1000).unwrap();
+    storage.update_worker_set(&[], 300).unwrap();
     assert_eq!(
         workers(&storage)[0].inactive_since,
         stale_at,
@@ -193,19 +189,17 @@ fn update_worker_set_already_stale_is_idempotent() {
 }
 
 #[test]
-fn update_worker_set_gc_boundary() {
+fn gc_inactive_workers_boundary() {
     let mut storage = InMemoryStorage::default();
-    storage
-        .update_worker_set(&[worker(1, None)], 100, 60)
-        .unwrap();
-    storage.update_worker_set(&[], 200, 60).unwrap(); // worker stale at 200
+    storage.update_worker_set(&[worker(1, None)], 100).unwrap();
+    storage.update_worker_set(&[], 200).unwrap(); // worker stale at 200
 
     // At now=260, cutoff = 260 - 60 = 200. 200 < 200 is false → kept.
-    storage.update_worker_set(&[], 260, 60).unwrap();
+    storage.gc_inactive_workers(260, 60).unwrap();
     assert_eq!(workers(&storage).len(), 1, "worker at the boundary is kept");
 
     // At now=300, cutoff = 300 - 60 = 240. 200 < 240 → evicted.
-    storage.update_worker_set(&[], 300, 60).unwrap();
+    storage.gc_inactive_workers(300, 60).unwrap();
     assert!(
         workers(&storage).is_empty(),
         "worker past the boundary is evicted"
@@ -213,11 +207,9 @@ fn update_worker_set_gc_boundary() {
 }
 
 #[test]
-fn update_worker_set_cleans_stale_mappings_for_departed() {
+fn scheduling_cycle_cleans_stale_mappings_for_departed() {
     let mut storage = InMemoryStorage::default();
-    storage
-        .update_worker_set(&[worker(1, None)], 100, 60)
-        .unwrap();
+    storage.update_worker_set(&[worker(1, None)], 100).unwrap();
     let worker_id = workers(&storage)[0].worker_id;
     storage.sched_stale_mappings.insert(
         (ChunkPk(1), worker_id),
@@ -226,7 +218,18 @@ fn update_worker_set_cleans_stale_mappings_for_departed() {
         },
     );
 
-    storage.update_worker_set(&[], 200, 60).unwrap(); // worker departs
+    storage.update_worker_set(&[], 200).unwrap(); // worker departs
+    assert!(
+        !storage.get_stale_mappings(|_| true).is_empty(),
+        "departure alone leaves the stale mapping; the cycle cleans it up"
+    );
+
+    let algorithm = StaticSchedulingAlgorithm {
+        mapping: Vec::new(),
+    };
+    storage
+        .run_scheduling_cycle(&algorithm, &(), 300, 60)
+        .expect("scheduling succeeds");
     assert!(storage.get_stale_mappings(|_| true).is_empty());
 }
 
@@ -588,7 +591,7 @@ fn run_scheduling_cycle_applies_mapping_from_algorithm() {
     // worker_ids are assigned in HashMap iteration order — record them rather
     // than assume a peer→id mapping.
     storage
-        .update_worker_set(&[worker(1, None), worker(2, None)], 0, 1000)
+        .update_worker_set(&[worker(1, None), worker(2, None)], 0)
         .unwrap();
     let worker_ids: Vec<WorkerPk> = workers(&storage)
         .iter()
@@ -642,9 +645,7 @@ fn worker_assignment_diffs_recorded_after_cycle_then_cleared_on_confirm() {
     let pk_1 = storage.pk_of(&chunk_1);
     storage.register_new_chunks().unwrap();
 
-    storage
-        .update_worker_set(&[worker(1, None)], 0, 1000)
-        .unwrap();
+    storage.update_worker_set(&[worker(1, None)], 0).unwrap();
     let worker_id = workers(&storage)[0].worker_id;
 
     let mapping: IdealMapping = vec![(pk_1, vec![worker_id])];

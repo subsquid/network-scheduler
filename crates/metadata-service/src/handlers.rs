@@ -187,7 +187,9 @@ pub async fn get_read_schema(
 
 /// Report chunks the ingester has written to storage. A 2xx means durably accepted: the overlap
 /// decision happens in this call (see ADR 0003), so the ingester can safely resume past the
-/// reported range. Re-sending a batch is safe — already-present ids come back as duplicates.
+/// reported range. Admission stays scheduler-side: the chunk is `pending` until the scheduler's
+/// own sweep gives it scheduling metadata. Re-sending a batch is safe — already-present ids come
+/// back as duplicates.
 #[utoipa::path(post, path = "/datasets/{name}/chunks", tag = "chunks",
     params(("name" = String, Path, description = "Dataset name")),
     request_body = InsertChunksRequest,

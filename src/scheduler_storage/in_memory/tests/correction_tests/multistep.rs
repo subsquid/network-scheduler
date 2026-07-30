@@ -111,7 +111,7 @@ fn correction_held_until_new_chunk_confirmed<S: TestStorage>() -> anyhow::Result
     let mut storage = make_storage::<S>(vec![chunk_a.clone()]);
     let pk_a = storage.pk_of(&chunk_a);
 
-    storage.update_worker_set(&[worker(1, None)], 0, 1000)?;
+    storage.update_worker_set(&[worker(1, None)], 0)?;
 
     let assignment_a = run_real_cycle(&mut storage, CYCLE_INTERVAL);
     storage.confirm_worker_assignment(assignment_a.id, CYCLE_INTERVAL)?;
@@ -140,7 +140,7 @@ fn correction_new_chunk_not_promoted_until_correction_fires<S: TestStorage>() ->
     let mut storage = make_storage::<S>(vec![chunk_a.clone()]);
     let pk_a = storage.pk_of(&chunk_a);
 
-    storage.update_worker_set(&[worker(1, None)], 0, 1000)?;
+    storage.update_worker_set(&[worker(1, None)], 0)?;
 
     let pk_b = storage.register_correction(pk_a, chunk_with_blocks(dataset, 2, 100, 2..=3), 150)?;
 
@@ -158,7 +158,7 @@ fn correction_chain_collapses_in_one_cycle<S: TestStorage>() -> anyhow::Result<(
     let mut storage = make_storage::<S>(vec![chunk_a.clone()]);
     let pk_a = storage.pk_of(&chunk_a);
 
-    storage.update_worker_set(&[worker(1, None)], 0, 1000)?;
+    storage.update_worker_set(&[worker(1, None)], 0)?;
 
     let assignment_a = run_real_cycle(&mut storage, CYCLE_INTERVAL);
     storage.confirm_worker_assignment(assignment_a.id, CYCLE_INTERVAL)?;
@@ -188,7 +188,7 @@ fn correction_independent_corrections_fire_together<S: TestStorage>() -> anyhow:
     let pk_a = storage.pk_of(&chunk_a);
     let pk_c = storage.pk_of(&chunk_c);
 
-    storage.update_worker_set(&[worker(1, None)], 0, 1000)?;
+    storage.update_worker_set(&[worker(1, None)], 0)?;
 
     let assignment_ac = run_real_cycle(&mut storage, CYCLE_INTERVAL);
     storage.confirm_worker_assignment(assignment_ac.id, CYCLE_INTERVAL)?;
@@ -223,7 +223,7 @@ fn overlapping_duplicate_rejected_at_registration<S: TestStorage>() -> anyhow::R
     let mut storage = make_storage::<S>(vec![lower.clone(), higher.clone()]);
     let lower_pk = storage.pk_of(&lower);
 
-    storage.update_worker_set(&[worker(1, None)], 0, 1000)?;
+    storage.update_worker_set(&[worker(1, None)], 0)?;
     let assignment = run_real_cycle(&mut storage, CYCLE_INTERVAL);
     storage.confirm_worker_assignment(assignment.id, CYCLE_INTERVAL)?;
 
@@ -245,7 +245,7 @@ fn rejected_duplicate_does_not_self_heal<S: TestStorage>() -> anyhow::Result<()>
     let mut storage = make_storage::<S>(vec![lower.clone(), higher.clone()]);
     let lower_pk = storage.pk_of(&lower);
 
-    storage.update_worker_set(&[worker(1, None)], 0, 1000)?;
+    storage.update_worker_set(&[worker(1, None)], 0)?;
     let assignment = run_real_cycle(&mut storage, CYCLE_INTERVAL);
     storage.confirm_worker_assignment(assignment.id, CYCLE_INTERVAL)?;
     let portal = storage.run_visibility_cycle(CYCLE_INTERVAL + DELTA)?;
@@ -269,7 +269,7 @@ fn correction_replacement_changing_range_is_rejected<S: TestStorage>() -> anyhow
     let original_pk = storage.pk_of(&original);
     let neighbor_pk = storage.pk_of(&neighbor);
 
-    storage.update_worker_set(&[worker(1, None)], 0, 1000)?;
+    storage.update_worker_set(&[worker(1, None)], 0)?;
     let assignment = run_real_cycle(&mut storage, CYCLE_INTERVAL);
     storage.confirm_worker_assignment(assignment.id, CYCLE_INTERVAL)?;
     let portal = storage.run_visibility_cycle(CYCLE_INTERVAL + DELTA)?;
@@ -360,7 +360,7 @@ proptest! {
         let c0 = chunk(dataset, 1, 100);
         let mut storage = make_storage::<InMemoryStorage>(vec![c0.clone()]);
         let c0_pk = storage.pk_of(&c0);
-        storage.update_worker_set(&[worker(1, None)], 0, 1000).unwrap();
+        storage.update_worker_set(&[worker(1, None)], 0).unwrap();
 
         let seed_assignment = run_real_cycle(&mut storage, CYCLE_INTERVAL);
         storage.confirm_worker_assignment(seed_assignment.id, CYCLE_INTERVAL).unwrap();

@@ -118,7 +118,7 @@ fn schedule_with_bundle(
 
 fn one_worker(storage: &mut PostgresStorage) -> Vec<WorkerPk> {
     storage
-        .update_worker_set(&[worker(1, None)], 0, 10_000)
+        .update_worker_set(&[worker(1, None)], 0)
         .expect("upsert workers");
     storage
         .get_workers(|_| true)

@@ -519,7 +519,7 @@ fn worker_gc_orphans_post_departure_stale_rows_case() -> (SimConfig, Vec<Action>
         // Heavy adds reshuffle pairs off the departed worker; still registered, it passes
         // the mint filter and collects stale rows.
         Action::AddChunks(vec![nc(2, 12), nc(3, 12)]),
-        // This sync GCs the departed worker under its stale rows.
+        // The next cycle's GC deletes the departed worker under its stale rows.
         Action::WorkerJoined(4),
     ];
     (config, actions)
@@ -585,10 +585,10 @@ fn departure_reshuffle_overcommits_a_survivor() {
     );
 }
 
-/// Regression: a departed worker's lingering row must not stall the drain probe. GC waits for a
-/// membership sync and the drain triggers none, so the row survives the whole probe; while
-/// departed workers were still scheduled onto, the ideal oscillated around it and the probe
-/// exhausted its 200-cycle budget. Shrunk by the churn walk.
+/// Regression: a departed worker's lingering row must not stall the drain probe. The row survives
+/// the probe's early cycles (GC waits out `gc_ticks`); while departed workers were still scheduled
+/// onto, the ideal oscillated around it and the probe exhausted its 200-cycle budget. Shrunk by
+/// the churn walk.
 ///
 /// Parked for the same reason as [`departure_reshuffle_overcommits_a_survivor`]: the oscillation
 /// was the reorder bug, fixed in a separate PR and masked here by the departed-worker filter.
@@ -657,7 +657,7 @@ fn stale_minted_for_a_gc_deleted_worker() {
             ))]),
             Action::WorkerLeft(0),
             // Draining advances the clock past the retention; the departed worker keeps its
-            // ideal pairs (nothing filters it) until the join's sync GC-deletes the row.
+            // ideal pairs (nothing filters it) until a cycle's GC deletes the row.
             Action::CheckConverged(ConvergenceCheck::FloorLocallyFeasible),
             Action::WorkerJoined(8),
             // The reshuffle drops the deleted worker's pair from the ideal — and the mint
@@ -1354,7 +1354,7 @@ fn vacuous_confirmation_must_not_expire_the_last_drain() {
     replay(&config, actions);
 }
 
-/// Postgres twin: the re-promotion is a `update_worker_set` SQL phase — exercise it on the real
+/// Postgres twin: the re-promotion is a scheduling-cycle SQL phase — exercise it on the real
 /// backend, keeping the two storages at parity on the fix.
 #[test]
 fn vacuous_confirmation_must_not_expire_the_last_drain_pg() {

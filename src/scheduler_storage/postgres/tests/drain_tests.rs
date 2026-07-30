@@ -43,7 +43,7 @@ impl DrainFixture {
         insert_and_register_chunk(&mut storage, "ds", 2, 100);
         insert_and_register_chunk(&mut storage, "ds", 3, 100);
         let workers: Vec<Worker> = (1..=5).map(|s| worker(s, None)).collect();
-        storage.update_worker_set(&workers, 0, 1000).unwrap();
+        storage.update_worker_set(&workers, 0).unwrap();
         Self { storage, target }
     }
 

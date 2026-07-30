@@ -30,8 +30,9 @@ two id tables, so a mix-up is caught at code-review time, not by the engine.
 ## Invariants
 
 1. **Single scheduler.** Only one scheduler instance may compute assignments at a time.
-   Concurrent schedulers would corrupt the lifecycle state. Enforced by a Postgres advisory lock
-   acquired at startup (see [mvcc-schema.md](mvcc-schema.md)).
+   Concurrent schedulers would corrupt the lifecycle state. Enforced by a leadership epoch checked
+   inside every write transaction, behind a startup advisory lock (see
+   [mvcc-schema.md](mvcc-schema.md)).
 
 2. **Two-phase publishing.** A chunk reaches portals only after workers confirm holding it, and a
    worker deletes data only after portals have stopped routing to it. This is the guarantee the
@@ -200,8 +201,9 @@ treats "pending" as `applied_at_portal_assignment_id IS NULL`, so completed rows
 
 ### Registration
 
-Corrections are registered out of band by the **backfill/ingestion process**, not by the
-scheduler's cycles. That process submits the replacement chunk together with the old chunk it
+Corrections are registered out of band through the ingestion write path (metadata-service), never
+by the scheduler's cycles; the scheduler only consumes them (the visibility cycle applies ready
+corrections). Registration submits the replacement chunk together with the old chunk it
 supersedes; the replacement (in the old chunk's dataset) and the `chunk_corrections` record are
 committed **atomically**.
 
@@ -345,16 +347,19 @@ When a chunk is removed entirely via the chunk-level mechanism (`dropped_from_wo
 set — gate A), its stale rows and ideal row go too; the whole-chunk removal supersedes any per-pair
 holdover.
 
-**Worker departures** (`update_worker_set`): a departed worker's stale rows are dropped — its
-copies left with it — and its ideal rows wait for the next cycle's diff. One guard runs at the
-same moment. A departure shrinks the confirmation quorum, so the watermark can pass an assignment
-whose sole recipients never applied it — a *vacuous* confirmation that step 4's expiry would then
-act on, deleting the fleet's only fetched copy (Invariant 2 broken at pair granularity). So if a
-chunk's committed-ideal holders are now all departed, its active stale holders are **re-promoted**
-into the committed ideal: the superseded copy becomes a first-class holder again — counted by the
-retention floor, never expiring — before Invariant 4's clock can destroy it. Excess copies shed as
-ordinary drains in later cycles; a rejoining recipient re-downloads via the normal confirmed
-handoff.
+**Worker departures**: `update_worker_set` only *marks* them (`inactive_since` — status columns,
+nothing else), so the status sync runs concurrently with a cycle. The mapping consequences are
+settled in phase A of every scheduling cycle, keyed on that state: a departed worker's stale rows
+are dropped — its copies left with it — and its ideal rows wait for the cycle's diff. One guard
+runs at the same moment. A departure shrinks the confirmation quorum, so the watermark can pass an
+assignment whose sole recipients never applied it — a *vacuous* confirmation that step 4's expiry
+would then act on, deleting the fleet's only fetched copy (Invariant 2 broken at pair
+granularity). So if a chunk's committed-ideal holders are now all departed, its active stale
+holders are **re-promoted** into the committed ideal: the superseded copy becomes a first-class
+holder again — counted by the retention floor, never expiring — structurally before step 4's
+expiry runs in the same phase (the rescue precedes the reaper), so Invariant 4's clock can never
+destroy it first. Excess copies shed as ordinary drains in later cycles; a rejoining recipient
+re-downloads via the normal confirmed handoff.
 
 **Publish** (when building the worker assignment): `sched_ideal_chunk_workers` unioned with the
 **entire** `sched_stale_mappings` table (pending and draining), deduplicated per chunk.

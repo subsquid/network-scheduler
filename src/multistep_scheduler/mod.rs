@@ -34,13 +34,7 @@ use crate::{
 /// Chunk indices assigned to each worker.
 type WorkerChunks = BTreeMap<PeerId, Vec<ChunkIndex>>;
 
-#[derive(Debug, Clone)]
-pub struct SchedulingConfig {
-    pub worker_capacity: u64,
-    pub saturation: f64,
-    pub min_replication: ReplicationFactor,
-    pub ignore_reliability: bool,
-}
+pub use crate::types::SchedulingConfig;
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ScheduledChunk<'a> {

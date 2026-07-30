@@ -1,5 +1,5 @@
 //! Phase helpers for [`PostgresStorage::run_scheduling_cycle`], run inside the
-//! cycle's transaction, plus the post-commit [`build_worker_assignment`] read.
+//! cycle's transaction, plus the post-commit in-memory [`build_worker_assignment`].
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -9,7 +9,6 @@ use futures::TryStreamExt;
 use itertools::Itertools as _;
 use rustc_hash::{FxHashMap, FxHashSet};
 use semver::Version;
-use sqlx::postgres::PgConnection;
 use sqlx::{Postgres, Transaction};
 
 use crate::metrics::{PhaseTimer, Timer};
@@ -299,7 +298,10 @@ pub(super) async fn apply_deltas_and_swap(
 ///   4. Cancel self-resolved removals: a pair the new ideal takes back was never really leaving,
 ///      so its drain (and the clock on it) must not outlive the decision.
 ///   5. Start the lifecycle of newcomers: a chunk's first appearance in an ideal is the anchor
-///      that later gates its portal promotion and schema-bundle membership (ADR 0002).
+///      that later gates its portal promotion and schema-bundle membership (ADR 0002). Chunks
+///      already marked for removal are skipped: promotion is closed to them anyway — their rows
+///      belong to the removal tail (`drop_marked_chunks`, run by the visibility cycle on this
+///      same connection).
 ///   6. Make the new ideal live: swap the staged twin in, leaving the old table empty and ready
 ///      to stage the next cycle.
 const SQL_DELTAS_AND_SWAP: &str = r#"
@@ -339,7 +341,8 @@ UPDATE sched_chunk_metadata m
 SET applied_at_worker_assignment_id = $WA
 FROM sched_future_ideal_chunk_workers f
 WHERE m.chunk_pk = f.chunk_pk
-  AND m.applied_at_worker_assignment_id IS NULL;
+  AND m.applied_at_worker_assignment_id IS NULL
+  AND m.marked_for_removal IS NULL;
 
 TRUNCATE sched_ideal_chunk_workers;
 ALTER TABLE sched_ideal_chunk_workers RENAME TO sched_ideal_chunk_workers__swap;
@@ -458,27 +461,34 @@ pub(super) fn decode_workers(worker_rows: &[WorkerRow]) -> Result<DecodedWorkers
     })
 }
 
+/// Post-delta stale holders: pre-existing rows plus this cycle's mint, minus resolved flip-flops
+/// and phase-A drops — i.e. exactly what the cycle's commit publishes. Read inside the cycle
+/// transaction, which sees its own writes.
+pub(super) async fn fetch_stale_holders(
+    tx: &mut Transaction<'_, Postgres>,
+) -> Result<Vec<(ChunkPk, Vec<WorkerPk>)>> {
+    let mut timer = PhaseTimer::new("run_scheduling_cycle:fetch_stale_holders");
+    let stale: Vec<(ChunkPk, Vec<WorkerPk>)> = sqlx::query_as(
+        "SELECT chunk_pk, array_agg(worker_id) FROM sched_stale_mappings GROUP BY chunk_pk",
+    )
+    .fetch_all(&mut **tx)
+    .await
+    .context("run_scheduling_cycle: fetch stale holders")?;
+    timer.stmt(stale.len() as u64);
+    Ok(stale)
+}
+
 /// Post-commit assembly of the published WorkerAssignment: ideal ∪ stale, excluding tombstoned
 /// chunks.
-pub(super) async fn build_worker_assignment(
-    conn: &mut PgConnection,
+pub(super) fn build_worker_assignment(
     id: AssignmentId,
     workers: BTreeMap<WorkerPk, AssignmentWorker>,
     replication_by_weight: BTreeMap<u16, u16>,
     ideal_mappings: Vec<(ChunkPk, Vec<WorkerPk>)>,
     mut active_chunks: FxHashMap<ChunkPk, WorkerAssignmentChunk>,
-) -> Result<WorkerAssignment> {
-    let mut timer = PhaseTimer::new("run_scheduling_cycle:build_worker_assignment");
-    // Post-delta stale holders: pre-existing rows plus this cycle's mint, minus resolved
-    // flip-flops and phase-A drops — i.e. exactly what the committed table now holds.
-    let stale: Vec<(ChunkPk, Vec<WorkerPk>)> = sqlx::query_as(
-        "SELECT chunk_pk, array_agg(worker_id) FROM sched_stale_mappings GROUP BY chunk_pk",
-    )
-    .fetch_all(&mut *conn)
-    .await
-    .context("build_worker_assignment: fetch stale holders")?;
-    timer.stmt(stale.len() as u64);
-
+    stale: Vec<(ChunkPk, Vec<WorkerPk>)>,
+) -> WorkerAssignment {
+    let _timer = Timer::new("run_scheduling_cycle:build_worker_assignment");
     let mut chunk_workers: BTreeMap<ChunkPk, Vec<WorkerPk>> = ideal_mappings.into_iter().collect();
     for (pk, extra) in stale {
         // Keep holder sets canonical (sorted, distinct), as the SQL merge did.
@@ -500,11 +510,11 @@ pub(super) async fn build_worker_assignment(
         None => false,
     });
 
-    Ok(WorkerAssignment {
+    WorkerAssignment {
         id,
         chunk_workers,
         chunks: chunks_out,
         workers,
         replication_by_weight,
-    })
+    }
 }

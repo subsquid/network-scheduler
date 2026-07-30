@@ -270,3 +270,14 @@ CREATE OR REPLACE TRIGGER chunk_corrections_same_dataset
 CREATE INDEX IF NOT EXISTS chunk_corrections_pending_by_new_chunk
     ON chunk_corrections (new_chunk_pk)
     WHERE applied_at_portal_assignment_id IS NULL;
+
+-- Leadership fencing. `epoch` is the token: a leader bumps it when it connects, and every
+-- scheduler write transaction re-reads it FOR SHARE, so a demoted instance's writes are refused
+-- instead of racing the new leader's. leader_pid is diagnostics only — pids get reused.
+CREATE TABLE IF NOT EXISTS sched_leadership (
+    only_row   BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (only_row),  -- PK + CHECK: at most one row
+    epoch      BIGINT  NOT NULL DEFAULT 0,
+    leader_pid INTEGER
+);
+
+INSERT INTO sched_leadership DEFAULT VALUES ON CONFLICT DO NOTHING;

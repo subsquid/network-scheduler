@@ -18,7 +18,7 @@ use network_scheduler::{
         WorkerAssignment, WorkerAssignmentChunk, WorkerPk,
         algorithm::MultistepAlgorithm,
         discovered_chunk,
-        postgres::PostgresStorage,
+        postgres::{DEFAULT_BATCH_SIZE, DEFAULT_CLAIM_LOCK_TIMEOUT, PostgresStorage},
         test_harness::pg_harness::{self, PgData},
     },
     types::{Chunk, DatasetSchema},
@@ -66,9 +66,10 @@ struct Backend {
 
 fn existing_database(url: &str) -> anyhow::Result<Backend> {
     tracing::info!("Connecting to Postgres at {url}");
-    Ok(Backend {
-        storage: connect_migrated(url)?,
-    })
+    // Its own leader; the sim is the only writer of the database it is pointed at.
+    let (storage, _epoch) =
+        PostgresStorage::connect(url, DEFAULT_CLAIM_LOCK_TIMEOUT, DEFAULT_BATCH_SIZE)?;
+    Ok(Backend { storage })
 }
 
 /// Disk-backed because the mainnet DB overflows the harness tmpfs.
@@ -77,12 +78,6 @@ fn ephemeral_database() -> Backend {
     Backend {
         storage: pg_harness::fresh_db_with(PgData::Disk, "reshuffle_sim", 0),
     }
-}
-
-fn connect_migrated(url: &str) -> anyhow::Result<PostgresStorage> {
-    let mut storage = PostgresStorage::connect(url)?;
-    storage.migrate()?;
-    Ok(storage)
 }
 
 /// What [`MultistepScheduler::build`] does with the baseline data before scheduling.
@@ -169,10 +164,8 @@ impl MultistepScheduler {
             backend,
             algo: MultistepAlgorithm::new(config.datasets.clone()),
             config: MultistepConfig {
-                worker_capacity: config.worker_storage_bytes,
-                saturation: config.saturation,
-                min_replication: config.min_replication,
                 ignore_reliability: true,
+                ..config.scheduling.clone()
             },
             clock: 0,
             ingested_chunks,
@@ -378,9 +371,14 @@ impl StepScheduler for MultistepScheduler {
 
     fn step(&mut self, ctx: StepContext) -> anyhow::Result<StepOutcome> {
         self.algo.set_weight_strategy(ctx.datasets_config.clone());
+        // Like the one-shot controller path: status update, then GC (rows stamped inactive at an
+        // earlier clock are collected; this step's departures survive until the next step).
         self.backend
             .storage
-            .update_worker_set(ctx.workers, self.clock, GC_TICKS)?;
+            .update_worker_set(ctx.workers, self.clock)?;
+        self.backend
+            .storage
+            .gc_inactive_workers(self.clock, GC_TICKS)?;
 
         self.current_step += 1;
 
@@ -501,9 +499,7 @@ fn seed_baseline(
             .map(|name| NewDataset::with_name(name.clone(), name, DatasetSchema::default()))
             .collect(),
     )?;
-    backend
-        .storage
-        .update_worker_set(&baseline.workers, 0, GC_TICKS)?;
+    backend.storage.update_worker_set(&baseline.workers, 0)?;
     tracing::info!(
         "Seeded {dataset_count} datasets and {} workers",
         baseline.workers.len()

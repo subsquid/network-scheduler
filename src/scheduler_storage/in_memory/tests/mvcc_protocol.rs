@@ -306,9 +306,7 @@ fn setup(num_workers: usize, num_chunks: usize) -> Setup {
     let workers_to_register: Vec<Worker> = (0..num_workers)
         .map(|i| worker((i + 1) as u8, None))
         .collect();
-    storage
-        .update_worker_set(&workers_to_register, 0, 1000)
-        .unwrap();
+    storage.update_worker_set(&workers_to_register, 0).unwrap();
     let worker_ids: Vec<WorkerPk> = workers(&storage)
         .iter()
         .map(|view| view.worker_id)
@@ -369,9 +367,7 @@ fn schema_bundle_holds_only_in_play_schemas() {
         .insert_new_chunks(vec![a.clone(), b.clone()])
         .unwrap();
     let a_pk = storage.pk_of(&a);
-    storage
-        .update_worker_set(&[worker(1, None)], 0, 1000)
-        .unwrap();
+    storage.update_worker_set(&[worker(1, None)], 0).unwrap();
     let w1 = workers(&storage)[0].worker_id;
 
     // Place only "a"; "b" stays unplaced (in no worker or portal assignment).
@@ -406,9 +402,7 @@ fn bundle_read_section_tracks_the_current_read_schema() {
     let a = chunk("a", 1, 100);
     storage.insert_new_chunks(vec![a.clone()]).unwrap();
     let a_pk = storage.pk_of(&a);
-    storage
-        .update_worker_set(&[worker(1, None)], 0, 1000)
-        .unwrap();
+    storage.update_worker_set(&[worker(1, None)], 0).unwrap();
     let w1 = workers(&storage)[0].worker_id;
     run_cycle(&mut storage, &a_pk, vec![w1], CYCLE_INTERVAL);
 
@@ -566,9 +560,7 @@ fn schema_bundle_covers_holderless_portal_visible_chunk() {
         .unwrap();
 
     // Depart the sole holder: its copy vanishes (not drained), no stale row survives.
-    storage
-        .update_worker_set(&[], 2 * CYCLE_INTERVAL, 1000)
-        .unwrap();
+    storage.update_worker_set(&[], 2 * CYCLE_INTERVAL).unwrap();
 
     // Next cycle places nothing (no active workers) -> chunk is holderless (ideal={}, stale={}),
     // still portal_visible. The bundle must still carry its schema.

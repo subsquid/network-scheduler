@@ -31,14 +31,15 @@ work. **This page is the single source of truth for what is actually built and w
 6. **[assignment-wire-format.md](assignment-wire-format.md)** — what the split worker/portal
    assignments should actually carry on the wire, traced against real consumers in worker-rs and
    sqd-portal.
-7. **[metadata-service.md](metadata-service.md)** — the ingestion write path: a shared crate owning
-   the ingest SQL, and an HTTP service in front of it, so ~300 ingesters don't each talk to
-   Postgres directly.
+7. **[metadata-service-api.md](metadata-service-api.md)** — the ingestion write path: a shared
+   crate owning the ingest SQL, and an HTTP service in front of it, so ~300 ingesters don't each
+   talk to Postgres directly.
 
 ## Status & limitations
 
 **The whole subsystem is a work in progress: gated behind the `mvcc-chunks` cargo feature, driven
-only by the simulation harness and tests, and *not* wired into the production `controller.rs`.**
+by the simulation harness, tests, and a compute-and-log service skeleton (`RunMode::Service`) —
+*not* wired into the production `controller.rs`.**
 Production still runs the legacy scheduler in `src/scheduling.rs` (analysed in
 [chunk-reshuffling.md](chunk-reshuffling.md)).
 
@@ -54,14 +55,14 @@ built.
 | Chunk corrections (1-to-1 same-range swaps) | ✅ | Both backends; property-tested. |
 | Deferred removal / stale mappings (`ideal ∪ stale`) | ✅ | Both backends. |
 | Capacity-aware placement (footprint charge, credit-held-free, bounded-load spill, essentials-first) | ✅ | `Reconcile` in `multistep_scheduler/mod.rs`. |
-| X% promotion threshold (quorum) | 🧪 | Computed by the sim's worker fleet; the storage core only consumes a precomputed confirmation watermark. No production quorum logic. |
+| X% promotion threshold (quorum) | ✅ | Production quorum in the service's worker-status task: watermark = highest assignment id echoed (`last_applied_assignment_id` ping column, collector's `mvcc-chunks` build) by ≥X% of online workers, `--confirmation-quorum-pct` (default 90; 0 = confirm latest unconditionally). End-to-end inert until assignments are published — workers can't echo ids they never received. The storage core still just consumes the computed watermark. |
 | Replica-sufficiency **drain gate** (capacity-aware "rule 2") | 📐 | Drains expire on the M-tick timer only. |
 | Replica-sufficiency **promotion gate** (capacity-aware "rule 3") | 📐 | Promotion is gated on assignment confirmation, not on a confirmed-copy count. |
 | Production wiring (`controller.rs`) | 📐 | Subsystem is sim-only behind `mvcc-chunks`. |
 | Worker/portal assignment content divergence | 📐 | Both wire formats still encode the identical legacy blob. See [assignment-wire-format.md](assignment-wire-format.md). |
 | Backpressure / under-replication observability counters | 📐 | `NotEnoughCapacity` error exists; the per-cycle metrics surface does not. |
 | Non-overlap enforcement (no overlapping chunk ranges per dataset) | ✅ | Registration-time rejection + promotion backstop, both backends. See [nonoverlap-promotion-gate.md](nonoverlap-promotion-gate.md). |
-| Ingestion write path (shared crate + metadata service) | 📐 | The storage's ingestion entry points have no production caller. See [metadata-service.md](metadata-service.md). |
+| Ingestion write path (shared crate + metadata service) | ✅ | `crates/metadata-service`, integration-tested; not yet deployed. Admission stays scheduler-side (`register_new_chunks`); the scheduler-side corrections half has no service caller. See [metadata-service-api.md](metadata-service-api.md). |
 
 ### Known limitations and open questions
 
