@@ -215,15 +215,18 @@ pub trait SchedulerStorage {
         schema: DatasetSchema,
     ) -> Result<(), StorageError>;
 
-    /// Decode schemas for assignment construction: all of them, or those in `schema_ids`.
-    /// Missing ids are omitted.
+    /// Test-only passthrough to the metadata crate's loader; missing ids are omitted (the
+    /// characterization the schema tests pin).
+    #[cfg(test)]
     fn load_schemas(
         &self,
         schema_ids: Option<&[SchemaId]>,
     ) -> Result<BTreeMap<SchemaId, DatasetSchema>, StorageError>;
 
-    /// Make `schema` the dataset's current read schema, returning its content-deduped id. Tests and
-    /// the simulation only — in production the metadata service is the registry's ONE writer.
+    /// Make `schema` the dataset's current read schema, returning its content-deduped id. Test-only
+    /// by construction: in production the metadata service is the read registry's ONE writer, and
+    /// the read path's concurrency argument rests on that.
+    #[cfg(test)]
     fn promote_read_schema(
         &mut self,
         dataset: &str,

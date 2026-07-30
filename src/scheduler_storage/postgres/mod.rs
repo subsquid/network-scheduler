@@ -260,6 +260,7 @@ impl SchedulerStorage for PostgresStorage {
         })
     }
 
+    #[cfg(test)]
     fn load_schemas(
         &self,
         schema_ids: Option<&[crate::scheduler_storage::SchemaId]>,
@@ -277,6 +278,7 @@ impl SchedulerStorage for PostgresStorage {
         })
     }
 
+    #[cfg(test)]
     fn promote_read_schema(
         &mut self,
         dataset: &str,
