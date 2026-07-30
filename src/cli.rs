@@ -54,6 +54,10 @@ pub struct Args {
     #[arg(
         long,
         env = "DATABASE_URL",
+        // Clap renders `[env: DATABASE_URL=<value>]` otherwise, printing the password in the
+        // connection string to anyone who runs `--help` on a configured deployment. `Secret` only
+        // covers `Debug`; clap reads the variable itself.
+        hide_env_values = true,
         required_if_eq_any([("multistep_scheduler", "true"), ("mode", "service")])
     )]
     pub database_url: Option<Secret>,
@@ -158,7 +162,8 @@ pub struct ClickhouseArgs {
     pub clickhouse_database: Option<String>,
     #[arg(long, env, required_if_eq_any([("mode", "prod"), ("mode", "service")]))]
     pub clickhouse_user: Option<String>,
-    #[arg(long, env, required_if_eq_any([("mode", "prod"), ("mode", "service")]))]
+    // `hide_env_values`: see `Args::database_url` — `--help` would otherwise print the password.
+    #[arg(long, env, hide_env_values = true, required_if_eq_any([("mode", "prod"), ("mode", "service")]))]
     pub clickhouse_password: Option<Secret>,
 }
 
@@ -356,6 +361,28 @@ impl From<String> for Secret {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every secret-bearing arg must suppress clap's `[env: VAR=value]` rendering, or `--help` on a
+    /// configured deployment prints the credential. Asserted on the arg definition rather than by
+    /// setting the variable, which would race other tests in the same process.
+    #[test]
+    fn secret_args_hide_their_env_values() {
+        use clap::CommandFactory as _;
+
+        let command = Args::command();
+        let secrets = ["database_url", "clickhouse_password"];
+        for name in secrets {
+            let arg = command
+                .get_arguments()
+                .find(|arg| arg.get_id() == name)
+                .unwrap_or_else(|| panic!("no `{name}` arg — was it renamed?"));
+            assert!(
+                arg.is_hide_env_values_set(),
+                "`--{}` would print its env value in --help",
+                name.replace('_', "-")
+            );
+        }
+    }
 
     /// Pins the deployed config-file schema: the scheduling knobs are flattened top-level keys,
     /// and `worker_storage_bytes` maps onto `SchedulingConfig::worker_capacity`.
