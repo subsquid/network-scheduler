@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/scheduler-metadata", "crates/metadata-service", "crates/pg-testkit", "tools/compare_fb", "tools/clear_block_hash", "tools/reshuffle_sim"]
+members = ["crates/scheduler-metadata", "crates/metadata-service", "crates/pg-testkit", "tools/compare_fb", "tools/reshuffle_sim"]
 
 [workspace.dependencies]
 bit-vec = "0.8"

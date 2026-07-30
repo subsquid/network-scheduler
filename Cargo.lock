@@ -1192,18 +1192,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 
 [[package]]
-name = "clear-block-hash"
-version = "0.0.1"
-dependencies = [
- "anyhow",
- "clap",
- "flate2",
- "libp2p-identity",
- "network-scheduler",
- "sqd-assignments 0.1.0 (git+https://github.com/subsquid/sqd-network.git?rev=fa19681)",
-]
-
-[[package]]
 name = "clickhouse"
 version = "0.13.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
