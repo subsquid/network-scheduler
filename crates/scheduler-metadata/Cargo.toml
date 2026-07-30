@@ -21,4 +21,4 @@ tracing = "0.1.41"
 
 [features]
 openapi = ["dep:utoipa"]
-explain = []
+auto_explain = []

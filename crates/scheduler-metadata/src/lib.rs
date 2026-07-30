@@ -1,11 +1,11 @@
 //! Shared metadata layer for the MVCC scheduler storage, re-exported by the
 //! `network-scheduler` root crate to keep its `scheduler_storage`/`types` surface stable.
 
+/// `auto_explain` support, off unless a dependant asks for it.
+#[cfg(feature = "auto_explain")]
+pub mod auto_explain;
 pub mod dataset_schema;
 pub mod error;
-/// `SIM_SQL_EXPLAIN` plumbing, off unless a dependant asks for it.
-#[cfg(feature = "explain")]
-pub mod explain;
 pub mod ids;
 pub mod ingest_api;
 pub mod metrics;

@@ -94,7 +94,7 @@ pub(super) async fn overlapping_live(
         ) hit
         "#
     );
-    let rows = super::debug::with_explain(conn, async |c| {
+    let rows = super::auto_explain::with_explain(conn, async |c| {
         sqlx::query(sqlx::AssertSqlSafe(sql))
             .bind(&pks)
             .bind(&datasets)

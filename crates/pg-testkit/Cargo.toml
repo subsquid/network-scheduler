@@ -7,7 +7,7 @@ edition = "2024"
 name = "pg_testkit"
 
 [dependencies]
-scheduler-metadata = { path = "../scheduler-metadata", features = ["explain"] }
+scheduler-metadata = { path = "../scheduler-metadata", features = ["auto_explain"] }
 anyhow = "1.0.98"
 dtor = "1.0.5"
 sqlx = { workspace = true }

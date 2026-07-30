@@ -18,7 +18,7 @@ use testcontainers_modules::testcontainers::core::Mount;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use testcontainers_modules::testcontainers::{ContainerAsync, ImageExt};
 
-use scheduler_metadata::explain;
+use scheduler_metadata::auto_explain;
 
 /// Run `f` on a thread inside no runtime, and block until it finishes.
 ///
@@ -52,9 +52,9 @@ fn reap_container_at_exit() {
     let Some(shared) = SHARED.get() else { return };
     let container = shared.container.lock().ok().and_then(|mut g| g.take());
     if let Some(container) = container {
-        if explain::enabled() {
+        if auto_explain::enabled() {
             // Leave it up so its log survives; `mem::forget` skips the `Drop` reaping.
-            eprintln!("{}", explain::left_running_notice(container.id()));
+            eprintln!("{}", auto_explain::left_running_notice(container.id()));
             std::mem::forget(container);
             return;
         }
@@ -107,8 +107,8 @@ fn build_shared(pgdata: PgData) -> Shared {
         .iter()
         .map(|s| s.to_string())
         .collect();
-        if explain::enabled() {
-            for &setting in explain::SESSION_SETTINGS {
+        if auto_explain::enabled() {
+            for &setting in auto_explain::SESSION_SETTINGS {
                 cmd.push("-c".to_string());
                 cmd.push(setting.to_string());
             }
@@ -192,7 +192,7 @@ pub struct CaseDb {
 impl Drop for CaseDb {
     fn drop(&mut self) {
         // Keep the data whenever the container is kept.
-        if explain::enabled() {
+        if auto_explain::enabled() {
             return;
         }
         let Some(shared) = SHARED.get() else { return };

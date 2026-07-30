@@ -8,9 +8,8 @@
 //! `m_ticks`/`gc_ticks` are raw tick counts used in integer arithmetic.
 
 mod admission;
+mod auto_explain;
 mod debug;
-#[cfg(feature = "explain")]
-pub use scheduler_metadata::explain;
 mod nonoverlap;
 mod rows;
 mod scheduling_cycle;
