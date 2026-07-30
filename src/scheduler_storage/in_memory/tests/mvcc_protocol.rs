@@ -37,7 +37,7 @@ fn chunk_migration_through_grace_period() {
     let cycle_1 = StaticSchedulingAlgorithm {
         mapping: ideal_mapping([(chunk_pk, vec![w1])]),
     };
-    let (worker_assignment_1, _) = storage
+    let worker_assignment_1 = storage
         .run_scheduling_cycle(&cycle_1, &(), cycle_1_at, GRACE_PERIOD)
         .expect("scheduling succeeds");
 
@@ -62,7 +62,7 @@ fn chunk_migration_through_grace_period() {
     let cycle_2 = StaticSchedulingAlgorithm {
         mapping: ideal_mapping([(chunk_pk, vec![w2])]),
     };
-    let (worker_assignment_2, _) = storage
+    let worker_assignment_2 = storage
         .run_scheduling_cycle(&cycle_2, &(), cycle_2_at, GRACE_PERIOD)
         .expect("scheduling succeeds");
     assert_eq!(
@@ -93,7 +93,7 @@ fn chunk_migration_through_grace_period() {
     let cycle_3 = StaticSchedulingAlgorithm {
         mapping: ideal_mapping([(chunk_pk, vec![w2])]),
     };
-    let (worker_assignment_3, _) = storage
+    let worker_assignment_3 = storage
         .run_scheduling_cycle(&cycle_3, &(), cycle_3_at, GRACE_PERIOD)
         .expect("scheduling succeeds");
     assert_eq!(
@@ -124,7 +124,7 @@ fn chunk_migration_through_grace_period() {
     let cycle_4 = StaticSchedulingAlgorithm {
         mapping: ideal_mapping([(chunk_pk, vec![w2])]),
     };
-    let (worker_assignment_4, _) = storage
+    let worker_assignment_4 = storage
         .run_scheduling_cycle(&cycle_4, &(), cycle_4_at, GRACE_PERIOD)
         .expect("scheduling succeeds");
     assert_eq!(
@@ -333,7 +333,6 @@ fn run_cycle(
     storage
         .run_scheduling_cycle(&algorithm, &(), at, GRACE_PERIOD)
         .expect("scheduling succeeds")
-        .0
 }
 
 fn ideal_mapping<'a>(
@@ -346,7 +345,7 @@ fn ideal_mapping<'a>(
 /// chunk's schema is included, an unplaced chunk's is not, and the id is content-addressed over it.
 #[test]
 fn schema_bundle_holds_only_in_play_schemas() {
-    use crate::scheduler_storage::{BundleId, SchemaBundle};
+    use crate::scheduler_storage::BundleId;
     use crate::types::{DatasetSchema, TableSchema};
 
     let one_table =
@@ -379,7 +378,7 @@ fn schema_bundle_holds_only_in_play_schemas() {
     let wa = run_cycle(&mut storage, &a_pk, vec![w1], CYCLE_INTERVAL);
     let a_schema = wa.chunks.get(&a_pk).unwrap().schema_id;
 
-    let bundle = SchemaBundle::generate(&storage).unwrap();
+    let bundle = storage.generate_schema_bundle().unwrap();
     assert_eq!(bundle.schemas(), &BTreeMap::from([(a_schema, schema_a)]));
     // No read schema promoted, so the read section is empty.
     assert_eq!(bundle.id(), BundleId::from_sections([a_schema], []));
@@ -392,7 +391,7 @@ fn schema_bundle_holds_only_in_play_schemas() {
         .run_visibility_cycle(CYCLE_INTERVAL + DELTA)
         .unwrap();
     assert!(portal.chunk_workers.contains_key(&a_pk));
-    assert_eq!(SchemaBundle::generate(&storage).unwrap().id(), bundle.id());
+    assert_eq!(storage.generate_schema_bundle().unwrap().id(), bundle.id());
 }
 
 /// In-memory twin of Postgres' `schema_bundle_carries_the_current_read_schema`, plus two things it
@@ -413,7 +412,7 @@ fn bundle_read_section_tracks_the_current_read_schema() {
     let w1 = workers(&storage)[0].worker_id;
     run_cycle(&mut storage, &a_pk, vec![w1], CYCLE_INTERVAL);
 
-    let before = SchemaBundle::generate(&storage).unwrap();
+    let before = storage.generate_schema_bundle().unwrap();
     assert!(before.read_schemas().is_empty(), "nothing promoted yet");
 
     // "b" has no placed chunk, so its read schema must not enter the bundle.
@@ -423,7 +422,7 @@ fn bundle_read_section_tracks_the_current_read_schema() {
     let r1 = storage
         .promote_read_schema(&dataset("a"), schema_with_tables(&["blocks"]))
         .unwrap();
-    let one = SchemaBundle::generate(&storage).unwrap();
+    let one = storage.generate_schema_bundle().unwrap();
     assert_eq!(
         one.read_schemas().keys().copied().collect::<Vec<_>>(),
         vec![r1],
@@ -441,7 +440,7 @@ fn bundle_read_section_tracks_the_current_read_schema() {
         .promote_read_schema(&dataset("a"), schema_with_tables(&["blocks", "logs"]))
         .unwrap();
     assert_ne!(r1, r2);
-    let two = SchemaBundle::generate(&storage).unwrap();
+    let two = storage.generate_schema_bundle().unwrap();
     assert_eq!(
         two.read_schemas().keys().copied().collect::<Vec<_>>(),
         vec![r2],
@@ -455,7 +454,7 @@ fn bundle_read_section_tracks_the_current_read_schema() {
         "re-promoting superseded content revives its original id, never mints a new one",
     );
     assert_eq!(
-        SchemaBundle::generate(&storage).unwrap().id(),
+        storage.generate_schema_bundle().unwrap().id(),
         one.id(),
         "so the fingerprint returns to exactly what it was under that schema",
     );
@@ -466,8 +465,6 @@ fn bundle_read_section_tracks_the_current_read_schema() {
 /// leaves when it tombstones. This is what lets `schema_bundle_consistency` drop its exclusion.
 #[test]
 fn schema_bundle_retains_removing_chunk_until_tombstone() {
-    use crate::scheduler_storage::SchemaBundle;
-
     let Setup {
         mut storage,
         worker_ids,
@@ -477,7 +474,7 @@ fn schema_bundle_retains_removing_chunk_until_tombstone() {
     let w1 = worker_ids[0];
 
     // Place, confirm, promote to the portal.
-    let (wa, _) = storage
+    let wa = storage
         .run_scheduling_cycle(
             &StaticSchedulingAlgorithm {
                 mapping: ideal_mapping([(chunk_pk, vec![w1])]),
@@ -495,7 +492,8 @@ fn schema_bundle_retains_removing_chunk_until_tombstone() {
         .run_visibility_cycle(CYCLE_INTERVAL + DELTA)
         .unwrap();
     assert!(
-        SchemaBundle::generate(&storage)
+        storage
+            .generate_schema_bundle()
             .unwrap()
             .contains(schema_id),
         "placed and promoted: schema is in the bundle",
@@ -510,7 +508,8 @@ fn schema_bundle_retains_removing_chunk_until_tombstone() {
         "removing: dropped from the portal",
     );
     assert!(
-        SchemaBundle::generate(&storage)
+        storage
+            .generate_schema_bundle()
             .unwrap()
             .contains(schema_id),
         "removing but pre-tombstone: worker still serves it, so its schema stays in the bundle",
@@ -518,7 +517,7 @@ fn schema_bundle_retains_removing_chunk_until_tombstone() {
 
     // Past M ticks after the portal drop, a scheduling cycle tombstones it — the schema retires,
     // and the bundle returned from that cycle no longer carries it.
-    let (_wa2, bundle) = storage
+    storage
         .run_scheduling_cycle(
             &StaticSchedulingAlgorithm {
                 mapping: ideal_mapping([]),
@@ -528,6 +527,7 @@ fn schema_bundle_retains_removing_chunk_until_tombstone() {
             GRACE_PERIOD,
         )
         .expect("scheduling succeeds");
+    let bundle = storage.generate_schema_bundle().unwrap();
     assert!(
         !bundle.contains(schema_id),
         "tombstoned: schema leaves the bundle",
@@ -547,7 +547,7 @@ fn schema_bundle_covers_holderless_portal_visible_chunk() {
     let w1 = worker_ids[0];
 
     // Place, confirm, promote to the portal -> portal_visible, one holder (w1).
-    let (wa, _) = storage
+    let wa = storage
         .run_scheduling_cycle(
             &StaticSchedulingAlgorithm {
                 mapping: ideal_mapping([(chunk_pk, vec![w1])]),
@@ -572,7 +572,7 @@ fn schema_bundle_covers_holderless_portal_visible_chunk() {
 
     // Next cycle places nothing (no active workers) -> chunk is holderless (ideal={}, stale={}),
     // still portal_visible. The frozen bundle must still carry its schema.
-    let (wa2, bundle) = storage
+    let wa2 = storage
         .run_scheduling_cycle(
             &StaticSchedulingAlgorithm {
                 mapping: ideal_mapping([]),
@@ -582,6 +582,7 @@ fn schema_bundle_covers_holderless_portal_visible_chunk() {
             GRACE_PERIOD,
         )
         .expect("scheduling succeeds");
+    let bundle = storage.generate_schema_bundle().unwrap();
     assert!(
         !wa2.chunks.contains_key(chunk_pk),
         "chunk is holderless: out of ideal ∪ stale",

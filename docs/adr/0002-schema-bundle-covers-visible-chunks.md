@@ -52,9 +52,11 @@ chunk that any narrower snapshot misses:
   placement. A chunk that a *later* assignment dropped can still be promoted off that earlier entry
   and keep serving its draining copies for M ticks — so the portal names it while the current
   assignment no longer lists it.
-- **The snapshot goes stale under shortage.** The bundle is frozen during scheduling, one step
-  before promotion; a sustained shortage keeps it frozen, so a per-cycle snapshot would never catch
-  up. A lifetime window holds no matter how long the freeze lasts or how far the watermark stalls.
+- **The snapshot goes stale under shortage.** (Since superseded in part: the bundle now regenerates
+  every round from committed rows, with the last successful assignment's schema set persisted in
+  `sched_worker_assignment_schemas` — so a shortage freezes the assignment but not the bundle. The
+  lifetime window remains the write section's base for the reason above.) A lifetime window holds no
+  matter how long a shortage lasts or how far the watermark stalls.
 
 The effect: **resolvability follows the routable lifetime, not the current holders.** How many
 copies exist (availability) and whether the file set can be derived (resolvability) are decoupled —

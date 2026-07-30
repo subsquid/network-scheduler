@@ -133,6 +133,16 @@ CREATE TABLE IF NOT EXISTS sched_chunk_metadata (
     dropped_from_worker_assignment_at BIGINT
 );
 
+-- Write-schema ids covered by the bundle of the last SUCCESSFUL scheduling cycle, written in the
+-- same transaction that commits the assignment (a shortage rolls back before the write, freezing
+-- the set with the assignment it describes). Read by generate_schema_bundle so a bundle built
+-- during a shortage still covers everything the frozen published assignment names. A few hundred
+-- rows, replaced wholesale each success — never derived from the placement tables. The FK also
+-- blocks a future hard-delete of a schema row the published assignment still references.
+CREATE TABLE IF NOT EXISTS sched_worker_assignment_schemas (
+    schema_id INTEGER PRIMARY KEY REFERENCES schemas(id)
+);
+
 -- What the scheduler currently wants; published worker assignment = this ∪ sched_stale_mappings.
 -- No chunks FK, same as the twin below: the cycle re-stages the whole ideal via COPY, and an FK
 -- would cost a per-row check on every staged row. Integrity comes from sched_worker_assignment_diffs

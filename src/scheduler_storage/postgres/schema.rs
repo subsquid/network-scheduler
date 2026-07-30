@@ -6,38 +6,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use anyhow::{Context, Result};
 use sqlx::postgres::PgConnection;
 
-use crate::scheduler_storage::{ReadSchemaId, SchemaBundle, SchemaId, WorkerAssignment};
-use crate::types::{DatasetId, DatasetSchema};
+use sqlx::Connection;
 
-/// Schemas of chunks placed on a worker at some point and not yet tombstoned. Portal-served chunks
-/// are already covered: portal promotion requires prior worker placement, and tombstoning requires
-/// a prior portal drop. The outer `EXISTS` is a semi-join: for each schema it walks the
-/// `chunks_schema_id` index and probes `sched_chunk_metadata` by PK, stopping at the first live
-/// chunk. Cheap when a schema has any live chunk; a fully-drained schema costs a full scan of its
-/// chunks to prove the negative.
-///
-/// Approximate on purpose: a chunk that already drained off every worker still counts until
-/// `dropped_from_worker_assignment_at` is stamped, which only ever widens the bundle, never
-/// narrows it.
-pub(super) async fn active_schema_bundle(
-    conn: &mut PgConnection,
-) -> Result<BTreeMap<SchemaId, DatasetSchema>> {
-    let mut timer = crate::metrics::PhaseTimer::new("active_schema_bundle");
-    let rows: Vec<(SchemaId, sqlx::types::Json<DatasetSchema>)> = sqlx::query_as(
-        "SELECT s.id, s.schema FROM schemas s WHERE EXISTS ( \
-             SELECT 1 FROM chunks c \
-             JOIN sched_chunk_metadata m ON m.chunk_pk = c.chunk_pk \
-             WHERE c.schema_id = s.id \
-               AND m.applied_at_worker_assignment_id IS NOT NULL \
-               AND m.dropped_from_worker_assignment_at IS NULL \
-         )",
-    )
-    .fetch_all(conn)
-    .await
-    .context("active_schema_bundle")?;
-    timer.stmt(rows.len() as u64);
-    Ok(rows.into_iter().map(|(id, json)| (id, json.0)).collect())
-}
+use crate::scheduler_storage::{ReadSchemaId, SchemaBundle, SchemaId};
+use crate::types::DatasetSchema;
 
 /// Each named dataset's current read-schema id, for the portal assignment to publish.
 ///
@@ -107,66 +79,65 @@ pub(super) async fn read_schemas_by_id(
     Ok(rows.into_iter().map(|(id, json)| (id, json.0)).collect())
 }
 
-/// [`read_schemas_by_id`] over the whole routable window, for callers without one already —
-/// the trait method, used by tests. The cycle uses the keyed form; both must select the same window.
+/// The generator: one bundle from committed rows alone, identical under success, shortage, and on
+/// a fresh process. Write section: the routable window (ADR 0002) ∪ the persisted set of the last
+/// successful assignment — the window alone can shrink below what the frozen published assignment
+/// still names, since Phase A keeps tombstoning during a shortage. Read section: the CURRENT read
+/// schema of every dataset either side references, so a promote always reaches the next bundle.
 ///
-/// Enumerating forward reads better than a per-dataset negative but measured no cheaper (~358 vs
-/// ~350 buffers on 50K tombstoned rows): no index matches the routable predicate, so either shape
-/// seq-scans `sched_chunk_metadata`. Acceptable only because no production path calls this — the
-/// cycle reads 2 buffers. The same missing index is why `fetch_portal_visible_chunks` scans that
-/// table every visibility cycle.
-pub(super) async fn active_read_schemas(
-    conn: &mut PgConnection,
-) -> Result<BTreeMap<ReadSchemaId, DatasetSchema>> {
-    let mut timer = crate::metrics::PhaseTimer::new("active_read_schemas");
-    let rows: Vec<(ReadSchemaId, sqlx::types::Json<DatasetSchema>)> = sqlx::query_as(
-        "SELECT DISTINCT r.id, r.schema \
-         FROM sched_chunk_metadata m \
-         JOIN chunks c ON c.chunk_pk = m.chunk_pk \
-         JOIN read_schemas r ON r.dataset_id = c.dataset_id AND r.superseded_at IS NULL \
-         WHERE m.applied_at_worker_assignment_id IS NOT NULL \
-           AND m.dropped_from_worker_assignment_at IS NULL",
+/// One `REPEATABLE READ, READ ONLY` transaction: both sections and the persisted set are read from
+/// a single snapshot, so a cycle or promote landing concurrently (the WIP service branch runs this
+/// from a different loop than the scheduler's) cannot skew them against each other.
+///
+/// Loads are strict: a window or persisted id whose `schemas` row is missing is an error, not an
+/// omission — under the soft-then-hard-delete policy a silent shrink here would republish a bundle
+/// that quietly dropped a schema consumers still resolve.
+pub(super) async fn generate_bundle(conn: &mut PgConnection) -> Result<SchemaBundle> {
+    let _timer = crate::metrics::Timer::new("generate_schema_bundle");
+    let mut tx = conn.begin().await.context("generate_bundle: begin")?;
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+        .execute(&mut *tx)
+        .await
+        .context("generate_bundle: set isolation")?;
+
+    // Window: distinct (schema id, dataset name) over chunks that entered a worker assignment and
+    // are not yet tombstoned.
+    let window: Vec<(SchemaId, String)> = sqlx::query_as(
+        "SELECT DISTINCT c.schema_id, d.name          FROM sched_chunk_metadata m          JOIN chunks c ON c.chunk_pk = m.chunk_pk          JOIN datasets d ON d.id = c.dataset_id          WHERE m.applied_at_worker_assignment_id IS NOT NULL            AND m.dropped_from_worker_assignment_at IS NULL",
     )
-    .fetch_all(conn)
+    .fetch_all(&mut *tx)
     .await
-    .context("active_read_schemas")?;
-    timer.stmt(rows.len() as u64);
-    Ok(rows.into_iter().map(|(id, json)| (id, json.0)).collect())
-}
+    .context("generate_bundle: window")?;
 
-/// The bundle to freeze with `assignment`: write schemas for every chunk in its routable window, and
-/// the current read schema of every dataset there.
-///
-/// `scanned_*` are what the cycle's own chunk scan saw. Both are unioned with the assignment's own
-/// chunks, because the scan runs before `apply_deltas_and_swap` stamps
-/// `applied_at_worker_assignment_id` — a chunk placed for the first time this cycle is named by the
-/// assignment while its row still reads as never-entered.
-///
-/// The window is deliberately wider than "currently held": a chunk the latest assignment dropped can
-/// still be routed off an earlier confirmed entry, so its schema must stay resolvable (ADR 0002).
-/// Only content loads hit the DB here, and content is immutable per id, so reading it after the
-/// cycle's commit is safe under concurrent writers.
-pub(super) async fn build_bundle(
-    conn: &mut PgConnection,
-    assignment: &WorkerAssignment,
-    scanned_schema_ids: BTreeSet<SchemaId>,
-    scanned_datasets: &BTreeSet<DatasetId>,
-) -> Result<SchemaBundle> {
-    let mut schema_ids = scanned_schema_ids;
-    schema_ids.extend(assignment.schema_ids());
+    // Persisted set of the last successful assignment; datasets via the schema's own dataset (the
+    // `chunks_schema_same_dataset` FK makes that exactly the chunk's dataset).
+    let persisted: Vec<(SchemaId, String)> = sqlx::query_as(
+        "SELECT w.schema_id, d.name          FROM sched_worker_assignment_schemas w          JOIN schemas s ON s.id = w.schema_id          JOIN datasets d ON d.id = s.dataset_id",
+    )
+    .fetch_all(&mut *tx)
+    .await
+    .context("generate_bundle: persisted set")?;
+
+    let mut schema_ids: BTreeSet<SchemaId> = BTreeSet::new();
+    let mut datasets: BTreeSet<String> = BTreeSet::new();
+    for (id, dataset) in window.into_iter().chain(persisted) {
+        schema_ids.insert(id);
+        datasets.insert(dataset);
+    }
     let schema_ids: Vec<SchemaId> = schema_ids.into_iter().collect();
+    let dataset_refs: Vec<&str> = datasets.iter().map(String::as_str).collect();
 
-    let mut datasets: BTreeSet<&str> = scanned_datasets.iter().map(|d| d.as_str()).collect();
-    datasets.extend(
-        assignment
-            .chunks
-            .values()
-            .map(|chunk| chunk.dataset.as_str()),
-    );
-    let datasets: Vec<&str> = datasets.into_iter().collect();
+    let schemas = scheduler_metadata::pg::schema::load_schemas(&mut tx, Some(&schema_ids)).await?;
+    let missing: Vec<SchemaId> = schema_ids
+        .iter()
+        .filter(|id| !schemas.contains_key(id))
+        .copied()
+        .collect();
+    if !missing.is_empty() {
+        anyhow::bail!("generate_bundle: schemas table is missing referenced ids {missing:?}");
+    }
+    let read_schemas = read_schemas_by_id(&mut tx, &dataset_refs).await?;
 
-    Ok(SchemaBundle::from_sections(
-        scheduler_metadata::pg::schema::load_schemas(conn, Some(&schema_ids)).await?,
-        read_schemas_by_id(conn, &datasets).await?,
-    ))
+    tx.commit().await.context("generate_bundle: commit")?;
+    Ok(SchemaBundle::from_sections(schemas, read_schemas))
 }

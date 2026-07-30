@@ -10,8 +10,6 @@ use std::collections::BTreeMap;
 use sha2::{Digest, Sha256};
 
 use super::{ReadSchemaId, SchemaId, WorkerAssignmentChunk};
-#[cfg(test)]
-use super::{SchedulerStorage, StorageError};
 use crate::types::DatasetSchema;
 
 /// Pins the encoding: a future format change becomes a different id, not a silent collision.
@@ -104,15 +102,6 @@ impl SchemaBundle {
             schemas,
             read_schemas,
         }
-    }
-
-    /// For tests; production takes the bundle from `run_scheduling_cycle`.
-    #[cfg(test)]
-    pub(crate) fn generate(storage: &impl SchedulerStorage) -> Result<Self, StorageError> {
-        Ok(Self::from_sections(
-            storage.active_schema_bundle()?,
-            storage.active_read_schemas()?,
-        ))
     }
 
     pub fn id(&self) -> BundleId {

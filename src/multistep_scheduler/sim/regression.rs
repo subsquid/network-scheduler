@@ -1423,21 +1423,12 @@ fn churn_knife_edge_false_shortage_is_excused() {
 }
 
 /// A read schema promoted while the fleet is over-subscribed must still be resolvable by the portal
-/// that is told to use it. **Reproduces an open bug, so it fails**: `run_scheduling_cycle` returns
-/// `Shortage` before it builds a bundle, while `run_visibility_cycle` keeps publishing the fresh
-/// pointer — so the portal names read schema 1 for `s3://sim-0` against a bundle frozen before that
-/// promote existed.
-///
-/// Captured from `in_memory::churn_simulation` with the walk oracle's frozen-bundle stand-down
-/// disabled, then shrunk by proptest to these seven transitions. The shortage here comes from real
-/// capacity pressure (4 workers, floor 4, saturation 0.8), not from a floor set above the worker
-/// count.
-///
-/// `#[ignore]` keeps `cargo test` green while the fix is outstanding; run it with
-/// `cargo test --features mvcc-chunks -- --ignored`. The fix is to let the bundle advance under
-/// shortage; when this passes, delete the stand-down arm in
-/// `assert_portal_read_schema_resolution`, which exists only to keep the sweeps green meanwhile —
-/// with it gone the sweeps catch this class on their own.
+/// that is told to use it. Captured from `in_memory::churn_simulation` (shrunk by proptest to these
+/// seven transitions) back when the bundle froze with the assignment under a shortage — the portal
+/// then named an id its own bundle could not resolve. Now the bundle is generated every round from
+/// committed rows, so the promote reaches it even though placement keeps failing, and the strict
+/// read-schema oracle enforces exactly that during `replay` — the replay is the assertion. The
+/// shortage is real capacity pressure (4 workers, floor 4, saturation 0.8).
 fn portal_read_schema_frozen_bundle_case() -> (SimConfig, Vec<Action>) {
     let config = SimConfig {
         worker_count: 4,
@@ -1464,13 +1455,14 @@ fn portal_read_schema_frozen_bundle_case() -> (SimConfig, Vec<Action>) {
 }
 
 #[test]
-#[ignore = "reproduces the frozen-bundle gap; passes once the bundle advances under shortage"]
 fn portal_read_schema_resolves_under_shortage() {
     let (config, actions) = portal_read_schema_frozen_bundle_case();
-    let sut = replay(&config, actions);
-    assert_eq!(
-        sut.portal_read_schema_faults().expect("portal has fetched"),
-        vec![],
-        "the portal names a read schema its own bundle cannot resolve",
-    );
+    replay(&config, actions);
+}
+
+/// Postgres twin: the same case on the real backend, keeping the shortage-round bundle at parity.
+#[test]
+fn portal_read_schema_resolves_under_shortage_pg() {
+    let (config, actions) = portal_read_schema_frozen_bundle_case();
+    replay_pg(&config, actions);
 }

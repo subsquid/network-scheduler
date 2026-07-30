@@ -115,7 +115,7 @@ fn schedule(
     schedule_with_bundle(storage, chunk_pks, worker_ids, at).0
 }
 
-/// [`schedule`], keeping the bundle instead of dropping it.
+/// [`schedule`], also generating the bundle the round would publish.
 fn schedule_with_bundle(
     storage: &mut PostgresStorage,
     chunk_pks: &[ChunkPk],
@@ -126,9 +126,11 @@ fn schedule_with_bundle(
     let workers: Vec<WorkerPk> = worker_ids.to_vec();
     let mapping: IdealMapping = chunk_pks.iter().map(|&pk| (pk, workers.clone())).collect();
     let algorithm = StaticSchedulingAlgorithm { mapping };
-    storage
+    let wa = storage
         .run_scheduling_cycle(&algorithm, &(), at, 60)
-        .expect("scheduling succeeds")
+        .expect("scheduling succeeds");
+    let bundle = storage.generate_schema_bundle().expect("generate bundle");
+    (wa, bundle)
 }
 
 fn one_worker(storage: &mut PostgresStorage) -> Vec<WorkerPk> {
@@ -188,7 +190,7 @@ fn active_schema_bundle_holds_only_in_play_schemas() {
 
     // Place only "a"; "b" stays registered but unplaced (in no worker or portal assignment).
     let wa = schedule(&mut storage, &[a_pk], &workers, 100);
-    let bundle = SchemaBundle::generate(&storage).unwrap();
+    let bundle = storage.generate_schema_bundle().unwrap();
     // Whole-bundle content: exactly a's schema decoded from jsonb; b's is excluded, unplaced.
     assert_eq!(
         bundle.schemas(),
@@ -201,7 +203,7 @@ fn active_schema_bundle_holds_only_in_play_schemas() {
     storage.confirm_worker_assignment(wa.id, 100).unwrap();
     storage.run_visibility_cycle(150).unwrap();
     assert_eq!(
-        SchemaBundle::generate(&storage).unwrap().id(),
+        storage.generate_schema_bundle().unwrap().id(),
         bundle.id(),
         "portal-served keeps the same in-play schema set",
     );

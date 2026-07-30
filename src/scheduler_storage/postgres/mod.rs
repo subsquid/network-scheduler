@@ -269,21 +269,9 @@ impl SchedulerStorage for PostgresStorage {
         })
     }
 
-    fn active_schema_bundle(
-        &self,
-    ) -> Result<BTreeMap<crate::scheduler_storage::SchemaId, DatasetSchema>, StorageError> {
+    fn generate_schema_bundle(&self) -> Result<SchemaBundle, StorageError> {
         self.with_conn_ref(async move |conn| {
-            schema::active_schema_bundle(conn)
-                .await
-                .map_err(StorageError::from)
-        })
-    }
-
-    fn active_read_schemas(
-        &self,
-    ) -> Result<BTreeMap<crate::scheduler_storage::ReadSchemaId, DatasetSchema>, StorageError> {
-        self.with_conn_ref(async move |conn| {
-            schema::active_read_schemas(conn)
+            schema::generate_bundle(conn)
                 .await
                 .map_err(StorageError::from)
         })
@@ -391,7 +379,7 @@ impl SchedulerStorage for PostgresStorage {
         config: &A::Config,
         now: Tick,
         m_ticks: u64,
-    ) -> Result<(WorkerAssignment, SchemaBundle), StorageError>
+    ) -> Result<WorkerAssignment, StorageError>
     where
         A: SchedulingAlgorithm + Send + Sync,
     {
@@ -424,7 +412,6 @@ impl SchedulerStorage for PostgresStorage {
                 committed_placement,
                 published: published_chunks,
                 bundle_schema_ids,
-                bundle_datasets,
             } = phase::fetch_active_chunks_with_placement(&mut tx).await?;
 
             // Confirmed routing for the eviction victim-ordering hint (best-effort). Read in the same
@@ -469,6 +456,21 @@ impl SchedulerStorage for PostgresStorage {
             phase::write_future_ideal(&mut tx, &ideal_mappings, batch_size).await?;
             phase::apply_deltas_and_swap(&mut tx, new_wa_id, &evicted).await?;
 
+            // The write-schema ids this round's bundle covers: the routable window from the scan,
+            // plus the new ideal's chunks — the scan ran before this cycle stamped first-placed
+            // chunks, so they must be added from the in-memory mapping (same reason the old
+            // in-cycle bundle unioned `wa.schema_ids()`). Committed atomically with the
+            // assignment; a shortage returns before this point, freezing the previous set.
+            let published_schema_ids: Vec<SchemaId> =
+                {
+                    let mut ids = bundle_schema_ids;
+                    ids.extend(ideal_mappings.iter().filter_map(|(pk, _)| {
+                        published_chunks.get(pk).map(|chunk| chunk.schema_id)
+                    }));
+                    ids.into_iter().collect()
+                };
+            phase::persist_assignment_schemas(&mut tx, &published_schema_ids).await?;
+
             tx.commit().await.context("run_scheduling_cycle: commit")?;
 
             let wa = phase::build_worker_assignment(
@@ -480,10 +482,7 @@ impl SchedulerStorage for PostgresStorage {
                 published_chunks,
             )
             .await?;
-
-            let bundle =
-                schema::build_bundle(conn, &wa, bundle_schema_ids, &bundle_datasets).await?;
-            Ok::<_, StorageError>((wa, bundle))
+            Ok::<_, StorageError>(wa)
         })
     }
 

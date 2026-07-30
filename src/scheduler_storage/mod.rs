@@ -117,12 +117,6 @@ pub struct WorkerAssignment {
     pub replication_by_weight: BTreeMap<u16, u16>,
 }
 
-impl WorkerAssignment {
-    pub(crate) fn schema_ids(&self) -> BTreeSet<SchemaId> {
-        self.chunks.values().map(|chunk| chunk.schema_id).collect()
-    }
-}
-
 /// The published portal assignment: confirmed routing for portal-visible chunks.
 #[derive(Debug, Clone)]
 pub struct PortalAssignment {
@@ -172,18 +166,28 @@ pub trait SchedulerStorage {
     /// Run one full scheduling cycle: tombstone expired chunks, expire stale
     /// mappings, run `algorithm` in-process, diff + commit results.
     ///
-    /// Returns the published `WorkerAssignment` (ideal ∪ stale) with the [`SchemaBundle`] frozen
-    /// with it — the write schemas its chunks reference, plus the current read schemas of the
-    /// datasets in play — so the two stay paired. On `Shortage` neither advances.
+    /// Returns the published `WorkerAssignment` (ideal ∪ stale). The bundle no longer travels with
+    /// it — call [`Self::generate_schema_bundle`] after every cycle, success or `Shortage`. On
+    /// success the cycle also persists the round's write-schema ids, atomically with the
+    /// assignment, which is what keeps a shortage-round bundle covering the frozen assignment.
     fn run_scheduling_cycle<Algo>(
         &mut self,
         algorithm: &Algo,
         config: &Algo::Config,
         now: Tick,
         m_ticks: u64,
-    ) -> Result<(WorkerAssignment, SchemaBundle), StorageError>
+    ) -> Result<WorkerAssignment, StorageError>
     where
         Algo: crate::scheduler_storage::algorithm::SchedulingAlgorithm + Send + Sync;
+
+    /// Build the schema bundle from committed rows alone — callable at any time, identical under
+    /// success, shortage, and after a restart (no driver state involved).
+    ///
+    /// Write section: the routable window (ADR 0002) ∪ the persisted schema set of the last
+    /// successful assignment, so nothing the frozen published assignment names ever drops out
+    /// mid-shortage. Read section: the CURRENT read schema of every dataset either side
+    /// references — a promote reaches the very next bundle, which is the point.
+    fn generate_schema_bundle(&self) -> Result<SchemaBundle, StorageError>;
 
     /// Advance the confirmation watermark and replay pending routing diffs
     fn confirm_worker_assignment(
@@ -223,15 +227,6 @@ pub trait SchedulerStorage {
         &self,
         schema_ids: Option<&[SchemaId]>,
     ) -> Result<BTreeMap<SchemaId, DatasetSchema>, StorageError>;
-
-    /// Schemas of every chunk currently in play — held by workers or served by the portal (see
-    /// [`SchemaBundle`]). One round-trip; independent of the published `WorkerAssignment`/
-    /// `PortalAssignment`, which can lag or fail on their own.
-    fn active_schema_bundle(&self) -> Result<BTreeMap<SchemaId, DatasetSchema>, StorageError>;
-
-    /// Every in-play dataset's current read schema, over the same routable window
-    /// `active_schema_bundle` uses, so both sections retire on one clock.
-    fn active_read_schemas(&self) -> Result<BTreeMap<ReadSchemaId, DatasetSchema>, StorageError>;
 
     /// Make `schema` the dataset's current read schema, returning its content-deduped id.
     ///

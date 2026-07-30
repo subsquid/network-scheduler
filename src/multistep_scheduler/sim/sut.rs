@@ -339,15 +339,16 @@ pub(super) struct SimUnderTest<D: SimStorage> {
     /// Latest published worker assignment (what a `WorkerFetch` samples); `None` until the first
     /// scheduling cycle.
     latest_worker_assignment: Option<WorkerAssignment>,
-    /// Bundle frozen with `latest_worker_assignment`; both stay frozen together across a shortage
-    /// streak, so the oracle checks the assignment against the bundle it shipped with.
+    /// The bundle of the latest round — regenerated on every outcome, so it advances across a
+    /// shortage streak while `latest_worker_assignment` stays frozen; the oracles check both
+    /// against it.
     latest_worker_bundle: Option<SchemaBundle>,
     /// dataset → (content the sim promoted, [`bundle_generation`](Self::bundle_generation) then).
     /// Written only by the sim's action, never read back from a backend — that independence is what
     /// makes the read-schema oracle able to fail.
     model_read_schemas: BTreeMap<String, (DatasetSchema, u64)>,
-    /// Bumped whenever a bundle is frozen. The oracle waits for a generation newer than a promote's
-    /// before demanding coverage; under shortage this never advances, which is the contract today.
+    /// Bumped once per round (every outcome). The worker-side oracle waits for a generation newer
+    /// than a promote's before demanding coverage — the legitimate one-round propagation lag.
     bundle_generation: u64,
     /// Latest published portal assignment (what a `PortalFetch` samples).
     latest_portal_assignment: Option<PortalAssignment>,
@@ -1110,31 +1111,41 @@ impl<D: SimStorage> SimUnderTest<D> {
 
     /// Run one scheduling pass against the live clock, recording the shortage flag. Returns the new
     /// assignment's id on success, or `None` on a recorded shortage.
+    ///
+    /// The bundle is generated on EVERY outcome: it is a function of committed rows (routable
+    /// window ∪ the persisted set of the last successful assignment), so a shortage advances it —
+    /// promotes keep flowing to portals while the assignment stays frozen. That is the fix the
+    /// strict read-schema oracle enforces.
     fn run_scheduler(&mut self) -> Option<AssignmentId> {
-        match self
-            .storage
-            .run_scheduling_cycle(&self.algo, &self.config, self.now, M_TICKS)
-        {
-            Ok((assignment, bundle)) => {
-                self.schedule_status = ScheduleStatus::SchedulerPlaced;
-                self.is_infeasible = false;
-                // A successful schedule ends a saturation episode — re-arm the latch so the walk
-                // can saturate, probe, and recover again.
-                self.converge_checked = false;
-                let id = assignment.id;
-                self.latest_worker_assignment = Some(assignment);
-                // Freeze with the assignment; on a shortage (below) neither is reassigned.
-                self.latest_worker_bundle = Some(bundle);
-                self.bundle_generation += 1;
-                Some(id)
-            }
-            Err(StorageError::Shortage) => {
-                self.schedule_status = ScheduleStatus::NotEnoughCapacity;
-                self.is_infeasible = true;
-                None
-            }
-            Err(err) => panic!("scheduling cycle failed (not a shortage): {err}"),
-        }
+        let id =
+            match self
+                .storage
+                .run_scheduling_cycle(&self.algo, &self.config, self.now, M_TICKS)
+            {
+                Ok(assignment) => {
+                    self.schedule_status = ScheduleStatus::SchedulerPlaced;
+                    self.is_infeasible = false;
+                    // A successful schedule ends a saturation episode — re-arm the latch so the walk
+                    // can saturate, probe, and recover again.
+                    self.converge_checked = false;
+                    let id = assignment.id;
+                    self.latest_worker_assignment = Some(assignment);
+                    Some(id)
+                }
+                Err(StorageError::Shortage) => {
+                    self.schedule_status = ScheduleStatus::NotEnoughCapacity;
+                    self.is_infeasible = true;
+                    None
+                }
+                Err(err) => panic!("scheduling cycle failed (not a shortage): {err}"),
+            };
+        self.latest_worker_bundle = Some(
+            self.storage
+                .generate_schema_bundle()
+                .expect("bundle generation is outcome-independent"),
+        );
+        self.bundle_generation += 1;
+        id
     }
 
     /// One storage cycle: schedule, advance the clock, run visibility, assert per-step safety.
@@ -1182,7 +1193,6 @@ impl<D: SimStorage> SimUnderTest<D> {
         // an assignment that predates it.
         self.latest_portal_publication = Some(observers::PortalPublication {
             bundle: self.latest_worker_bundle.clone(),
-            generation: self.bundle_generation,
             promoted: self.model_read_schemas.clone(),
         });
         self.latest_portal_assignment = Some(assignment);
@@ -1384,16 +1394,10 @@ impl<D: SimStorage> SimUnderTest<D> {
         }
     }
 
-    /// Checked against what the portal holds, not the latest published pair.
-    ///
-    /// **Known gap, excused:** an `Unresolvable` promoted at or after the bundle's generation is the
-    /// frozen-bundle window — `run_scheduling_cycle` returns `Shortage` before building a bundle
-    /// while the visibility cycle keeps publishing a fresh pointer, and nothing records which read
-    /// ids a published bundle carried. Reproduced by `portal_read_schema_resolves_under_shortage`;
-    /// letting the bundle advance under shortage removes both.
-    ///
-    /// Everything else is fatal. The excused count is measured, so an excuse that starts firing
-    /// broadly shows up as a statistic instead of hiding a regression.
+    /// Checked against what the portal holds, not the latest published pair. Strict: every fault is
+    /// fatal. The bundle advances on every round including shortages (it is generated from
+    /// committed rows, independent of placement), so there is no frozen-bundle state left to
+    /// excuse — a portal must always be able to resolve every read schema it is told to use.
     fn assert_portal_read_schema_resolution(&self) {
         let Some(publication) = self.portal_state.publication.as_ref() else {
             return;
@@ -1406,39 +1410,9 @@ impl<D: SimStorage> SimUnderTest<D> {
         };
         let faults =
             placement_oracles::portal_read_schemas_resolve(portal, bundle, &publication.promoted);
-        let (excused, fatal): (Vec<_>, Vec<_>) = faults.into_iter().partition(|fault| {
-            matches!(
-                fault,
-                placement_oracles::ReadSchemaFault::Unresolvable { promoted_at, .. }
-                    if publication.generation <= *promoted_at
-            )
-        });
-        statistics::measure(
-            "schema: read refs excused by frozen bundle",
-            excused.len() as f64,
-        );
-        statistics::classify(
-            !fatal.is_empty(),
-            "schema: portal read reference unresolvable (fatal)",
-        );
-        if let Some(fault) = fatal.first() {
+        if let Some(fault) = faults.first() {
             panic!("{fault}");
         }
-    }
-
-    /// The unexcused verdict, for regressions asserting on the gap itself. `None` before a fetch.
-    #[cfg(test)]
-    pub(super) fn portal_read_schema_faults(
-        &self,
-    ) -> Option<Vec<placement_oracles::ReadSchemaFault>> {
-        let publication = self.portal_state.publication.as_ref()?;
-        let portal = self.portal_state.snapshot.as_ref()?;
-        let bundle = publication.bundle.as_ref()?;
-        Some(placement_oracles::portal_read_schemas_resolve(
-            portal,
-            bundle,
-            &publication.promoted,
-        ))
     }
 
     // ---- Observation layer (fleet + portal) -------------------------------------------------

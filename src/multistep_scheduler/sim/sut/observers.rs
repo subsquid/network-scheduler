@@ -130,11 +130,10 @@ pub(super) struct Portal {
 /// Captured at publication, so an oracle can't pair a held assignment with a bundle never sent.
 #[derive(Debug, Clone)]
 pub(super) struct PortalPublication {
-    /// What a portal holding this assignment must resolve against; `None` before the first
-    /// successful cycle. Under shortage this is the frozen bundle — the point, not an artefact.
+    /// What a portal holding this assignment must resolve against; `None` only before the first
+    /// scheduling round. Regenerated every round — success or shortage — so it always carries the
+    /// current read schemas.
     pub(super) bundle: Option<SchemaBundle>,
-    /// `bundle_generation` at publication.
-    pub(super) generation: u64,
     /// The sim's promote log at publication; never read back from a backend.
     pub(super) promoted: BTreeMap<String, (DatasetSchema, u64)>,
 }
@@ -280,7 +279,6 @@ mod tests {
             2,
             PortalPublication {
                 bundle: None,
-                generation: 0,
                 promoted: BTreeMap::new(),
             },
             12,

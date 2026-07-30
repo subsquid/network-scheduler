@@ -61,6 +61,30 @@ pub(super) async fn open_worker_assignment(
     Ok(id)
 }
 
+/// Replace `sched_worker_assignment_schemas` with `schema_ids` — the write-schema ids the round's
+/// bundle covers, computed in Rust from data the cycle already holds (never derived server-side
+/// from the placement tables; that would scan millions of rows for a few hundred ids). Runs in the
+/// cycle's transaction, so a shortage freezes the previous set by never reaching this write.
+pub(super) async fn persist_assignment_schemas(
+    tx: &mut Transaction<'_, Postgres>,
+    schema_ids: &[SchemaId],
+) -> Result<()> {
+    let mut timer = PhaseTimer::new("run_scheduling_cycle:persist_assignment_schemas");
+    sqlx::query("DELETE FROM sched_worker_assignment_schemas")
+        .execute(&mut **tx)
+        .await
+        .context("persist_assignment_schemas: clear")?;
+    sqlx::query(
+        "INSERT INTO sched_worker_assignment_schemas (schema_id) SELECT * FROM UNNEST($1::int[])",
+    )
+    .bind(schema_ids)
+    .execute(&mut **tx)
+    .await
+    .context("persist_assignment_schemas: insert")?;
+    timer.stmt(schema_ids.len() as u64);
+    Ok(())
+}
+
 /// Tombstone chunks whose portal-drop landed at least `m_ticks` ago, stamping the drop tick.
 pub(super) async fn tombstone_expired_chunks(
     tx: &mut Transaction<'_, Postgres>,
@@ -144,11 +168,9 @@ pub(super) struct ActiveChunks {
     /// Full-column decode of the active rows, reused by the post-commit
     /// [`build_worker_assignment`] so it needn't re-read the chunks; shares `for_algo`'s `Arc`s.
     pub(super) published: FxHashMap<ChunkPk, WorkerAssignmentChunk>,
-    /// schema_ids of every chunk that has entered a worker assignment and is not yet tombstoned (ADR 0002)
+    /// schema_ids of every chunk that has entered a worker assignment and is not yet tombstoned
+    /// (ADR 0002) — the input, with the new ideal's ids, to the persisted assignment-schema set.
     pub(super) bundle_schema_ids: BTreeSet<SchemaId>,
-    /// The same chunks' datasets. Collected in this scan so the bundle's read section is a keyed
-    /// lookup rather than a per-dataset existence proof over `chunks`.
-    pub(super) bundle_datasets: BTreeSet<crate::types::DatasetId>,
 }
 
 /// Reads every active chunk — registered, and neither `rejected` nor removed (tombstoned) — spanning
@@ -188,7 +210,6 @@ pub(super) async fn fetch_active_chunks_with_placement(
         committed_placement: CurrentPlacement::default(),
         published: FxHashMap::default(),
         bundle_schema_ids: BTreeSet::new(),
-        bundle_datasets: BTreeSet::new(),
     };
     let mut count = 0u64;
     while let Some(mut row) = stream
@@ -209,7 +230,6 @@ pub(super) async fn fetch_active_chunks_with_placement(
             .push((pk, AlgoChunk::new(&chunk, row.is_portal_visible)));
         if row.entered_worker_assignment {
             out.bundle_schema_ids.insert(chunk.schema_id);
-            out.bundle_datasets.insert(chunk.dataset.clone());
         }
         out.published.insert(pk, chunk);
         count += 1;

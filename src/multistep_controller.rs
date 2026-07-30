@@ -69,7 +69,7 @@ pub async fn run(
         min_replication: config.min_replication,
         ignore_reliability: config.ignore_reliability,
     };
-    let (assignment, _) = {
+    let assignment = {
         let _timer = metrics::Timer::new("multistep:schedule");
         storage
             .run_scheduling_cycle(
@@ -80,12 +80,21 @@ pub async fn run(
             )
             .context("run multistep scheduling cycle")?
     };
+    // Exercises the production bundle path even though nothing publishes it yet; the BundleId is
+    // the value a caching consumer would key on.
+    let bundle = storage
+        .generate_schema_bundle()
+        .context("generate schema bundle")?;
 
     tracing::info!(
-        "Multistep scheduling cycle done: assignment {}, {} chunks placed, replication_by_weight={:?}",
+        "Multistep scheduling cycle done: assignment {}, {} chunks placed, replication_by_weight={:?}, \
+         bundle {} ({} write / {} read schemas)",
         assignment.id,
         assignment.chunk_workers.len(),
         assignment.replication_by_weight,
+        bundle.id(),
+        bundle.schemas().len(),
+        bundle.read_schemas().len(),
     );
 
     Ok(())
