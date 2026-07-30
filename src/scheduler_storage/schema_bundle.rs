@@ -1,9 +1,6 @@
 //! Schemas published alongside an assignment: the WRITE schemas its chunks pin, and the current
-//! READ schemas of the datasets in play. Built from the assignment's own chunks, so the two can't
-//! drift.
-//!
-//! [`BundleId`] covers both sections, so a promote moves it — that is what lets a portal cache the
-//! bundle and re-fetch only on a change.
+//! READ schemas of the datasets in play. [`BundleId`] covers both sections, so a promote moves it —
+//! what lets a portal cache the bundle and re-fetch only on a change.
 
 use std::collections::BTreeMap;
 
@@ -15,12 +12,9 @@ use crate::types::DatasetSchema;
 /// Pins the encoding: a future format change becomes a different id, not a silent collision.
 const BUNDLE_ID_DOMAIN: &[u8] = b"sqd.schema-bundle.v1";
 
-/// SHA-256 over the bundle's sorted ids. Ids are content-deduped serials, so equal ids ⇒ equal
-/// content — within one database, not across them.
-///
-/// Each section is hashed behind its own tag and length: `schemas.id` and `read_schemas.id` are
-/// independent `SERIAL`s handing out the same integers, so a flat hash would let write-3 and
-/// read-3 collide. Ids are never reused, so an id in a published bundle keeps its meaning.
+/// SHA-256 over the bundle's sorted ids (content-deduped serials: equal ids ⇒ equal content within
+/// one database). Sections are hashed behind per-section tags — the two id spaces are independent
+/// `SERIAL`s, so a flat hash would let write-3 and read-3 collide.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct BundleId([u8; 32]);
 

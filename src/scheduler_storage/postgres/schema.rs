@@ -11,15 +11,9 @@ use sqlx::Connection;
 use crate::scheduler_storage::{ReadSchemaId, SchemaBundle, SchemaId};
 use crate::types::DatasetSchema;
 
-/// Each named dataset's current read-schema id, for the portal assignment to publish.
-///
-/// Driven from `datasets` with a LEFT JOIN, so the result is TOTAL over the named set: a dataset
-/// with no read row yields `None`. That is what makes "never promoted" publishable and distinct from
-/// a key the backend failed to produce. Compare [`read_schemas_by_id`], which inner-joins because a
-/// dataset without a read schema has no payload to carry.
-///
-/// Ids only — the content travels in the bundle, built in another transaction, so there is nothing
-/// here for the id to be atomically consistent with.
+/// Each named dataset's current read-schema id, for the portal assignment to publish. LEFT JOIN
+/// from `datasets`, so the result is TOTAL over the named set — `None` means "never promoted",
+/// distinct from a key the backend failed to produce. Ids only; the content travels in the bundle.
 pub(super) async fn read_schema_ids_by_dataset(
     conn: &mut PgConnection,
     datasets: &[&str],
@@ -44,20 +38,9 @@ pub(super) async fn read_schema_ids_by_dataset(
         .collect())
 }
 
-/// The bundle's read section: payloads keyed by id, for the named datasets. The caller passes the
-/// routable window it already scanned, making this a keyed lookup.
-///
-/// Inner join, unlike [`read_schema_ids_by_dataset`]: a dataset with no read schema contributes no
-/// payload, and the bundle is keyed by id, so there is no slot for an absent one.
-///
-/// Not a per-dataset `EXISTS` over `chunks`. A read schema is a dataset-level pointer no chunk need
-/// be written under, so the predicate would be "has this dataset a live chunk" — and proving that
-/// negative for a retired dataset walks all its chunk rows, every cycle, forever, since nothing
-/// deletes `datasets` or `chunks` and no index matches the routable predicate. (Contrast
-/// [`active_schema_bundle`]: its probe is per-*schema* and rides `chunks_schema_id`.)
-///
-/// One statement, so no concurrent promote can open a resolve-then-load gap; a promote either side
-/// of it costs a cycle of freshness, never resolvability.
+/// The bundle's read section: current read-schema payloads keyed by id, for the named datasets.
+/// Inner join, unlike [`read_schema_ids_by_dataset`] — a dataset with no read schema has no slot in
+/// an id-keyed map. One statement, so a concurrent promote costs freshness, never resolvability.
 pub(super) async fn read_schemas_by_id(
     conn: &mut PgConnection,
     datasets: &[&str],
@@ -79,15 +62,11 @@ pub(super) async fn read_schemas_by_id(
     Ok(rows.into_iter().map(|(id, json)| (id, json.0)).collect())
 }
 
-/// The generator: one bundle from committed rows alone, identical under success, shortage, and on
-/// a fresh process. Write section: the routable window ∪ the persisted set of the last successful
-/// assignment (the window alone can shrink below what the frozen assignment names — Phase A keeps
-/// tombstoning during a shortage). Read section: the CURRENT read schema of every dataset either
-/// side references, so a promote always reaches the next bundle.
-///
-/// One `REPEATABLE READ, READ ONLY` transaction: everything is read from a single snapshot, so a
-/// concurrent cycle or promote cannot skew the sections against each other. Loads are strict — a
-/// referenced id whose `schemas` row is missing is an error, never a silent shrink.
+/// One bundle from committed rows alone — identical under success, shortage, and on a fresh
+/// process. Write section: routable window ∪ the persisted set (the window alone can shrink below
+/// what the frozen assignment names — Phase A keeps tombstoning during a shortage). Read section:
+/// the CURRENT read schema of every referenced dataset. One `REPEATABLE READ, READ ONLY` snapshot;
+/// strict loads — a referenced id with no `schemas` row is an error, never a silent shrink.
 pub(super) async fn generate_bundle(conn: &mut PgConnection) -> Result<SchemaBundle> {
     let _timer = crate::metrics::Timer::new("generate_schema_bundle");
     let mut tx = conn.begin().await.context("generate_bundle: begin")?;
@@ -96,9 +75,8 @@ pub(super) async fn generate_bundle(conn: &mut PgConnection) -> Result<SchemaBun
         .await
         .context("generate_bundle: set isolation")?;
 
-    // (schema id, dataset name) over the window ∪ the persisted set. The persisted arm resolves
-    // its dataset through the schema row — `chunks_schema_same_dataset` makes that the chunk's own
-    // dataset.
+    // (schema id, dataset name) over window ∪ persisted; the persisted arm resolves its dataset
+    // through the schema row (`chunks_schema_same_dataset` makes that the chunk's own dataset).
     let refs: Vec<(SchemaId, String)> = sqlx::query_as(
         "SELECT DISTINCT c.schema_id, d.name \
          FROM sched_chunk_metadata m \

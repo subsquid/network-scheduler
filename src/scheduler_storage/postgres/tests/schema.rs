@@ -209,8 +209,8 @@ fn active_schema_bundle_holds_only_in_play_schemas() {
     );
 }
 
-/// The bundle carries the current read schema alongside the write schemas, and a promote moves the
-/// fingerprint — without that movement a caching portal never invalidates.
+/// A promote lands in the bundle's read section and moves the fingerprint — without that movement a
+/// caching portal never invalidates.
 #[test]
 fn schema_bundle_carries_the_current_read_schema() {
     let mut storage = fresh_storage("bundle_read_schema");
@@ -258,16 +258,10 @@ fn schema_bundle_carries_the_current_read_schema() {
     );
 }
 
-/// A dataset placed for the first time this cycle must still reach the bundle. The scan runs before
-/// `apply_deltas_and_swap` stamps `applied_at_worker_assignment_id`, so the chunk reads as
-/// never-entered and the scan alone misses its dataset — the reason the write side starts from
-/// `wa.schema_ids()`.
-///
-/// The order is the whole point: [`schema_bundle_carries_the_current_read_schema`] promotes after a
-/// cycle has already stamped the chunk, so it cannot catch this.
-///
-/// The bug was found by the Postgres sim sweeps, which failed with an empty read section; this is the
-/// deterministic case written afterwards to pin it.
+/// A dataset placed for the first time in a cycle must still reach that round's bundle. The order —
+/// promote, THEN first placement — is the point: the sibling test promotes after a cycle has
+/// stamped the chunk, so it cannot catch this. Found by the Postgres sim sweeps (empty read
+/// section); pinned here.
 #[test]
 fn first_placement_cycle_carries_the_read_schema() {
     let mut storage = fresh_storage("bundle_first_placement");

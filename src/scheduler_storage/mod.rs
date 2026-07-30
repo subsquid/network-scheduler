@@ -124,15 +124,10 @@ pub struct PortalAssignment {
     pub chunk_workers: BTreeMap<ChunkPk, Vec<WorkerPk>>,
     pub chunks: BTreeMap<ChunkPk, WorkerAssignmentChunk>,
     pub workers: BTreeMap<WorkerPk, AssignmentWorker>,
-    /// The read-schema id a portal validates each dataset's queries under; resolved against the
-    /// [`SchemaBundle`] published with the assignment.
-    ///
-    /// **Total over the datasets `chunks` names, and no wider** — so it retires with the last
-    /// visible chunk. Keying it off the `datasets` registry would grow forever, since nothing
-    /// deletes a dataset row.
-    ///
-    /// `None` = never promoted, the seeded state of every dataset the scheduler creates. Distinct
-    /// from a missing key, which would be a resolution failure rather than an answer.
+    /// The read-schema id a portal validates each dataset's queries under, resolved against the
+    /// published [`SchemaBundle`]. Total over the datasets `chunks` names and no wider, so it
+    /// retires with the last visible chunk. `None` = never promoted — distinct from a missing key,
+    /// which would be a resolution failure rather than an answer.
     pub read_schemas: BTreeMap<DatasetId, Option<ReadSchemaId>>,
 }
 
@@ -166,10 +161,10 @@ pub trait SchedulerStorage {
     /// Run one full scheduling cycle: tombstone expired chunks, expire stale
     /// mappings, run `algorithm` in-process, diff + commit results.
     ///
-    /// Returns the published `WorkerAssignment` (ideal ∪ stale). The bundle no longer travels with
-    /// it — call [`Self::generate_schema_bundle`] after every cycle, success or `Shortage`. On
-    /// success the cycle also persists the round's write-schema ids, atomically with the
-    /// assignment, which is what keeps a shortage-round bundle covering the frozen assignment.
+    /// Returns the published `WorkerAssignment` (ideal ∪ stale); call
+    /// [`Self::generate_schema_bundle`] after every cycle, success or `Shortage`. Success also
+    /// persists the round's write-schema ids atomically with the assignment — what keeps a
+    /// shortage-round bundle covering the frozen assignment.
     fn run_scheduling_cycle<Algo>(
         &mut self,
         algorithm: &Algo,
@@ -180,11 +175,9 @@ pub trait SchedulerStorage {
     where
         Algo: crate::scheduler_storage::algorithm::SchedulingAlgorithm + Send + Sync;
 
-    /// Build the schema bundle from committed rows alone — identical under success, shortage, and
-    /// after a restart. Write section: routable window (ADR 0002) ∪ the persisted set of the last
-    /// successful assignment, so nothing the frozen published assignment names drops out
-    /// mid-shortage. Read section: the CURRENT read schema of every referenced dataset, so a
-    /// promote reaches the very next bundle.
+    /// The schema bundle, from committed rows alone — identical under success, shortage, and after
+    /// a restart. Write section: routable window (ADR 0002) ∪ the persisted set. Read section: the
+    /// CURRENT read schema of every referenced dataset, so a promote reaches the very next bundle.
     fn generate_schema_bundle(&self) -> Result<SchemaBundle, StorageError>;
 
     /// Advance the confirmation watermark and replay pending routing diffs
@@ -226,10 +219,8 @@ pub trait SchedulerStorage {
         schema_ids: Option<&[SchemaId]>,
     ) -> Result<BTreeMap<SchemaId, DatasetSchema>, StorageError>;
 
-    /// Make `schema` the dataset's current read schema, returning its content-deduped id.
-    ///
-    /// For tests and the simulation only. In production the read registry has one writer, the
-    /// metadata service; the read path's concurrency argument rests on there being no second.
+    /// Make `schema` the dataset's current read schema, returning its content-deduped id. Tests and
+    /// the simulation only — in production the metadata service is the registry's ONE writer.
     fn promote_read_schema(
         &mut self,
         dataset: &str,

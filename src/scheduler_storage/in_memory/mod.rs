@@ -235,10 +235,9 @@ pub(crate) struct InMemoryStorage {
     /// `(dataset, canonical json)` → id: re-registering seen content reuses its id (mirrors
     /// `UNIQUE (dataset_id, hash)`)
     schema_ids: HashMap<(Dataset, String), SchemaId>,
-    /// Mirrors `schemas.dataset_id` — the generator derives its read-section scope through it.
+    /// Mirrors `schemas.dataset_id`.
     schema_datasets: HashMap<SchemaId, Dataset>,
-    /// Mirrors `sched_worker_assignment_schemas`: the write ids of the last successful round's
-    /// bundle, replaced atomically with the assignment; a shortage leaves it frozen.
+    /// Mirrors `sched_worker_assignment_schemas`; a shortage leaves it frozen.
     worker_assignment_schemas: BTreeSet<SchemaId>,
     /// Each dataset's latest-registered write schema id, so the sim can stamp inserts with the id a
     /// fresh write would pin. Earlier ids stay in `schemas` (write schemas are immutable).
@@ -816,7 +815,7 @@ impl SchedulerStorage for InMemoryStorage {
     }
 
     fn generate_schema_bundle(&self) -> Result<SchemaBundle, StorageError> {
-        // Write section: routable window ∪ persisted set (postgres `generate_bundle` verbatim).
+        // Postgres `generate_bundle` semantics, verbatim.
         let mut ids: BTreeSet<SchemaId> = self.worker_assignment_schemas.clone();
         let mut datasets: BTreeSet<Dataset> = BTreeSet::new();
         for chunk in self.routable_window_chunks() {
@@ -1128,8 +1127,7 @@ impl SchedulerStorage for InMemoryStorage {
             }
         }
 
-        // Persist the round's bundle write ids (window ∪ this assignment), atomically with the
-        // assignment; a shortage returned earlier, leaving the previous set frozen.
+        // Persist the round's bundle write ids; a shortage returned earlier, freezing the set.
         let mut schema_ids: BTreeSet<SchemaId> =
             assignment.chunks.values().map(|c| c.schema_id).collect();
         schema_ids.extend(self.routable_window_chunks().map(|c| c.schema_id));

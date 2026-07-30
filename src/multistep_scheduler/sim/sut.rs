@@ -339,16 +339,14 @@ pub(super) struct SimUnderTest<D: SimStorage> {
     /// Latest published worker assignment (what a `WorkerFetch` samples); `None` until the first
     /// scheduling cycle.
     latest_worker_assignment: Option<WorkerAssignment>,
-    /// The bundle of the latest round — regenerated on every outcome, so it advances across a
-    /// shortage streak while `latest_worker_assignment` stays frozen; the oracles check both
-    /// against it.
+    /// Regenerated every round, so it advances across a shortage streak while
+    /// `latest_worker_assignment` stays frozen.
     latest_worker_bundle: Option<SchemaBundle>,
-    /// dataset → (content the sim promoted, [`bundle_generation`](Self::bundle_generation) then).
-    /// Written only by the sim's action, never read back from a backend — that independence is what
-    /// makes the read-schema oracle able to fail.
+    /// dataset → (promoted content, [`bundle_generation`](Self::bundle_generation) at the promote).
+    /// Never read back from a backend — that independence is what lets the oracle fail.
     model_read_schemas: BTreeMap<String, (DatasetSchema, u64)>,
-    /// Bumped once per round (every outcome). The worker-side oracle waits for a generation newer
-    /// than a promote's before demanding coverage — the legitimate one-round propagation lag.
+    /// Bumped once per round. The worker-side oracle enforces a promote only once the generation
+    /// passes it — the legitimate one-round propagation lag.
     bundle_generation: u64,
     /// Latest published portal assignment (what a `PortalFetch` samples).
     latest_portal_assignment: Option<PortalAssignment>,
@@ -519,9 +517,8 @@ impl<D: SimStorage> SimUnderTest<D> {
         ));
     }
 
-    /// The single refresh path for both the fetch action and the convergence fixed point.
-    /// `check_converged` bypasses `do_portal_fetch` and shortage regressions land there, so a second
-    /// site would leave the captured pair stale in exactly the states the oracle targets.
+    /// The single refresh path for the fetch action AND the convergence fixed point — a second site
+    /// would leave the captured pair stale in exactly the states the oracle targets.
     fn refresh_portal_observer(&mut self) {
         let Some(assignment) = self.latest_portal_assignment.clone() else {
             return;
@@ -576,8 +573,8 @@ impl<D: SimStorage> SimUnderTest<D> {
         self.trace_step(&format!("SetDatasetSchema({dataset})"));
     }
 
-    /// Records the content as the oracle's reference. Runs no cycle on purpose: a promote lands on
-    /// the ingester's clock, so the interleaving worth testing is one falling between cycles.
+    /// Records the content as the oracle's reference. Runs no cycle: a promote lands on the
+    /// ingester's clock, between rounds.
     pub(super) fn do_promote_read_schema(&mut self, dataset: &str, schema: DatasetSchema) {
         self.storage
             .promote_read_schema(dataset, schema.clone())
@@ -1109,10 +1106,9 @@ impl<D: SimStorage> SimUnderTest<D> {
 
     // ---- Storage cycle (shared machinery) ---------------------------------------------------
 
-    /// Run one scheduling pass against the live clock, recording the shortage flag. Returns the new
-    /// assignment's id on success, or `None` on a recorded shortage. The bundle is generated on
-    /// EVERY outcome, so a shortage advances it while the assignment stays frozen — the fix the
-    /// strict read-schema oracle enforces.
+    /// One scheduling pass; returns the new assignment's id, or `None` on a recorded shortage. The
+    /// bundle regenerates on EVERY outcome — a shortage advances it while the assignment stays
+    /// frozen, which is the fix the strict read-schema oracle enforces.
     fn run_scheduler(&mut self) -> Option<AssignmentId> {
         let id =
             match self
@@ -1186,8 +1182,8 @@ impl<D: SimStorage> SimUnderTest<D> {
         self.assert_schema_bundle_consistency();
         self.latest_portal_watermark =
             self.storage.get_worker_assignment_confirmation() as AssignmentId;
-        // Captured here, not at fetch time: rebuilding it on fetch would let a later promote indict
-        // an assignment that predates it.
+        // Captured at publish: rebuilding on fetch would let a later promote indict an older
+        // assignment.
         self.latest_portal_publication = Some(observers::PortalPublication {
             bundle: self.latest_worker_bundle.clone(),
             promoted: self.model_read_schemas.clone(),
@@ -1391,9 +1387,8 @@ impl<D: SimStorage> SimUnderTest<D> {
         }
     }
 
-    /// Checked against what the portal holds, not the latest published pair. Strict — every fault
-    /// is fatal: the bundle advances on every round including shortages, so there is no frozen
-    /// state left to excuse.
+    /// Strict: every fault is fatal — the bundle advances every round, so there is no frozen state
+    /// to excuse. Checked against what the portal holds, not the latest published pair.
     fn assert_portal_read_schema_resolution(&self) {
         let Some(publication) = self.portal_state.publication.as_ref() else {
             return;

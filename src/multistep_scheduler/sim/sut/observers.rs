@@ -122,19 +122,16 @@ pub(super) struct Portal {
     pub(super) snapshot: Option<PortalAssignment>,
     pub(super) fetched_at: Tick,
     pub(super) watermark: AssignmentId,
-    /// The publication `snapshot` came from. Captured, not read live, so a later promote can't
-    /// indict a pair that was coherent when handed over.
+    /// The publication `snapshot` came from, captured at publish time.
     pub(super) publication: Option<PortalPublication>,
 }
 
-/// Captured at publication, so an oracle can't pair a held assignment with a bundle never sent.
+/// What was published alongside a portal assignment, captured at that instant.
 #[derive(Debug, Clone)]
 pub(super) struct PortalPublication {
-    /// What a portal holding this assignment must resolve against; `None` only before the first
-    /// scheduling round. Regenerated every round — success or shortage — so it always carries the
-    /// current read schemas.
+    /// What a portal holding this assignment resolves against; `None` before the first round.
     pub(super) bundle: Option<SchemaBundle>,
-    /// The sim's promote log at publication; never read back from a backend.
+    /// The sim's promote log at publication.
     pub(super) promoted: BTreeMap<String, (DatasetSchema, u64)>,
 }
 
