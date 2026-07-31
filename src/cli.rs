@@ -54,9 +54,6 @@ pub struct Args {
     #[arg(
         long,
         env = "DATABASE_URL",
-        // Clap renders `[env: DATABASE_URL=<value>]` otherwise, printing the password in the
-        // connection string to anyone who runs `--help` on a configured deployment. `Secret` only
-        // covers `Debug`; clap reads the variable itself.
         hide_env_values = true,
         required_if_eq_any([("multistep_scheduler", "true"), ("mode", "service")])
     )]
@@ -171,7 +168,6 @@ pub struct ClickhouseArgs {
     pub clickhouse_database: Option<String>,
     #[arg(long, env, required_if_eq_any([("mode", "prod"), ("mode", "service")]))]
     pub clickhouse_user: Option<String>,
-    // `hide_env_values`: see `Args::database_url` — `--help` would otherwise print the password.
     #[arg(long, env, hide_env_values = true, required_if_eq_any([("mode", "prod"), ("mode", "service")]))]
     pub clickhouse_password: Option<Secret>,
     /// Cap on a single ClickHouse request — the worker-ping query and the startup table DDL. A
