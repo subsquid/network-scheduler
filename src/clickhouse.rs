@@ -1,6 +1,6 @@
-use std::{collections::BTreeMap, str::FromStr, sync::Arc, time::Duration};
+use std::{collections::BTreeMap, future::Future, str::FromStr, sync::Arc, time::Duration};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use clickhouse::{Client, Row};
 use itertools::Itertools;
 use libp2p_identity::PeerId;
@@ -106,6 +106,8 @@ pub struct WorkerPing {
 
 pub struct ClickhouseClient {
     client: Client,
+    /// Wall-clock cap on one request, from [`ClickhouseArgs::clickhouse_timeout`].
+    request_timeout: Duration,
 }
 
 impl ClickhouseClient {
@@ -132,9 +134,25 @@ impl ClickhouseClient {
                     .ok_or_else(|| anyhow::anyhow!("ClickHouse password is required"))?
                     .expose_secret(),
             );
-        let this = Self { client };
+        let this = Self {
+            client,
+            request_timeout: args.clickhouse_timeout,
+        };
         this.create_tables().await?;
         Ok(this)
+    }
+
+    /// Bound one ClickHouse round trip on the wall clock. A request that hangs past
+    /// `request_timeout` is dropped (which closes its connection) and surfaces as an error, so the
+    /// caller retries rather than blocking forever — the crate has no request timeout of its own.
+    async fn with_timeout<T>(&self, op: &str, fut: impl Future<Output = Result<T>>) -> Result<T> {
+        match tokio::time::timeout(self.request_timeout, fut).await {
+            Ok(result) => result,
+            Err(_) => Err(anyhow!(
+                "ClickHouse {op} exceeded the {}s request timeout",
+                self.request_timeout.as_secs()
+            )),
+        }
     }
 
     #[instrument(skip_all)]
@@ -156,16 +174,20 @@ impl ClickhouseClient {
             "
         );
 
-        let mut cursor = self.client.query(&query).fetch::<PingRow>()?;
-
         // Buffered, not classified inline: the epoch baseline needs every row first.
-        let mut rows = Vec::new();
-        while let Some(row) = cursor.next().await? {
-            let Some(peer_id) = parse_peer_id(&row.worker_id) else {
-                continue;
-            };
-            rows.push((peer_id, row));
-        }
+        let rows: Vec<(PeerId, PingRow)> = self
+            .with_timeout("active-workers query", async move {
+                let mut cursor = self.client.query(&query).fetch::<PingRow>()?;
+                let mut rows = Vec::new();
+                while let Some(row) = cursor.next().await? {
+                    let Some(peer_id) = parse_peer_id(&row.worker_id) else {
+                        continue;
+                    };
+                    rows.push((peer_id, row));
+                }
+                Ok(rows)
+            })
+            .await?;
 
         let thresholds = StatusThresholds {
             inactive_threshold: inactive_threshold(inactive_timeout),
@@ -223,17 +245,21 @@ impl ClickhouseClient {
             "
         );
 
-        let mut cursor = self.client.query(&query).fetch::<MvccPingRow>()?;
-
         // Buffered, not classified inline: the epoch baseline needs every row first.
-        let mut rows = Vec::new();
-        while let Some(row) = cursor.next().await? {
-            let (ping, last_applied_assignment_id) = row.split();
-            let Some(peer_id) = parse_peer_id(&ping.worker_id) else {
-                continue;
-            };
-            rows.push((peer_id, ping, last_applied_assignment_id));
-        }
+        let rows: Vec<(PeerId, PingRow, Option<String>)> = self
+            .with_timeout("worker-ping query", async move {
+                let mut cursor = self.client.query(&query).fetch::<MvccPingRow>()?;
+                let mut rows = Vec::new();
+                while let Some(row) = cursor.next().await? {
+                    let (ping, last_applied_assignment_id) = row.split();
+                    let Some(peer_id) = parse_peer_id(&ping.worker_id) else {
+                        continue;
+                    };
+                    rows.push((peer_id, ping, last_applied_assignment_id));
+                }
+                Ok(rows)
+            })
+            .await?;
 
         let thresholds = StatusThresholds {
             inactive_threshold: inactive_threshold(config.worker_inactive_timeout),
@@ -296,31 +322,36 @@ impl ClickhouseClient {
             "
         );
 
-        let mut cursor = self
-            .client
-            .query(&query)
-            .bind(datasets.into_iter().map(Into::into).collect_vec())
-            .fetch::<ChunkRow>()?;
+        self.with_timeout("existing-chunks query", async move {
+            let mut cursor = self
+                .client
+                .query(&query)
+                .bind(datasets.into_iter().map(Into::into).collect_vec())
+                .fetch::<ChunkRow>()?;
 
-        let mut result: BTreeMap<_, Vec<_>> = BTreeMap::new();
-        while let Some(row) = cursor.next().await? {
-            let chunk = Chunk::try_from(row)?;
-            result.entry(chunk.dataset.clone()).or_default().push(chunk);
-        }
-        Ok(result)
+            let mut result: BTreeMap<_, Vec<_>> = BTreeMap::new();
+            while let Some(row) = cursor.next().await? {
+                let chunk = Chunk::try_from(row)?;
+                result.entry(chunk.dataset.clone()).or_default().push(chunk);
+            }
+            Ok(result)
+        })
+        .await
     }
 
     #[instrument(skip_all)]
     pub async fn store_new_chunks(&self, chunks: impl IntoIterator<Item = Chunk>) -> Result<()> {
         let _timer = crate::metrics::Timer::new("store_new_chunks");
 
-        let mut inserter = self.client.insert(CHUNKS_TABLE)?;
-        for chunk in chunks {
-            inserter.write(&ChunkRow::from(chunk)).await?;
-        }
-        inserter.end().await?;
-
-        Ok(())
+        self.with_timeout("store-new-chunks insert", async move {
+            let mut inserter = self.client.insert(CHUNKS_TABLE)?;
+            for chunk in chunks {
+                inserter.write(&ChunkRow::from(chunk)).await?;
+            }
+            inserter.end().await?;
+            Ok(())
+        })
+        .await
     }
 
     async fn create_tables(&self) -> Result<()> {
@@ -338,8 +369,11 @@ impl ClickhouseClient {
             "
         );
 
-        self.client.query(&query).execute().await?;
-        Ok(())
+        self.with_timeout("create tables", async move {
+            self.client.query(&query).execute().await?;
+            Ok(())
+        })
+        .await
     }
 }
 
@@ -438,6 +472,7 @@ mod test {
             clickhouse_database: Some("logs_db".to_string()),
             clickhouse_user: Some("user".to_string()),
             clickhouse_password: Some("password".to_string().into()),
+            clickhouse_timeout: Duration::from_secs(30),
         })
         .await
         .expect("Cannot connect to clickhouse");

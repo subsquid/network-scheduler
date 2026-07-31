@@ -152,6 +152,15 @@ pub struct S3Args {
 
     #[arg(env, hide = true, default_value = "auto")]
     aws_region: String,
+
+    /// Cap on establishing an S3 connection.
+    #[arg(long, env = "S3_CONNECT_TIMEOUT", default_value = "10s", value_parser = humantime::parse_duration)]
+    s3_connect_timeout: Duration,
+
+    /// Cap on a single S3 request waiting for the first response byte. Bounds a hung LIST/GET so a
+    /// stuck request fails the pass instead of blocking the loop.
+    #[arg(long, env = "S3_READ_TIMEOUT", default_value = "30s", value_parser = humantime::parse_duration)]
+    s3_read_timeout: Duration,
 }
 
 #[derive(clap::Args, Debug)]
@@ -165,12 +174,24 @@ pub struct ClickhouseArgs {
     // `hide_env_values`: see `Args::database_url` — `--help` would otherwise print the password.
     #[arg(long, env, hide_env_values = true, required_if_eq_any([("mode", "prod"), ("mode", "service")]))]
     pub clickhouse_password: Option<Secret>,
+    /// Cap on a single ClickHouse request — the worker-ping query and the startup table DDL. A
+    /// request hung past this fails the call, so the service task retries next tick instead of
+    /// wedging, and startup fails fast instead of hanging.
+    #[arg(long, env, default_value = "30s", value_parser = humantime::parse_duration)]
+    pub clickhouse_timeout: Duration,
 }
 
 impl S3Args {
     pub async fn config(&self) -> aws_config::SdkConfig {
+        // Bound each S3 request so a hung LIST/GET fails the call instead of blocking the caller's
+        // loop. `read_timeout` is per-attempt time-to-first-byte, not a cap on the whole transfer.
+        let timeouts = aws_sdk_s3::config::timeout::TimeoutConfig::builder()
+            .connect_timeout(self.s3_connect_timeout)
+            .read_timeout(self.s3_read_timeout)
+            .build();
         aws_config::from_env()
             .endpoint_url(self.aws_s3_endpoint.clone())
+            .timeout_config(timeouts)
             .load()
             .await
     }
